@@ -55,7 +55,7 @@ class RouterManager:
 
     def __init__(self, weightdir, adapter_dirs, load_way, world_size, eos_id,
                  router_port, detokenization_port, model_rpc_ports,
-                 input_params,
+                 input_params,system_prompt_tokens,lora_max_rank,lora_num,lorac=False,
                  mode=[], log_stats=True, log_stats_interval=10):
         self.model_weightdir = weightdir
         self.adapter_dirs = adapter_dirs
@@ -63,6 +63,11 @@ class RouterManager:
         self.load_way = load_way
         self.mode = mode
         self.input_params = input_params
+        self.system_prompt_tokens = system_prompt_tokens
+        self.lora_max_rank = lora_max_rank
+        self.lora_num = lora_num
+        self.lorac = lorac
+        
 
         if self.input_params.prefetch:
             self.prefetch_stream = torch.cuda.Stream()
@@ -113,6 +118,10 @@ class RouterManager:
                     self.mode,
                     input_params=self.input_params,
                     prefetch_stream=self.prefetch_stream,
+                    system_prompt_tokens=self.system_prompt_tokens,
+                    lora_max_rank=self.lora_max_rank,
+                    lora_num=self.lora_num,
+                    lorac=self.lorac
                 ))
 
         await asyncio.gather(*init_model_ret)
@@ -376,7 +385,7 @@ class RouterManager:
         return
 
 
-def start_router_process(args, router_port, detokenization_port, model_rpc_ports, mode, pipe_writer):
+def start_router_process(args, router_port, detokenization_port, model_rpc_ports, mode, pipe_writer,system_prompt_tokens,lora_max_rank,lora_num,lorac=False):
     input_params = InputParams(max_req_total_len=args.max_req_total_len,
                                # kv cache manager parameters
                                max_total_token_num=args.max_total_token_num,
@@ -414,6 +423,10 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
             model_rpc_ports=model_rpc_ports,
             input_params=input_params,
             mode=mode,
+            system_prompt_tokens=system_prompt_tokens,
+            lora_max_rank=lora_max_rank,
+            lora_num=lora_num,
+            lorac=lorac,
             log_stats = not args.disable_log_stats,
             log_stats_interval = args.log_stats_interval,
         )

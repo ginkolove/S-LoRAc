@@ -32,9 +32,9 @@ class LlamaTpPartModel(TpPartBaseModel):
     memory_manager_class = MemoryAllocator
 
     def __init__(self, tp_rank, world_size, weight_dir, 
-                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[], dummy=False):
+                 max_total_token_num, system_prompt_tokens,lora_max_rank,lora_num,lorac,mem_adapter_size, load_way="HF", mode=[], dummy=False):
         super().__init__(tp_rank, world_size, weight_dir,
-                         max_total_token_num, mem_adapter_size, load_way, mode, dummy=dummy)
+                         max_total_token_num,system_prompt_tokens,lora_max_rank,lora_num,lorac,mem_adapter_size, load_way, mode, dummy=dummy)
         return
     
     def _init_config(self):
@@ -59,7 +59,11 @@ class LlamaTpPartModel(TpPartBaseModel):
                                                      dtype=torch.float16,
                                                      head_num=self.config["num_attention_heads"] // self.world_size_,
                                                      head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
-                                                     layer_num=self.config["num_hidden_layers"])
+                                                     layer_num=self.config["num_hidden_layers"],
+                                                     system_prompt_tokens=self.system_prompt_tokens,
+                                                     lora_max_rank=self.lora_max_rank,
+                                                     lora_num=self.lora_num,
+                                                     lorac=self.lorac)
 
     def _init_custom(self):
         """

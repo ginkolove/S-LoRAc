@@ -379,6 +379,13 @@ def main():
     parser.add_argument("--no-lora", action="store_true")
     ''' end of slora arguments '''
 
+    # lorac parameters
+    parser.add_argument("--system-prompt-tokens", type=int, default=0)
+    parser.add_argument("--lora-max-rank", type=int, default=0)
+    parser.add_argument("--lora-num", type=int, default=0)
+    parser.add_argument("--lorac", action="store_true")
+    ''' end of lorac parameters '''
+
     args = parser.parse_args()
 
     assert args.max_req_input_len < args.max_req_total_len
@@ -423,6 +430,10 @@ def main():
             model_rpc_ports,
             args.mode,
             pipe_router_writer,
+            args.system_prompt_tokens,
+            args.lora_max_rank,
+            args.lora_num,
+            args.lorac,
         ),
     )
     proc_router.start()

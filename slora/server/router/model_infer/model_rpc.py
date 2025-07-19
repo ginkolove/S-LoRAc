@@ -33,7 +33,7 @@ class ModelRpcServer(rpyc.Service):
 
     def exposed_init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
                            max_total_token_num, load_way, mode, input_params,
-			   prefetch_stream):
+			   prefetch_stream,system_prompt_tokens,lora_max_rank,lora_num,lorac=False):
         import torch
         import torch.distributed as dist
         if world_size != 1:
@@ -60,14 +60,14 @@ class ModelRpcServer(rpyc.Service):
             if self.model_type == "llama":
                 if "num_key_value_heads" in model_cfg.keys():
                     self.model = Llama2TpPartModel(rank_id, world_size, weight_dir,
-                                                    max_total_token_num,
+                                                    max_total_token_num,system_prompt_tokens,lora_max_rank,lora_num,lorac=False,
                                                     mem_adapter_size=input_params.pool_size_lora,
                                                     load_way=load_way, mode=mode,
                                                     dummy=input_params.dummy)
                     
                 else:
                     self.model = LlamaTpPartModel(rank_id, world_size, weight_dir,
-                                                    max_total_token_num,
+                                                    max_total_token_num,system_prompt_tokens,lora_max_rank,lora_num,lorac=False,
                                                     mem_adapter_size=input_params.pool_size_lora,
                                                     load_way=load_way, mode=mode,
                                                     dummy=input_params.dummy)
@@ -419,10 +419,10 @@ class ModelRpcClient:
 
     async def init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
                          max_total_token_num, load_way, mode, input_params,
-			 prefetch_stream):
+			 prefetch_stream,system_prompt_tokens,lora_max_rank,lora_num,lorac=False):
         ans : rpyc.AsyncResult = self._init_model(rank_id, world_size, weight_dir, adapter_dirs,
                                                   max_total_token_num, load_way, mode, input_params,
-						  prefetch_stream)
+						  prefetch_stream,system_prompt_tokens,lora_max_rank,lora_num,lorac=False)
         if self.use_rpc:
             await ans
             return

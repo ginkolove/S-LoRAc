@@ -8,7 +8,7 @@ def suffix_cumsum(tensor, dim=-1, dtype=torch.int32):
 
 
 class MemoryAllocator:
-    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num):
+    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num,system_prompt_tokens,lora_max_rank,lora_num,lorac=False):
         assert tot_size >= cache_size
         self.dtype = dtype
         self.head_num = head_num
@@ -19,12 +19,51 @@ class MemoryAllocator:
         self.tot_size = tot_size
         self.cache_size = cache_size
 
-        self.reset_all_pool()
 
+        self.lorac = lorac
+        if self.lorac:
+            self.lora_max_rank = lora_max_rank
+            self.system_prompt_tokens = system_prompt_tokens
+            self.decode_kv_size = self.cache_size- self.system_prompt_tokens
+            self.lora_num = lora_num
+            self.reset_all_lorac_pool()
+        else:
+            self.reset_all_pool()
+    
+
+    def reset_all_lorac_pool(self):
+        self.base_k = [torch.empty((self.system_prompt_tokens, self.head_num, self.head_dim),
+                                       dtype=self.dtype, device="cuda")
+                           for _ in range(self.layer_num)]
+        self.base_v = [torch.empty((self.system_prompt_tokens, self.head_num, self.head_dim),
+                                       dtype=self.dtype, device="cuda")
+                           for _ in range(self.layer_num)]
+        self.mini_k = [[torch.empty((self.system_prompt_tokens, self.lora_max_rank),
+                                       dtype=self.dtype, device="cuda")
+                           for _ in range(self.layer_num)]
+                           for _ in range(self.lora_num)]
+        self.mini_v = [[torch.empty((self.system_prompt_tokens, self.lora_max_rank),
+                                       dtype=self.dtype, device="cuda")
+                           for _ in range(self.layer_num)]
+                           for _ in range(self.lora_num)]
+
+        self.mem_state = torch.ones((self.decode_kv_size,), dtype=torch.bool, device="cuda")
+        self._mem_cum_sum = torch.empty((self.decode_kv_size,), dtype=torch.int32, device="cuda")
+        self.indexes = torch.arange(0, self.decode_kv_size, dtype=torch.long, device="cuda")
+        self.can_use_mem_size = self.decode_kv_size
+        self.key_buffer = [torch.empty((self.decode_kv_size, self.head_num, self.head_dim),
+                                       dtype=self.dtype, device="cuda")
+                           for _ in range(self.layer_num)]
+        self.value_buffer = [torch.empty((self.decode_kv_size, self.head_num, self.head_dim),
+                                       dtype=self.dtype, device="cuda")
+                           for _ in range(self.layer_num)]
 
     def get_memory_size(self):
         dsize = 2 if self.dtype == torch.float16 else None
-        return 2 * self.layer_num * self.tot_size * self.cell_size * dsize
+        if self.lorac:
+            return (2 * self.layer_num * self.decode_kv_size*self.cell_size*dsize + 2 * self.system_prompt_tokens * self.layer_num * self.lora_max_rank * self.lora_num * dsize+ 2 * self.system_prompt_tokens * self.layer_num * self.cell_size * dsize)
+        else:
+            return 2 * self.layer_num * self.tot_size * self.cell_size * dsize
   
 
     def alloc(self, need_size):
@@ -109,79 +148,7 @@ class MemoryAllocator:
         self.can_use_mem_size -= select_index.shape[0]
         return select_index
 
-
-    def alloc_prefix(self, need_size):
-        assert False
-        if need_size > self.can_use_mem_size_prefix:
-            raise Exception(f'warn no enough pool space: need_size {need_size} left_size {self.can_use_mem_size_prefix}')
-        
-        torch.cumsum(self.mem_state, dim=0, dtype=torch.int32, out=self._mem_cum_sum)
-        select_index = torch.logical_and(self._mem_cum_sum <= need_size, self.mem_state == 1)
-        select_index = self.indexes[select_index]
-        self.mem_state[select_index] = 0
-        self.can_use_mem_size_prefix -= len(select_index)
-        return select_index
-    
-
-    def alloc_contiguous_prefix(self, need_size):
-        assert False
-        if need_size > self.can_use_mem_size_prefix:
-            raise Exception(f'warn no enough pool space: need_size {need_size} left_size {self.can_use_mem_size_prefix}')
-        
-        torch.cumsum(self.mem_state, dim=0, dtype=torch.int32, out=self._mem_cum_sum)
-        loc_sums = self._mem_cum_sum[need_size - 1:self.cache_size] - self._mem_cum_sum[0:self.cache_size - need_size + 1] + self.mem_state[0:self.cache_size - need_size + 1]
-        can_used_loc = self.indexes[0:self.cache_size - need_size + 1][loc_sums == need_size]
-        if can_used_loc.shape[0] == 0:
-            # print(f'warn no enough pool space: to contiguous need_size {need_size} left_size {self.can_use_mem_size_prefix}')
-            return None
-        start_loc = can_used_loc[0]
-        select_index = self.indexes[start_loc : start_loc + need_size]
-        
-        self.mem_state[select_index] = 0
-        self.can_use_mem_size_prefix -= need_size
-        start = start_loc.item()
-        end = start + need_size
-        return select_index, start, end
-
-
-    def alloc_suffix(self, need_size):
-        assert False
-        if need_size > self.can_use_mem_size_suffix:
-            raise Exception(f'warn no enough pool space: need_size {need_size} left_size {self.can_use_mem_size_suffix}')
-            return None
-        
-        self._mem_cum_sum = suffix_cumsum(self.mem_state, dim=0, dtype=torch.int32)
-        select_index = torch.logical_and(self._mem_cum_sum <= need_size, self.mem_state == 1)
-        select_index = self.indexes[select_index]
-        self.mem_state[select_index] = 0
-        self.can_use_mem_size_suffix -= len(select_index)
-        return select_index
-    
-
-    def alloc_contiguous_suffix(self, need_size):
-        assert False
-        if need_size > self.can_use_mem_size_suffix:
-            raise Exception(f'warn no enough pool space: need_size {need_size} left_size {self.can_use_mem_size_suffix}')
-            return None
-        
-        self._mem_cum_sum = suffix_cumsum(self.mem_state, dim=0, dtype=torch.int32)
-        assert len(self._mem_cum_sum) == self.cache_size
-        loc_sums = (self._mem_cum_sum[0:self.cache_size - need_size + 1] - self._mem_cum_sum[need_size - 1:] +
-                    self.mem_state[need_size - 1:])
-        can_used_loc = self.indexes[0:self.cache_size - need_size + 1][loc_sums == need_size]
-        if can_used_loc.shape[0] == 0:
-            # print(f'warn no enough pool space: to contiguous need_size {need_size} left_size {self.can_use_mem_size_suffix}')
-            return None
-        start_loc = can_used_loc[0]
-        select_index = self.indexes[start_loc : start_loc + need_size]
-        
-        self.mem_state[select_index] = 0
-        self.can_use_mem_size_suffix -= need_size
-        start = start_loc.item()
-        end = start + need_size
-        return select_index, start, end
- 
-    
+   
     def free(self, free_index):
         """_summary_
 

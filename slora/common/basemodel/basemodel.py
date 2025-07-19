@@ -27,7 +27,7 @@ class TpPartBaseModel:
     infer_state_class = InferStateInfo
 
     def __init__(self, tp_rank, world_size, weight_dir,
-                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[], dummy=False):
+                 max_total_token_num, system_prompt_tokens,lora_max_rank,lora_num,lorac,mem_adapter_size, load_way="HF", mode=[], dummy=False):
         self.tp_rank_ = tp_rank
         self.world_size_ = world_size
         self.weight_dir_ = weight_dir
@@ -36,6 +36,10 @@ class TpPartBaseModel:
         self.load_way = load_way
         self.mode = mode
         self.dummy = dummy
+        self.system_prompt_tokens = system_prompt_tokens
+        self.lora_max_rank = lora_max_rank
+        self.lora_num = lora_num
+        self.lorac = lorac
 
         self._init_config()
         self._verify_must()
