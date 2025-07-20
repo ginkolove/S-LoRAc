@@ -10,7 +10,7 @@ from slora.models.llama.layer_weights.transformer_layer_weight import LlamaTrans
 from slora.models.llama.infer_struct import LlamaInferStateInfo
 # from slora.common.mem_manager import MemoryManager
 from slora.common.mem_allocator import MemoryAllocator
-from slora.common.int8kv_mem_manager import INT8KVMemoryManager
+# from slora.common.int8kv_mem_manager import INT8KVMemoryManager
 from slora.common.basemodel import TpPartBaseModel
 
 
@@ -47,13 +47,13 @@ class LlamaTpPartModel(TpPartBaseModel):
         assert self.load_way == "HF", "llama only support HF format to load Now!"
 
     def _init_mem_manager(self):
-        mem_dict = {
-            "int8kv" : INT8KVMemoryManager
-        }
-        for _mode in self.mode:
-            if _mode in mem_dict:
-                print("Model using mode", _mode)
-                self.memory_manager_class = mem_dict[_mode]
+        # mem_dict = {
+        #     "int8kv" : INT8KVMemoryManager
+        # }
+        # for _mode in self.mode:
+        #     if _mode in mem_dict:
+        #         print("Model using mode", _mode)
+        #         self.memory_manager_class = mem_dict[_mode]
         self.mem_manager = self.memory_manager_class(tot_size=self.max_total_token_num + self.mem_adapter_size, 
                                                      cache_size=self.max_total_token_num,
                                                      dtype=torch.float16,
