@@ -15,13 +15,26 @@ class Req:
         self.output_metadata_list = []
         self.has_generate_finished = False
         self.aborted = False
+        
+        # system_prompt缓存相关属性
+        self.use_system_prompt = False
+        self.system_prompt_hash = None
 
     def to_rpc_obj(self):
-        return {"adapter_dir": self.adapter_dir,
-                "request_id": self.request_id,
-                "input_id": self.prompt_ids,
-                "output_len": self.max_output_len,
-                "sampling_param": self.sample_params.to_dict() }
+        rpc_obj = {"adapter_dir": self.adapter_dir,
+                   "request_id": self.request_id,
+                   "input_id": self.prompt_ids,
+                   "output_len": self.max_output_len,
+                   "sampling_param": self.sample_params.to_dict()}
+        
+        # 添加system_prompt信息到RPC对象
+        if self.use_system_prompt:
+            rpc_obj["use_system_prompt"] = True
+            rpc_obj["system_prompt_hash"] = self.system_prompt_hash
+        else:
+            rpc_obj["use_system_prompt"] = False
+            
+        return rpc_obj
 
     def to_req_detokenization_state(self):
         out = ReqDetokenizationState(self.request_id, self.prompt_ids, self.max_output_len, self.sample_params.ignore_eos)

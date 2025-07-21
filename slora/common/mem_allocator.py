@@ -8,7 +8,7 @@ def suffix_cumsum(tensor, dim=-1, dtype=torch.int32):
 
 
 class MemoryAllocator:
-    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num):
+    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num, system_prompt_size=0):
         assert tot_size >= cache_size
         self.dtype = dtype
         self.head_num = head_num
@@ -18,13 +18,110 @@ class MemoryAllocator:
 
         self.tot_size = tot_size
         self.cache_size = cache_size
+        # 新增：system_prompt专用空间大小
+        self.system_prompt_size = system_prompt_size
+        # system_prompt缓存相关
+        self.system_prompt_kv_caches = {}  # {adapter_dir: (key_cache, value_cache)}
+        self.base_system_prompt_kv = None  # 基础模型的system_prompt KV缓存
 
         self.reset_all_pool()
-
+    
 
     def get_memory_size(self):
         dsize = 2 if self.dtype == torch.float16 else None
-        return 2 * self.layer_num * self.tot_size * self.cell_size * dsize
+        total_system_prompt_size = self.system_prompt_size * len(self.system_prompt_kv_caches)
+        return 2 * self.layer_num * (self.tot_size + total_system_prompt_size) * self.cell_size * dsize
+
+
+    def init_system_prompt_cache(self, adapter_dirs, system_prompt_tokens):
+        """
+        初始化system_prompt的KV缓存空间
+        
+        Args:
+            adapter_dirs (List[str]): 所有adapter的目录列表
+            system_prompt_tokens (int): system_prompt的token数量
+        """
+        self.system_prompt_tokens = system_prompt_tokens
+        
+        # 为基础模型分配system_prompt KV缓存
+        if system_prompt_tokens > 0:
+            self.base_system_prompt_kv = {
+                'key_cache': [torch.empty((system_prompt_tokens, self.head_num, self.head_dim),
+                                        dtype=self.dtype, device="cuda")
+                            for _ in range(self.layer_num)],
+                'value_cache': [torch.empty((system_prompt_tokens, self.head_num, self.head_dim),
+                                          dtype=self.dtype, device="cuda") 
+                              for _ in range(self.layer_num)]
+            }
+            
+            # 为每个adapter分配system_prompt KV缓存
+            for adapter_dir in adapter_dirs:
+                self.system_prompt_kv_caches[adapter_dir] = {
+                    'key_cache': [torch.empty((system_prompt_tokens, self.head_num, self.head_dim),
+                                            dtype=self.dtype, device="cuda")
+                                for _ in range(self.layer_num)],
+                    'value_cache': [torch.empty((system_prompt_tokens, self.head_num, self.head_dim),
+                                              dtype=self.dtype, device="cuda")
+                                  for _ in range(self.layer_num)]
+                }
+
+
+    def get_system_prompt_kv(self, adapter_dir=None):
+        """
+        获取system_prompt的KV缓存
+        
+        Args:
+            adapter_dir (str, optional): adapter目录，None表示基础模型
+            
+        Returns:
+            dict: 包含key_cache和value_cache的字典，如果不存在则返回None
+        """
+        if adapter_dir is None:
+            return self.base_system_prompt_kv
+        else:
+            return self.system_prompt_kv_caches.get(adapter_dir, None)
+
+
+    def set_system_prompt_kv(self, key_states_list, value_states_list, adapter_dir=None):
+        """
+        设置system_prompt的KV缓存
+        
+        Args:
+            key_states_list (List[torch.Tensor]): 每层的key状态
+            value_states_list (List[torch.Tensor]): 每层的value状态  
+            adapter_dir (str, optional): adapter目录，None表示基础模型
+        """
+        if adapter_dir is None:
+            if self.base_system_prompt_kv is not None:
+                for i in range(self.layer_num):
+                    if i < len(self.base_system_prompt_kv['key_cache']) and i < len(key_states_list):
+                        self.base_system_prompt_kv['key_cache'][i].copy_(key_states_list[i])
+                    if i < len(self.base_system_prompt_kv['value_cache']) and i < len(value_states_list):
+                        self.base_system_prompt_kv['value_cache'][i].copy_(value_states_list[i])
+        else:
+            if adapter_dir in self.system_prompt_kv_caches:
+                cache = self.system_prompt_kv_caches[adapter_dir]
+                for i in range(self.layer_num):
+                    if i < len(cache['key_cache']) and i < len(key_states_list):
+                        cache['key_cache'][i].copy_(key_states_list[i])
+                    if i < len(cache['value_cache']) and i < len(value_states_list):
+                        cache['value_cache'][i].copy_(value_states_list[i])
+
+    
+    def has_system_prompt_cache(self, adapter_dir=None):
+        """
+        检查是否有system_prompt缓存
+        
+        Args:
+            adapter_dir (str, optional): adapter目录，None表示基础模型
+            
+        Returns:
+            bool: 是否有缓存
+        """
+        if adapter_dir is None:
+            return self.base_system_prompt_kv is not None
+        else:
+            return adapter_dir in self.system_prompt_kv_caches
   
 
     def alloc(self, need_size):

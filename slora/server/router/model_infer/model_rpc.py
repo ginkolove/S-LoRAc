@@ -208,10 +208,18 @@ class ModelRpcServer(rpyc.Service):
 
         assert len(batch.adapter_dirs) == len(batch), "batch.adapter_dirs != batch"
 
+        # 检查是否有请求使用system_prompt缓存
+        use_system_cache = any(req.get("use_system_prompt", False) for req in batch.requests)
+        
         # always use lora batch infer
         if (self.input_params.no_lora or self.input_params.no_kernel or
             self.input_params.scheduler == "peft" or set(batch.adapter_dirs) == {None}):
             engine = self.model
+            # 对于基础模型，传递adapter_dirs和system_prompt信息
+            kwargs["adapter_dirs"] = batch.adapter_dirs
+            if use_system_cache:
+                kwargs["use_system_cache"] = True
+                kwargs["system_prompt_hashes"] = [req.get("system_prompt_hash") for req in batch.requests]
         else:
             adapters = [self.adapters[self.adapter_id[adapter_dir]] for adapter_dir in batch.adapter_dirs]
             if self.input_params.no_lora_compute:
@@ -233,6 +241,10 @@ class ModelRpcServer(rpyc.Service):
             else:
                 engine = LoraUnorderedBatchInfer(self.model, adapters, infer_adapter=self.infer_adapter)
             kwargs["no_lora_compute"] = self.input_params.no_lora_compute
+            kwargs["adapter_dirs"] = batch.adapter_dirs  # 传递adapter信息
+            if use_system_cache:
+                kwargs["use_system_cache"] = True
+                kwargs["system_prompt_hashes"] = [req.get("system_prompt_hash") for req in batch.requests]
             # kwargs["no_lora_copy"] = self.input_params.no_lora_copy 
 
         logits = engine.forward(**kwargs)
@@ -374,6 +386,121 @@ class ModelRpcServer(rpyc.Service):
         engine = LoraPEFTBatchInfer(self.model, infer_adapter=self.infer_adapter)
         engine.merge_adapter()
 
+    def exposed_init_system_prompt_cache(self, prompt_ids, adapter_dirs):
+        """
+        初始化system prompt的KV缓存
+        
+        Args:
+            prompt_ids (List[int]): system prompt的token ids
+            adapter_dirs (List[str]): 要初始化缓存的adapter目录列表
+            
+        Returns:
+            bool: 初始化是否成功
+        """
+        if self.world_size != 1:
+            prompt_ids, adapter_dirs = obtain(prompt_ids), obtain(adapter_dirs)
+        
+        try:
+            import torch
+            
+            # 确保prompt_ids不为空
+            if not prompt_ids or len(prompt_ids) == 0:
+                print("Error: prompt_ids is empty")
+                return False
+            
+            # 初始化内存管理器的system prompt缓存空间
+            self.model.mem_manager.init_system_prompt_cache(adapter_dirs, len(prompt_ids))
+            print(f"Initialized system prompt cache space for {len(adapter_dirs)} adapters with {len(prompt_ids)} tokens")
+            
+            # 为基础模型计算system prompt的KV缓存
+            prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device="cuda").unsqueeze(0)
+            
+            # 使用模型的prefill来计算KV缓存
+            batch_size = 1
+            total_token_num = len(prompt_ids)
+            max_len_in_batch = len(prompt_ids)
+            
+            # 准备位置信息
+            b_loc = torch.zeros(batch_size, max_len_in_batch, dtype=torch.long, device="cuda")
+            b_start_loc = torch.zeros(batch_size, dtype=torch.int32, device="cuda") 
+            b_seq_len = torch.full((batch_size,), len(prompt_ids), dtype=torch.int32, device="cuda")
+            
+            # 分配内存并设置b_loc
+            mem_index = self.model.mem_manager.alloc(total_token_num)
+            b_loc[0, :max_len_in_batch] = mem_index
+            
+            # 基础模型prefill
+            print(f"Computing base model system prompt KV cache...")
+            base_logits = self.model._prefill(batch_size, total_token_num, max_len_in_batch, 
+                                            prompt_tensor.view(-1), b_loc, b_start_loc, b_seq_len)
+            
+            # 提取KV缓存并存储到system prompt缓存中
+            key_states = []
+            value_states = []
+            for layer_id in range(self.model.layers_num):
+                # 获取当前层的KV缓存
+                layer_key_cache = self.model.mem_manager.key_buffer[layer_id][mem_index]
+                layer_value_cache = self.model.mem_manager.value_buffer[layer_id][mem_index] 
+                
+                key_states.append(layer_key_cache.clone())
+                value_states.append(layer_value_cache.clone())
+            
+            # 存储基础模型的system prompt KV缓存
+            self.model.mem_manager.set_system_prompt_kv(key_states, value_states, adapter_dir=None)
+            print(f"Stored base model system prompt KV cache")
+            
+            # 为每个adapter计算system prompt的KV缓存
+            for adapter_dir in adapter_dirs:
+                if adapter_dir is None:
+                    continue
+                    
+                print(f"Computing system prompt KV cache for adapter: {adapter_dir}")
+                
+                # 加载adapter
+                adapter = self.adapters[self.adapter_id[adapter_dir]]
+                self.infer_adapter.load_adapters([adapter], prefetch=False)
+                
+                # 创建LoRA引擎
+                engine = LoraUnorderedBatchInfer(self.model, [adapter], infer_adapter=self.infer_adapter)
+                
+                # 重新分配内存（之前的已经被释放）
+                mem_index = self.model.mem_manager.alloc(total_token_num)
+                b_loc[0, :max_len_in_batch] = mem_index
+                
+                # 使用LoRA引擎计算
+                lora_logits = engine.forward(batch_size, total_token_num, max_len_in_batch,
+                                           prompt_tensor.view(-1), b_loc, b_start_loc, b_seq_len,
+                                           is_prefill=True, no_lora_compute=False)
+                
+                # 提取LoRA的KV缓存
+                adapter_key_states = []
+                adapter_value_states = []
+                for layer_id in range(self.model.layers_num):
+                    layer_key_cache = self.model.mem_manager.key_buffer[layer_id][mem_index]
+                    layer_value_cache = self.model.mem_manager.value_buffer[layer_id][mem_index]
+                    
+                    adapter_key_states.append(layer_key_cache.clone())
+                    adapter_value_states.append(layer_value_cache.clone())
+                
+                # 存储adapter的system prompt KV缓存
+                self.model.mem_manager.set_system_prompt_kv(adapter_key_states, adapter_value_states, adapter_dir=adapter_dir)
+                print(f"Stored system prompt KV cache for adapter: {adapter_dir}")
+                
+                # 释放临时内存
+                self.model.mem_manager.free(mem_index)
+                
+                # 卸载adapter
+                self.infer_adapter.offload_adapters([])
+            
+            print(f"Successfully initialized system prompt cache for all {len(adapter_dirs)} adapters")
+            return True
+            
+        except Exception as e:
+            print(f"Error initializing system prompt cache: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
 
 class ModelRpcClient:
     def __init__(self, model_rpc, world_size, rpc_server_process=None):
@@ -402,6 +529,7 @@ class ModelRpcClient:
             self._merge_batch = async_wrap(self.model.merge_batch)
             self._remove_batch = async_wrap(self.model.remove_batch)
             self._profile_prefill = async_wrap(self.model.profile_prefill)
+            self._init_system_prompt_cache = async_wrap(self.model.init_system_prompt_cache)
         else:
             self._init_model = self.model.exposed_init_model
             self._load_adapters = self.model.exposed_load_adapters
@@ -415,6 +543,7 @@ class ModelRpcClient:
             self._merge_batch = self.model.exposed_merge_batch
             self._remove_batch = self.model.exposed_remove_batch
             self._profile_prefill = self.model.exposed_profile_prefill
+            self._init_system_prompt_cache = self.model.exposed_init_system_prompt_cache
         return
 
     async def init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
@@ -492,6 +621,23 @@ class ModelRpcClient:
     
     async def profile_prefill(self):
         ans = self._profile_prefill()
+        if self.use_rpc:
+            return await ans
+        else:
+            return ans
+
+    async def init_system_prompt_cache(self, prompt_ids, adapter_dirs):
+        """
+        初始化system prompt的KV缓存
+        
+        Args:
+            prompt_ids (List[int]): system prompt的token ids
+            adapter_dirs (List[str]): 要初始化缓存的adapter目录列表
+            
+        Returns:
+            bool: 初始化是否成功
+        """
+        ans = self._init_system_prompt_cache(prompt_ids, adapter_dirs)
         if self.use_rpc:
             return await ans
         else:

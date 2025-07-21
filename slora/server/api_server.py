@@ -87,6 +87,11 @@ async def generate(request: Request) -> Response:
     request_dict = await request.json()
     adapter_dir = request_dict["lora_dir"] if "lora_dir" in request_dict else None
     prompt = request_dict.pop("inputs")
+    
+    # 新增：支持使用system_prompt缓存
+    use_system_prompt = request_dict.get("use_system_prompt", False)
+    system_prompt_text = request_dict.get("system_prompt", "") if use_system_prompt else ""
+    
     sample_params_dict = request_dict["parameters"]
     return_details = sample_params_dict.pop("return_details", False)
     sampling_params = SamplingParams(**sample_params_dict)
@@ -96,7 +101,13 @@ async def generate(request: Request) -> Response:
         request_id = request_dict["req_id"]
     else:
         request_id = uuid.uuid4().hex
-    results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
+    
+    # 根据是否使用system_prompt选择不同的生成器
+    if use_system_prompt:
+        results_generator = httpserver_manager.generate_with_system_prompt(
+            adapter_dir, system_prompt_text, prompt, sampling_params, request_id)
+    else:
+        results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
 
     # Non-streaming case
     final_output = []
@@ -124,6 +135,40 @@ async def generate(request: Request) -> Response:
         ret["tokens"] = tokens
     return Response(content=json.dumps(ret, ensure_ascii=False).encode("utf-8"))
 
+@app.post("/init_system_prompt")
+async def init_system_prompt(request: Request):
+    """
+    初始化system_prompt的KV缓存
+    """
+    global isFirst
+    if isFirst:
+        loop = asyncio.get_event_loop()
+        loop.create_task(httpserver_manager.handle_loop())
+        isFirst = False
+
+    try:
+        request_dict = await request.json()
+        system_prompt = request_dict.get("system_prompt", "")
+        lora_dirs = request_dict.get("lora_dirs", [])  # 可以指定特定的LoRA，为空则初始化所有LoRA
+        
+        if not system_prompt:
+            return create_error_response(HTTPStatus.BAD_REQUEST, "system_prompt is required")
+        
+        # 调用httpserver_manager来初始化system_prompt缓存
+        success = await httpserver_manager.init_system_prompt_cache(system_prompt, lora_dirs)
+        
+        if success:
+            ret = {
+                "status": "success",
+                "message": f"System prompt KV cache initialized for {len(lora_dirs) if lora_dirs else 'all'} adapters",
+                "system_prompt_length": len(system_prompt)
+            }
+            return Response(content=json.dumps(ret, ensure_ascii=False).encode("utf-8"))
+        else:
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, "Failed to initialize system prompt cache")
+            
+    except Exception as e:
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"Error initializing system prompt cache: {str(e)}")
 
 @app.post("/generate_stream")
 async def generate_stream(request: Request) -> Response:
@@ -136,6 +181,11 @@ async def generate_stream(request: Request) -> Response:
     request_dict = await request.json()
     adapter_dir = request_dict["lora_dir"] if "lora_dir" in request_dict else None
     prompt = request_dict.pop("inputs")
+    
+    # 新增：支持使用system_prompt缓存
+    use_system_prompt = request_dict.get("use_system_prompt", False)
+    system_prompt_text = request_dict.get("system_prompt", "") if use_system_prompt else ""
+    
     sample_params_dict = request_dict["parameters"]
     return_details = sample_params_dict.pop("return_details", False)
     sampling_params = SamplingParams(**sample_params_dict)
@@ -145,7 +195,13 @@ async def generate_stream(request: Request) -> Response:
         request_id = request_dict["req_id"]
     else:
         request_id = uuid.uuid4().hex
-    results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
+    
+    # 根据是否使用system_prompt选择不同的生成器
+    if use_system_prompt:
+        results_generator = httpserver_manager.generate_with_system_prompt(
+            adapter_dir, system_prompt_text, prompt, sampling_params, request_id)
+    else:
+        results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
 
     # Streaming case
     async def stream_results() -> AsyncGenerator[bytes, None]:

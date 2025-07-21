@@ -53,7 +53,10 @@ class LoraUnorderedBatchInfer:
             is_prefill=True,
             use_bmm=True,
             no_lora_compute=False,
-            no_lora_copy=False):
+            no_lora_copy=False,
+            adapter_dirs=None,
+            use_system_cache=False,
+            system_prompt_hashes=None):
 
         # Notice that batch_lora only support decoding
         assert len(b_loc) == len(b_start_loc) == len(b_seq_len)
@@ -70,19 +73,21 @@ class LoraUnorderedBatchInfer:
 
             return self._prefill(batch_size, total_token_num, max_len_in_batch,
                                  input_ids,
-                                 b_loc, b_start_loc, b_seq_len, no_lora_compute)
+                                 b_loc, b_start_loc, b_seq_len, no_lora_compute, adapter_dirs, 
+                                 use_system_cache, system_prompt_hashes)
         else:
             for _ in range(3):
                 self.delta.append(torch.zeros((len(b_seq_len), self.max_lora_dim), dtype=torch.float16, device="cuda"))
             return self._decode(batch_size, total_token_num, max_len_in_batch,
                                 input_ids,
                                 b_loc, b_start_loc, b_seq_len,
-                                no_lora_compute, no_lora_copy)
+                                no_lora_compute, no_lora_copy, adapter_dirs)
 
 
     def _prefill(self, batch_size, total_token_num, max_len_in_batch,
                  input_ids,
-                 b_loc, b_start_loc, b_seq_len, no_lora_compute=False):
+                 b_loc, b_start_loc, b_seq_len, no_lora_compute=False, adapter_dirs=None,
+                 use_system_cache=False, system_prompt_hashes=None):
 
         infer_state = self.base_model.infer_state_class()
         infer_state.is_prefill = True
@@ -105,6 +110,35 @@ class LoraUnorderedBatchInfer:
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
         infer_state.mem_manager = self.base_model.mem_manager
+        
+        # 检查是否使用system_prompt缓存
+        infer_state.use_system_cache = use_system_cache
+        infer_state.system_prompt_hashes = system_prompt_hashes if system_prompt_hashes else []
+        infer_state.adapter_dirs = adapter_dirs if adapter_dirs else []
+        
+        # 如果使用system_prompt缓存，需要特殊处理
+        if use_system_cache and system_prompt_hashes:
+            print(f"LoRA prefill using system prompt cache for batch")
+            # 检查所有请求是否都有对应的system_prompt缓存
+            has_system_cache = True
+            for i, (adapter_dir, sys_hash) in enumerate(zip(adapter_dirs, system_prompt_hashes)):
+                if sys_hash is None or not self.base_model.mem_manager.has_system_prompt_cache(adapter_dir):
+                    has_system_cache = False
+                    print(f"Warning: Request {i} (adapter: {adapter_dir}) missing system prompt cache")
+                    break
+            
+            if has_system_cache:
+                infer_state.using_system_cache = True
+                # 获取system_prompt的token长度（假设所有缓存长度相同）
+                first_cache = self.base_model.mem_manager.get_system_prompt_kv(adapter_dirs[0])
+                if first_cache:
+                    infer_state.system_prompt_tokens = first_cache['key_cache'][0].shape[0]
+                    print(f"Using system prompt cache with {infer_state.system_prompt_tokens} tokens")
+            else:
+                infer_state.using_system_cache = False
+        else:
+            infer_state.using_system_cache = False
+        
         infer_state.prefill_mem_index = self.base_model.mem_manager.alloc(infer_state.total_token_num)
         infer_state.prefill_key_buffer = torch.empty(
                 (infer_state.total_token_num, self.base_model.tp_k_head_num_, self.base_model.head_dim_),
@@ -120,7 +154,7 @@ class LoraUnorderedBatchInfer:
 
     def _decode(self, batch_size, total_token_num, max_len_in_batch,
                 input_ids,
-                b_loc, b_start_loc, b_seq_len, no_lora_compute=False, no_lora_copy=False):
+                b_loc, b_start_loc, b_seq_len, no_lora_compute=False, no_lora_copy=False, adapter_dirs=None):
         infer_state = self.base_model.infer_state_class()
         infer_state.is_prefill = False
         infer_state.batch_size = batch_size
@@ -154,7 +188,7 @@ class LoraUnorderedBatchInfer:
             b_loc[:, max_len_in_batch - 1] = infer_state.decode_mem_index
 
         infer_state.init_some_extra_state(self.base_model, batch_size, total_token_num, max_len_in_batch,
-                                          input_ids, b_loc, b_start_loc, b_seq_len, False)
+                                          input_ids, b_loc, b_start_loc, b_seq_len, False, adapter_dirs)
         predict_logics = self._token_forward(input_ids, infer_state, no_lora_compute, no_lora_copy)
         return predict_logics
 
@@ -212,6 +246,58 @@ class LoraUnorderedBatchInfer:
         input1 = layer_infer._att_norm(input_embs, infer_state, layer_weight)
         # fetch k, v
         cache_k, cache_v = layer_infer._pre_cache_kv(infer_state, layer_weight)
+        
+        # 如果使用system_prompt缓存，先复制缓存的KV
+        if getattr(infer_state, 'using_system_cache', False):
+            system_tokens = getattr(infer_state, 'system_prompt_tokens', 0)
+            if system_tokens > 0:
+                # 为每个batch中的请求复制system_prompt KV
+                for batch_idx in range(infer_state.batch_size):
+                    adapter_dir = infer_state.adapter_dirs[batch_idx] if batch_idx < len(infer_state.adapter_dirs) else None
+                    
+                    # 获取该adapter的system_prompt缓存
+                    system_cache = infer_state.mem_manager.get_system_prompt_kv(adapter_dir)
+                    if system_cache and layer_id < len(system_cache['key_cache']):
+                        start_loc = infer_state.b_start_loc[batch_idx].item()
+                        seq_len = infer_state.b_seq_len[batch_idx].item()
+                        
+                        # 确保序列长度大于system_prompt长度
+                        if seq_len >= system_tokens:
+                            cached_key = system_cache['key_cache'][layer_id]  # [sys_tokens, head_num, head_dim]
+                            cached_value = system_cache['value_cache'][layer_id]
+                            
+                            # 复制到对应位置
+                            cache_k[start_loc:start_loc + system_tokens] = cached_key
+                            cache_v[start_loc:start_loc + system_tokens] = cached_value
+                            
+                            # 调整position信息，跳过system_prompt部分
+                            # 这里需要修改input_embs和position信息，只处理用户输入部分
+                            user_start = start_loc + system_tokens
+                            user_length = seq_len - system_tokens
+                            
+                            if user_length > 0:
+                                # 只对用户输入部分计算QKV
+                                user_input1 = input1[user_start:user_start + user_length]
+                                user_cache_k = cache_k[user_start:user_start + user_length]
+                                user_cache_v = cache_v[user_start:user_start + user_length]
+                                
+                                # 对用户输入部分重新计算位置编码
+                                user_pos_start = system_tokens
+                                user_position_cos = infer_state.position_cos[user_start:user_start + user_length]
+                                user_position_sin = infer_state.position_sin[user_start:user_start + user_length]
+                                
+                                # 计算用户输入的QKV
+                                q_user = self._compute_user_qkv(layer_id, user_input1, user_cache_k, user_cache_v, 
+                                                               user_position_cos, user_position_sin, no_lora_compute)
+                                
+                                print(f"Layer {layer_id}: Used system cache ({system_tokens} tokens) + computed user input ({user_length} tokens)")
+                            else:
+                                print(f"Layer {layer_id}: Only using system cache, no user input")
+                        else:
+                            print(f"Warning: Sequence length {seq_len} < system tokens {system_tokens}, falling back to normal computation")
+                    else:
+                        print(f"Warning: No system cache found for adapter {adapter_dir} at layer {layer_id}")
+
         # gen new q, k, v (batch different adapters)
         q = self._lora_get_qkv(layer_id, input1, cache_k, cache_v, infer_state, no_lora_compute)
         input1 = None
@@ -225,6 +311,36 @@ class LoraUnorderedBatchInfer:
         # residual
         input_embs.add_(o.view(-1, layer_infer.embed_dim_))
         return
+
+    def _compute_user_qkv(self, layer_id, user_input, user_cache_k, user_cache_v, user_pos_cos, user_pos_sin, no_lora_compute=False):
+        """
+        为用户输入部分单独计算QKV（当使用system_prompt缓存时）
+        """
+        base_model = self.base_model
+        base_layer_weight = base_model.trans_layers_weight[layer_id]
+        base_layer_infer = base_model.layers_infer[layer_id]
+        
+        # 计算Q
+        q = torch.mm(user_input.view(-1, base_layer_infer.embed_dim_), base_layer_weight.q_weight_)
+        
+        # 应用旋转位置编码到Q
+        from slora.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
+        rotary_emb_fwd(q.view(-1, base_layer_infer.tp_q_head_num_, base_model.head_dim_), user_pos_cos, user_pos_sin)
+        
+        # 计算K
+        torch.mm(user_input.view(-1, base_layer_infer.embed_dim_), base_layer_weight.k_weight_,
+                 out=user_cache_k.view(-1, base_model.tp_k_head_num_ * base_model.head_dim_))
+        rotary_emb_fwd(user_cache_k, user_pos_cos, user_pos_sin)
+        
+        # 计算V
+        torch.mm(user_input.view(-1, base_layer_infer.embed_dim_), base_layer_weight.v_weight_,
+                 out=user_cache_v.view(-1, base_model.tp_k_head_num_ * base_model.head_dim_))
+        
+        # TODO: 这里还需要处理LoRA的delta计算
+        if not no_lora_compute:
+            print("Warning: LoRA computation for system cache mode not fully implemented yet")
+        
+        return q
 
 
     # @calculate_time(show=True, min_cost_ms=0)

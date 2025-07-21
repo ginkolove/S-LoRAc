@@ -141,9 +141,21 @@ class RouterManager:
         adapter_dir: str,
         prompt_ids: List[int],
         sampling_params: SamplingParams,
-        request_id: str
+        request_id: str,
+        use_system_prompt: bool = False,
+        system_prompt_hash: int = None
     ):
         req = Req(adapter_dir, request_id, prompt_ids, sampling_params)
+        
+        # 如果使用system_prompt缓存，添加相关信息
+        if use_system_prompt:
+            req.use_system_prompt = True
+            req.system_prompt_hash = system_prompt_hash
+            print(f"Request {request_id} will use system prompt cache (hash: {system_prompt_hash})")
+        else:
+            req.use_system_prompt = False
+            req.system_prompt_hash = None
+            
         self.req_queue.append(req)
         self.send_to_detokenization.send_pyobj(req.to_req_detokenization_state())
         return
@@ -360,6 +372,33 @@ class RouterManager:
             if isinstance(recv_req, tuple) and len(recv_req) == 4:
                 adapter_dir, prompt_ids, sampling_params, request_id = recv_req
                 self.add_req(adapter_dir, prompt_ids, sampling_params, request_id)
+            elif isinstance(recv_req, tuple) and len(recv_req) == 6:
+                # system prompt初始化请求或system prompt推理请求
+                adapter_dir, prompt_ids, param3, request_id, flag, param6 = recv_req
+                
+                if flag is True and adapter_dir == "system_prompt_init" and isinstance(param6, list):
+                    # system prompt初始化请求: (adapter_dir, prompt_ids, sampling_params, request_id, is_system_prompt, lora_dirs)
+                    await self.init_system_prompt_cache(prompt_ids, param6, request_id)
+                elif flag is True and isinstance(param6, int):
+                    # system prompt推理请求: (adapter_dir, prompt_ids, sampling_params, request_id, use_system_prompt, system_prompt_hash)
+                    self.add_req(adapter_dir, prompt_ids, param3, request_id, use_system_prompt=True, system_prompt_hash=param6)
+                else:
+                    # 其他6参数请求，按常规处理
+                    print(f"Warning: Unexpected 6-parameter request: {recv_req}")
+                    self.add_req(adapter_dir, prompt_ids, param3, request_id)
+            elif isinstance(recv_req, tuple) and len(recv_req) == 5:
+                # 保留对5参数请求的兼容性处理（如果有其他地方还在使用）
+                adapter_dir, prompt_ids, sampling_params_or_lora_dirs, request_id, is_system_prompt_or_other = recv_req
+                # 尝试判断这是否为旧格式的system prompt请求
+                if (is_system_prompt_or_other is True and 
+                    adapter_dir == "system_prompt_init" and 
+                    isinstance(sampling_params_or_lora_dirs, list)):
+                    # 旧格式的system prompt请求
+                    print("Warning: Using deprecated 5-parameter system prompt request format")
+                    await self.init_system_prompt_cache(prompt_ids, sampling_params_or_lora_dirs, request_id)
+                else:
+                    # 其他5参数请求，按常规处理（第5个参数作为额外信息忽略）
+                    self.add_req(adapter_dir, prompt_ids, sampling_params_or_lora_dirs, request_id)
             elif isinstance(recv_req, AbortReq):
                 abort_req = recv_req
                 request_id = abort_req.req_id
@@ -367,6 +406,56 @@ class RouterManager:
                 self.send_to_detokenization.send_pyobj(abort_req)
             else:
                 assert False, f"Error Req Inf {recv_req}"
+
+    async def init_system_prompt_cache(self, prompt_ids, lora_dirs, request_id):
+        """
+        初始化system prompt的KV缓存
+        
+        Args:
+            prompt_ids (List[int]): system prompt的token ids
+            lora_dirs (List[str]): 要初始化的lora目录列表，None表示所有lora
+            request_id (str): 请求ID
+        """
+        try:
+            # 如果lora_dirs为空，则使用所有adapter
+            if lora_dirs is None or len(lora_dirs) == 0:
+                target_adapters = self.adapter_dirs
+            else:
+                target_adapters = lora_dirs
+            
+            # 调用所有模型进程来初始化system prompt缓存
+            init_tasks = []
+            for rank_id in range(self.world_size):
+                init_tasks.append(
+                    self.model_rpcs[rank_id].init_system_prompt_cache(prompt_ids, target_adapters)
+                )
+            
+            # 等待所有rank完成初始化
+            results = await asyncio.gather(*init_tasks, return_exceptions=True)
+            
+            # 检查是否所有rank都成功
+            success = all(isinstance(result, bool) and result for result in results)
+            
+            # 发送结果到detokenization进程
+            from ..io_struct import BatchTokenIdOut
+            batch_out = BatchTokenIdOut()
+            metadata = {"success": success, "initialized_adapters": len(target_adapters)}
+            batch_out.reqs_infs.append((request_id, 0, metadata, True, False))  # finished=True
+            self.send_to_detokenization.send_pyobj(batch_out)
+            
+            if success:
+                print(f"Successfully initialized system prompt cache for {len(target_adapters)} adapters")
+            else:
+                print(f"Failed to initialize system prompt cache")
+                
+        except Exception as e:
+            print(f"Error in init_system_prompt_cache: {e}")
+            # 发送失败结果
+            from ..io_struct import BatchTokenIdOut
+            batch_out = BatchTokenIdOut()
+            metadata = {"success": False, "error": str(e)}
+            batch_out.reqs_infs.append((request_id, 0, metadata, True, False))
+            self.send_to_detokenization.send_pyobj(batch_out)
 
     def clean_up(self):
         for model_rpc in self.model_rpcs:
