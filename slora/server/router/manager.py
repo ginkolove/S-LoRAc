@@ -417,21 +417,35 @@ class RouterManager:
             request_id (str): 请求ID
         """
         try:
+            print(f"[DEBUG] Router Manager初始化system prompt cache")
+            print(f"[DEBUG] 输入lora_dirs: {lora_dirs}")
+            print(f"[DEBUG] 可用adapter_dirs: {self.adapter_dirs}")
+            
             # 如果lora_dirs为空，则使用所有adapter
             if lora_dirs is None or len(lora_dirs) == 0:
                 target_adapters = self.adapter_dirs
+                print(f"[DEBUG] 使用所有adapters: {target_adapters}")
             else:
                 target_adapters = lora_dirs
+                print(f"[DEBUG] 使用指定adapters: {target_adapters}")
+            
+            if not target_adapters:
+                print(f"[ERROR] target_adapters为空! self.adapter_dirs={self.adapter_dirs}")
+                raise ValueError("No adapters available for system prompt cache initialization")
             
             # 调用所有模型进程来初始化system prompt缓存
+            print(f"[DEBUG] 开始调用{self.world_size}个模型进程初始化...")
             init_tasks = []
             for rank_id in range(self.world_size):
+                print(f"[DEBUG] 为rank {rank_id} 创建初始化任务")
                 init_tasks.append(
                     self.model_rpcs[rank_id].init_system_prompt_cache(prompt_ids, target_adapters)
                 )
             
             # 等待所有rank完成初始化
+            print(f"[DEBUG] 等待所有rank完成初始化...")
             results = await asyncio.gather(*init_tasks, return_exceptions=True)
+            print(f"[DEBUG] 所有rank结果: {results}")
             
             # 检查是否所有rank都成功
             success = all(isinstance(result, bool) and result for result in results)
@@ -444,12 +458,16 @@ class RouterManager:
             self.send_to_detokenization.send_pyobj(batch_out)
             
             if success:
-                print(f"Successfully initialized system prompt cache for {len(target_adapters)} adapters")
+                print(f"[DEBUG] ✅ 成功初始化{len(target_adapters)}个adapters的system prompt cache")
             else:
-                print(f"Failed to initialize system prompt cache")
+                print(f"[DEBUG] ❌ system prompt cache初始化失败")
+                print(f"[DEBUG] 详细结果: {results}")
                 
         except Exception as e:
-            print(f"Error in init_system_prompt_cache: {e}")
+            print(f"[ERROR] Router Manager初始化system prompt cache异常: {e}")
+            import traceback
+            print(f"[ERROR] 详细堆栈:")
+            traceback.print_exc()
             # 发送失败结果
             from ..io_struct import BatchTokenIdOut
             batch_out = BatchTokenIdOut()

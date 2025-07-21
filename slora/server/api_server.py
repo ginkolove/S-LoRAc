@@ -168,7 +168,11 @@ async def init_system_prompt(request: Request):
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, "Failed to initialize system prompt cache")
             
     except Exception as e:
-        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"Error initializing system prompt cache: {str(e)}")
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"[ERROR] System prompt cache initialization failed:")
+        print(error_details)
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"Error initializing system prompt cache: {str(e)}\n\nDetails:\n{error_details}")
 
 @app.post("/generate_stream")
 async def generate_stream(request: Request) -> Response:
