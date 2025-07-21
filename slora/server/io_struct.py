@@ -153,7 +153,10 @@ class BatchTokenIdOut:
 class BatchStrOut:
     def __init__(self):
         self.reqs_infs: List[Tuple[str, str, Dict, bool, bool]] = [] # [req_id, token_str, gen_metadata, finished_state, abort_state]
-        
+class BatchSysOut:
+    def __init__(self):
+        self.reqs_infs: List[Tuple[str, bool, Dict]] = []  # [req_id, init_system_prompt, metadata]
+
 class AbortReq:
     def __init__(self, req_id):
         self.req_id = req_id

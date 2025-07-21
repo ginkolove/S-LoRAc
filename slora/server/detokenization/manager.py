@@ -3,7 +3,7 @@ import asyncio
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 import zmq
 import zmq.asyncio
-from ..io_struct import BatchTokenIdOut, ReqDetokenizationState, BatchStrOut, AbortReq, BatchAbortReq
+from ..io_struct import BatchTokenIdOut, ReqDetokenizationState, BatchStrOut, AbortReq, BatchAbortReq,BatchSysOut
 from typing import Union
 from .decode import decode_token
 from ..tokenizer import get_tokenizer
@@ -33,8 +33,8 @@ class DeTokenizationManager:
     async def handle_loop(self):
         while True:
             try:
-                recv_obj:Union(BatchTokenIdOut, ReqDetokenizationState, AbortReq, BatchAbortReq) = await self.recv_from_router.recv_pyobj() 
-                assert isinstance(recv_obj, (BatchTokenIdOut, ReqDetokenizationState, AbortReq, BatchAbortReq)), f"type is not right {type(recv_obj)}"
+                recv_obj:Union(BatchTokenIdOut, ReqDetokenizationState, AbortReq, BatchAbortReq,BatchSysOut) = await self.recv_from_router.recv_pyobj() 
+                assert isinstance(recv_obj, (BatchTokenIdOut, ReqDetokenizationState, AbortReq, BatchAbortReq,BatchSysOut)), f"type is not right {type(recv_obj)}"
                 if isinstance(recv_obj, ReqDetokenizationState):
                     self.req_id_to_out[recv_obj.request_id] = recv_obj
                 
@@ -48,7 +48,10 @@ class DeTokenizationManager:
                         if delete_req_id in self.req_id_to_out:
                             del self.req_id_to_out[delete_req_id]
                     self.send_to_httpserver.send_pyobj(recv_obj)
-                        
+                
+                if isinstance(recv_obj, BatchSysOut):
+                    self.send_to_httpserver.send_pyobj(recv_obj)
+                    
                 if isinstance(recv_obj, BatchTokenIdOut):
                     new_batch_str_out = BatchStrOut()
                     for req_id, new_token_id, new_gen_metadata, finished, abort in recv_obj.reqs_infs:

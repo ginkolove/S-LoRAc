@@ -6,7 +6,7 @@ from typing import Union
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 from ..tokenizer import get_tokenizer
-from ..io_struct import BatchStrOut, AbortReq, BatchAbortReq
+from ..io_struct import BatchStrOut, AbortReq, BatchAbortReq,BatchSysOut
 
 
 class HttpServerManager:
@@ -177,8 +177,8 @@ class HttpServerManager:
             prompt_ids = self.tokenizer.encode(system_prompt)
             prompt_tokens = len(prompt_ids)
             
-            if prompt_tokens > self.max_req_input_len:
-                raise ValueError(f"System prompt too long: {prompt_tokens} > {self.max_req_input_len}")
+            # if prompt_tokens > self.max_req_input_len:
+            #     raise ValueError(f"System prompt too long: {prompt_tokens} > {self.max_req_input_len}")
             
             # 发送system prompt初始化请求到router
             # 使用特殊的request_id来标识这是system prompt初始化请求
@@ -194,23 +194,22 @@ class HttpServerManager:
             self.req_id_to_out_inf[request_id] = ("", {}, False, event)
             
             try:
-                # 等待最多30秒
-                await asyncio.wait_for(event.wait(), timeout=30)
+                # 等待最多200秒
+                await asyncio.wait_for(event.wait(), timeout=60)
                 
                 # 检查结果
                 if request_id in self.req_id_to_out_inf:
-                    _, metadata, finished, _ = self.req_id_to_out_inf[request_id]
-                    success = finished and metadata.get("success", False)
-                    
+                    _,  finished, _ = self.req_id_to_out_inf[request_id]
+                    if finished:
                     # 清理
-                    try:
-                        del self.req_id_to_out_inf[request_id]
-                    except:
-                        pass
+                        try:
+                            del self.req_id_to_out_inf[request_id]
+                        except:
+                            pass
                     
-                    return success
+                    return finished
                 else:
-                    return False
+                    return False, {}
                     
             except asyncio.TimeoutError:
                 # 清理超时的请求
@@ -218,16 +217,16 @@ class HttpServerManager:
                     del self.req_id_to_out_inf[request_id]
                 except:
                     pass
-                return False
+                return False, {"error": "Timeout waiting for system prompt cache initialization"}
                 
         except Exception as e:
-            print(f"Error initializing system prompt cache: {e}")
-            return False
+            print(f"HTTP: Error initializing system prompt cache: {e}")
+            return False, {"error": str(e)}
 
     async def handle_loop(self):
         while True:
-            recv_ans:Union(BatchStrOut, BatchAbortReq) = await self.recv_from_detokenization.recv_pyobj()
-            assert isinstance(recv_ans, (BatchStrOut, BatchAbortReq)), f"error recv type {type(recv_ans)}"
+            recv_ans:Union(BatchStrOut, BatchAbortReq, BatchSysOut) = await self.recv_from_detokenization.recv_pyobj()
+            assert isinstance(recv_ans, (BatchStrOut, BatchAbortReq,BatchSysOut)), f"error recv type {type(recv_ans)}"
             if isinstance(recv_ans, BatchStrOut):
                 for req_id, text, metadata, finished, abort in recv_ans.reqs_infs:
                     try:
@@ -244,6 +243,13 @@ class HttpServerManager:
                             del self.req_id_to_out_inf[req_id]
                     except:
                         pass
+            elif isinstance(recv_ans, BatchSysOut):
+                # 处理system prompt初始化的响应
+                for req_id, init_system_prompt, metadata in recv_ans.reqs_infs:
+                    if req_id in self.req_id_to_out_inf:
+                        _, _, finished, event = self.req_id_to_out_inf[req_id]
+                        self.req_id_to_out_inf[req_id] = ("", metadata, finished, event)
+                        event.set()
             elif isinstance(recv_ans, BatchAbortReq):
                 print("abort reqs:", recv_ans.reqs)
                 for req_id in recv_ans.reqs:

@@ -165,7 +165,8 @@ async def init_system_prompt(request: Request):
             }
             return Response(content=json.dumps(ret, ensure_ascii=False).encode("utf-8"))
         else:
-            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, "Failed to initialize system prompt cache")
+            error_message = "error, Failed to initialize system prompt cache"
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, error_message)
             
     except Exception as e:
         return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"Error initializing system prompt cache: {str(e)}")

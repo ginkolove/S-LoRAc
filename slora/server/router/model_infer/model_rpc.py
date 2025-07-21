@@ -410,7 +410,7 @@ class ModelRpcServer(rpyc.Service):
             
             # 初始化内存管理器的system prompt缓存空间
             self.model.mem_manager.init_system_prompt_cache(adapter_dirs, len(prompt_ids))
-            print(f"Initialized system prompt cache space for {len(adapter_dirs)} adapters with {len(prompt_ids)} tokens")
+            print(f"RPCServer:Initialized system prompt cache space for {len(adapter_dirs)} adapters with {len(prompt_ids)} tokens")
             
             # 为基础模型计算system prompt的KV缓存
             prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device="cuda").unsqueeze(0)
@@ -430,7 +430,7 @@ class ModelRpcServer(rpyc.Service):
             b_loc[0, :max_len_in_batch] = mem_index
             
             # 基础模型prefill
-            print(f"Computing base model system prompt KV cache...")
+            print(f"RPCServer: Computing base model system prompt KV cache...")
             base_logits = self.model._prefill(batch_size, total_token_num, max_len_in_batch, 
                                             prompt_tensor.view(-1), b_loc, b_start_loc, b_seq_len)
             
@@ -447,14 +447,17 @@ class ModelRpcServer(rpyc.Service):
             
             # 存储基础模型的system prompt KV缓存
             self.model.mem_manager.set_system_prompt_kv(key_states, value_states, adapter_dir=None)
-            print(f"Stored base model system prompt KV cache")
+            print(f"RPCServer:Stored base model system prompt KV cache")
+            
+            # 释放基础模型的临时内存
+            self.model.mem_manager.free(mem_index)
             
             # 为每个adapter计算system prompt的KV缓存
             for adapter_dir in adapter_dirs:
                 if adapter_dir is None:
                     continue
                     
-                print(f"Computing system prompt KV cache for adapter: {adapter_dir}")
+                print(f"RPCServer::Computing system prompt KV cache for adapter: {adapter_dir}")
                 
                 # 加载adapter
                 adapter = self.adapters[self.adapter_id[adapter_dir]]
@@ -484,7 +487,7 @@ class ModelRpcServer(rpyc.Service):
                 
                 # 存储adapter的system prompt KV缓存
                 self.model.mem_manager.set_system_prompt_kv(adapter_key_states, adapter_value_states, adapter_dir=adapter_dir)
-                print(f"Stored system prompt KV cache for adapter: {adapter_dir}")
+                print(f"RPCServer:Stored system prompt KV cache for adapter: {adapter_dir}")
                 
                 # 释放临时内存
                 self.model.mem_manager.free(mem_index)
@@ -492,11 +495,11 @@ class ModelRpcServer(rpyc.Service):
                 # 卸载adapter
                 self.infer_adapter.offload_adapters([])
             
-            print(f"Successfully initialized system prompt cache for all {len(adapter_dirs)} adapters")
+            print(f"RPCServer: Successfully initialized system prompt cache for all {len(adapter_dirs)} adapters")
             return True
             
         except Exception as e:
-            print(f"Error initializing system prompt cache: {e}")
+            print(f"RPCServer: Error initializing system prompt cache: {e}")
             import traceback
             traceback.print_exc()
             return False

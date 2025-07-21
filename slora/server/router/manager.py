@@ -15,7 +15,7 @@ from .model_infer.model_rpc import start_model_process, ModelRpcClient
 from .req_queue import ReqQueue
 from rpyc.utils.classic import obtain
 from slora.utils.infer_utils import calculate_time
-from ..io_struct import BatchTokenIdOut, AbortReq
+from ..io_struct import BatchTokenIdOut, AbortReq,BatchSysOut
 from .stats import Stats
 
 from slora.server.input_params import InputParams
@@ -374,38 +374,17 @@ class RouterManager:
                 self.add_req(adapter_dir, prompt_ids, sampling_params, request_id)
             elif isinstance(recv_req, tuple) and len(recv_req) == 6:
                 # system prompt初始化请求或system prompt推理请求
-                adapter_dir, prompt_ids, param3, request_id, flag, param6 = recv_req
-                
-                if flag is True and adapter_dir == "system_prompt_init" and isinstance(param6, list):
+                sys_init, prompt_ids, sampling_params, request_id, flag, lora_dirs = recv_req
+                if flag is True and sys_init == "system_prompt_init" and isinstance(lora_dirs, list):
                     # system prompt初始化请求: (adapter_dir, prompt_ids, sampling_params, request_id, is_system_prompt, lora_dirs)
-                    await self.init_system_prompt_cache(prompt_ids, param6, request_id)
-                elif flag is True and isinstance(param6, int):
-                    # system prompt推理请求: (adapter_dir, prompt_ids, sampling_params, request_id, use_system_prompt, system_prompt_hash)
-                    self.add_req(adapter_dir, prompt_ids, param3, request_id, use_system_prompt=True, system_prompt_hash=param6)
-                else:
-                    # 其他6参数请求，按常规处理
-                    print(f"Warning: Unexpected 6-parameter request: {recv_req}")
-                    self.add_req(adapter_dir, prompt_ids, param3, request_id)
-            elif isinstance(recv_req, tuple) and len(recv_req) == 5:
-                # 保留对5参数请求的兼容性处理（如果有其他地方还在使用）
-                adapter_dir, prompt_ids, sampling_params_or_lora_dirs, request_id, is_system_prompt_or_other = recv_req
-                # 尝试判断这是否为旧格式的system prompt请求
-                if (is_system_prompt_or_other is True and 
-                    adapter_dir == "system_prompt_init" and 
-                    isinstance(sampling_params_or_lora_dirs, list)):
-                    # 旧格式的system prompt请求
-                    print("Warning: Using deprecated 5-parameter system prompt request format")
-                    await self.init_system_prompt_cache(prompt_ids, sampling_params_or_lora_dirs, request_id)
-                else:
-                    # 其他5参数请求，按常规处理（第5个参数作为额外信息忽略）
-                    self.add_req(adapter_dir, prompt_ids, sampling_params_or_lora_dirs, request_id)
+                    await self.init_system_prompt_cache(prompt_ids, lora_dirs, request_id)
             elif isinstance(recv_req, AbortReq):
                 abort_req = recv_req
                 request_id = abort_req.req_id
                 await self.abort(request_id)
                 self.send_to_detokenization.send_pyobj(abort_req)
             else:
-                assert False, f"Error Req Inf {recv_req}"
+                assert False, f"Router(loop): Error Req Inf {recv_req}"
 
     async def init_system_prompt_cache(self, prompt_ids, lora_dirs, request_id):
         """
@@ -437,24 +416,27 @@ class RouterManager:
             success = all(isinstance(result, bool) and result for result in results)
             
             # 发送结果到detokenization进程
-            from ..io_struct import BatchTokenIdOut
-            batch_out = BatchTokenIdOut()
-            metadata = {"success": success, "initialized_adapters": len(target_adapters)}
-            batch_out.reqs_infs.append((request_id, 0, metadata, True, False))  # finished=True
+            batch_out = BatchSysOut()
+            # 添加更详细的信息到metadata中
+            metadata = {
+                "success": success, 
+                "initialized_adapters": len(target_adapters),
+                "init_sys_cache" : True
+            }
+            batch_out.reqs_infs.append((request_id, True, metadata))  # finished=True
             self.send_to_detokenization.send_pyobj(batch_out)
             
             if success:
-                print(f"Successfully initialized system prompt cache for {len(target_adapters)} adapters")
+                print(f"Router(init): Successfully initialized system prompt cache for {len(target_adapters)} adapters")
             else:
-                print(f"Failed to initialize system prompt cache")
+                print(f"Router(init): Failed to initialize system prompt cache")
                 
         except Exception as e:
-            print(f"Error in init_system_prompt_cache: {e}")
+            print(f"Router(init): Error in init_system_prompt_cache: {e}")
             # 发送失败结果
-            from ..io_struct import BatchTokenIdOut
-            batch_out = BatchTokenIdOut()
+            batch_out = BatchSysOut()
             metadata = {"success": False, "error": str(e)}
-            batch_out.reqs_infs.append((request_id, 0, metadata, True, False))
+            batch_out.reqs_infs.append((request_id, False, metadata))
             self.send_to_detokenization.send_pyobj(batch_out)
 
     def clean_up(self):
