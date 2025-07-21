@@ -194,8 +194,8 @@ class HttpServerManager:
             self.req_id_to_out_inf[request_id] = ("", {}, False, event)
             
             try:
-                # 等待最多30秒
-                await asyncio.wait_for(event.wait(), timeout=30)
+                # 等待最多180秒（3分钟），给每个LoRA足够的计算时间
+                await asyncio.wait_for(event.wait(), timeout=180)
                 
                 # 检查结果
                 if request_id in self.req_id_to_out_inf:

@@ -402,18 +402,28 @@ class ModelRpcServer(rpyc.Service):
         
         try:
             import torch
+            print(f"[DEBUG] 开始初始化system prompt缓存")
+            print(f"[DEBUG] prompt_ids长度: {len(prompt_ids) if prompt_ids else 0}")
+            print(f"[DEBUG] adapter_dirs数量: {len(adapter_dirs) if adapter_dirs else 0}")
+            print(f"[DEBUG] adapter_dirs: {adapter_dirs}")
             
             # 确保prompt_ids不为空
             if not prompt_ids or len(prompt_ids) == 0:
                 print("Error: prompt_ids is empty")
                 return False
             
+            # 检查内存状态
+            print(f"[DEBUG] GPU内存使用情况: {torch.cuda.memory_allocated() / 1024**2:.1f}MB / {torch.cuda.max_memory_allocated() / 1024**2:.1f}MB")
+            
             # 初始化内存管理器的system prompt缓存空间
+            print(f"[DEBUG] 初始化内存管理器缓存空间...")
             self.model.mem_manager.init_system_prompt_cache(adapter_dirs, len(prompt_ids))
-            print(f"Initialized system prompt cache space for {len(adapter_dirs)} adapters with {len(prompt_ids)} tokens")
+            print(f"[DEBUG] ✓ 初始化完成，为 {len(adapter_dirs)} 个adapters分配了 {len(prompt_ids)} tokens的缓存空间")
             
             # 为基础模型计算system prompt的KV缓存
+            print(f"[DEBUG] 创建prompt tensor...")
             prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device="cuda").unsqueeze(0)
+            print(f"[DEBUG] prompt tensor shape: {prompt_tensor.shape}")
             
             # 使用模型的prefill来计算KV缓存
             batch_size = 1
@@ -421,33 +431,59 @@ class ModelRpcServer(rpyc.Service):
             max_len_in_batch = len(prompt_ids)
             
             # 准备位置信息
+            print(f"[DEBUG] 准备批处理参数...")
             b_loc = torch.zeros(batch_size, max_len_in_batch, dtype=torch.long, device="cuda")
             b_start_loc = torch.zeros(batch_size, dtype=torch.int32, device="cuda") 
             b_seq_len = torch.full((batch_size,), len(prompt_ids), dtype=torch.int32, device="cuda")
             
             # 分配内存并设置b_loc
-            mem_index = self.model.mem_manager.alloc(total_token_num)
+            print(f"[DEBUG] 分配内存...")
+            try:
+                mem_index = self.model.mem_manager.alloc(total_token_num)
+                print(f"[DEBUG] ✓ 内存分配成功, mem_index范围: {mem_index.min().item()}-{mem_index.max().item()}")
+            except Exception as e:
+                print(f"[DEBUG] ❌ 内存分配失败: {e}")
+                return False
+            
             b_loc[0, :max_len_in_batch] = mem_index
             
             # 基础模型prefill
-            print(f"Computing base model system prompt KV cache...")
-            base_logits = self.model._prefill(batch_size, total_token_num, max_len_in_batch, 
-                                            prompt_tensor.view(-1), b_loc, b_start_loc, b_seq_len)
+            print(f"[DEBUG] 开始计算基础模型的system prompt KV缓存...")
+            try:
+                base_logits = self.model._prefill(batch_size, total_token_num, max_len_in_batch, 
+                                                prompt_tensor.view(-1), b_loc, b_start_loc, b_seq_len)
+                print(f"[DEBUG] ✓ 基础模型prefill完成, logits shape: {base_logits.shape if base_logits is not None else 'None'}")
+            except Exception as e:
+                print(f"[DEBUG] ❌ 基础模型prefill失败: {e}")
+                self.model.mem_manager.free(mem_index)
+                return False
             
             # 提取KV缓存并存储到system prompt缓存中
+            print(f"[DEBUG] 提取KV缓存...")
             key_states = []
             value_states = []
             for layer_id in range(self.model.layers_num):
-                # 获取当前层的KV缓存
-                layer_key_cache = self.model.mem_manager.key_buffer[layer_id][mem_index]
-                layer_value_cache = self.model.mem_manager.value_buffer[layer_id][mem_index] 
-                
-                key_states.append(layer_key_cache.clone())
-                value_states.append(layer_value_cache.clone())
+                try:
+                    # 获取当前层的KV缓存
+                    layer_key_cache = self.model.mem_manager.key_buffer[layer_id][mem_index]
+                    layer_value_cache = self.model.mem_manager.value_buffer[layer_id][mem_index] 
+                    
+                    key_states.append(layer_key_cache.clone())
+                    value_states.append(layer_value_cache.clone())
+                except Exception as e:
+                    print(f"[DEBUG] ❌ 提取第{layer_id}层KV缓存失败: {e}")
+                    self.model.mem_manager.free(mem_index)
+                    return False
             
             # 存储基础模型的system prompt KV缓存
-            self.model.mem_manager.set_system_prompt_kv(key_states, value_states, adapter_dir=None)
-            print(f"Stored base model system prompt KV cache")
+            print(f"[DEBUG] 存储基础模型system prompt KV缓存...")
+            try:
+                self.model.mem_manager.set_system_prompt_kv(key_states, value_states, adapter_dir=None)
+                print(f"[DEBUG] ✓ 基础模型system prompt KV缓存存储成功")
+            except Exception as e:
+                print(f"[DEBUG] ❌ 存储基础模型KV缓存失败: {e}")
+                self.model.mem_manager.free(mem_index)
+                return False
             
             # 为每个adapter计算system prompt的KV缓存
             for adapter_dir in adapter_dirs:

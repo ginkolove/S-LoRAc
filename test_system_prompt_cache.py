@@ -21,7 +21,7 @@ class SLoRASystemPromptTester:
         headers = {"Content-Type": "application/json"}
         
         try:
-            response = self.session.post(url, json=data, headers=headers, timeout=30)
+            response = self.session.post(url, json=data, headers=headers, timeout=200)  # 3分钟以上，匹配服务端超时
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
