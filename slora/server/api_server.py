@@ -107,7 +107,7 @@ async def generate(request: Request) -> Response:
         results_generator = httpserver_manager.generate_with_system_prompt(
             adapter_dir, system_prompt_text, prompt, sampling_params, request_id)
     else:
-        results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
+    results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
 
     # Non-streaming case
     final_output = []
@@ -205,7 +205,7 @@ async def generate_stream(request: Request) -> Response:
         results_generator = httpserver_manager.generate_with_system_prompt(
             adapter_dir, system_prompt_text, prompt, sampling_params, request_id)
     else:
-        results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
+    results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
 
     # Streaming case
     async def stream_results() -> AsyncGenerator[bytes, None]:

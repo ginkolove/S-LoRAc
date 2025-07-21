@@ -15,16 +15,16 @@ class Req:
         self.output_metadata_list = []
         self.has_generate_finished = False
         self.aborted = False
-        
+
         # system_prompt缓存相关属性
         self.use_system_prompt = False
         self.system_prompt_hash = None
 
     def to_rpc_obj(self):
         rpc_obj = {"adapter_dir": self.adapter_dir,
-                   "request_id": self.request_id,
-                   "input_id": self.prompt_ids,
-                   "output_len": self.max_output_len,
+                "request_id": self.request_id,
+                "input_id": self.prompt_ids,
+                "output_len": self.max_output_len,
                    "sampling_param": self.sample_params.to_dict()}
         
         # 添加system_prompt信息到RPC对象
