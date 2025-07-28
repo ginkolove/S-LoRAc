@@ -32,9 +32,9 @@ class LlamaTpPartModel(TpPartBaseModel):
     memory_manager_class = MemoryAllocator
 
     def __init__(self, tp_rank, world_size, weight_dir, 
-                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[], dummy=False):
+                 max_total_token_num, system_prompt_lens,adapter_dirs,mem_adapter_size,load_way="HF", mode=[], dummy=False):
         super().__init__(tp_rank, world_size, weight_dir,
-                         max_total_token_num, mem_adapter_size, load_way, mode, dummy=dummy)
+                         max_total_token_num,system_prompt_lens,adapter_dirs, mem_adapter_size,load_way, mode, dummy=dummy)
         return
     
     def _init_config(self):
@@ -47,19 +47,22 @@ class LlamaTpPartModel(TpPartBaseModel):
         assert self.load_way == "HF", "llama only support HF format to load Now!"
 
     def _init_mem_manager(self):
-        mem_dict = {
-            "int8kv" : INT8KVMemoryManager
-        }
-        for _mode in self.mode:
-            if _mode in mem_dict:
-                print("Model using mode", _mode)
-                self.memory_manager_class = mem_dict[_mode]
+        # mem_dict = {
+        #     "int8kv" : INT8KVMemoryManager
+        # }
+        # for _mode in self.mode:
+        #     if _mode in mem_dict:
+        #         print("Model using mode", _mode)
+        #         self.memory_manager_class = mem_dict[_mode]
         self.mem_manager = self.memory_manager_class(tot_size=self.max_total_token_num + self.mem_adapter_size, 
                                                      cache_size=self.max_total_token_num,
                                                      dtype=torch.float16,
                                                      head_num=self.config["num_attention_heads"] // self.world_size_,
                                                      head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
-                                                     layer_num=self.config["num_hidden_layers"])
+                                                     layer_num=self.config["num_hidden_layers"],
+                                                     system_prompt_lens=self.system_prompt_lens,
+                                                     adapter_dirs=self.adapter_dirs,
+                                                     )
 
     def _init_custom(self):
         """

@@ -33,7 +33,7 @@ class ModelRpcServer(rpyc.Service):
 
     def exposed_init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
                            max_total_token_num, load_way, mode, input_params,
-			   prefetch_stream):
+			   prefetch_stream,system_prompt, system_prompt_ids,system_prompt_lens):
         import torch
         import torch.distributed as dist
         if world_size != 1:
@@ -47,7 +47,9 @@ class ModelRpcServer(rpyc.Service):
         self.mode = mode
         self.input_params = input_params
         self.prefetch_stream = prefetch_stream
-
+        self.system_prompt = system_prompt
+        self.system_prompt_ids = system_prompt_ids
+        self.system_prompt_lens = system_prompt_lens
         self.cache = {}
 
         dist.init_process_group('nccl', init_method=f'tcp://127.0.0.1:{setting["nccl_port"]}', rank=rank_id, world_size=world_size)
@@ -61,6 +63,8 @@ class ModelRpcServer(rpyc.Service):
                 if "num_key_value_heads" in model_cfg.keys():
                     self.model = Llama2TpPartModel(rank_id, world_size, weight_dir,
                                                     max_total_token_num,
+                                                    system_prompt_lens=self.system_prompt_lens,
+                                                    adapter_dirs=adapter_dirs,
                                                     mem_adapter_size=input_params.pool_size_lora,
                                                     load_way=load_way, mode=mode,
                                                     dummy=input_params.dummy)
@@ -68,6 +72,8 @@ class ModelRpcServer(rpyc.Service):
                 else:
                     self.model = LlamaTpPartModel(rank_id, world_size, weight_dir,
                                                     max_total_token_num,
+                                                    system_prompt_lens=self.system_prompt_lens,
+                                                    adapter_dirs=adapter_dirs,
                                                     mem_adapter_size=input_params.pool_size_lora,
                                                     load_way=load_way, mode=mode,
                                                     dummy=input_params.dummy)
@@ -374,6 +380,103 @@ class ModelRpcServer(rpyc.Service):
         engine = LoraPEFTBatchInfer(self.model, infer_adapter=self.infer_adapter)
         engine.merge_adapter()
 
+    def exposed_init_system_prompt_kv(self, system_prompt_ids, adapter_dirs):
+        if self.world_size != 1:
+            system_prompt_ids, adapter_dirs = obtain(system_prompt_ids), obtain(adapter_dirs)
+        try:
+            import torch
+            
+            # 为基础模型计算system prompt的KV缓存
+            prompt_tensor = torch.tensor(system_prompt_ids, dtype=torch.long, device="cuda").unsqueeze(0)
+            
+            # 使用模型的prefill来计算KV缓存
+            batch_size = 1
+            total_token_num = len(system_prompt_ids)
+            max_len_in_batch = len(system_prompt_ids)
+            
+            # 准备位置信息
+            b_loc = torch.zeros(batch_size, max_len_in_batch, dtype=torch.long, device="cuda")
+            b_start_loc = torch.zeros(batch_size, dtype=torch.int32, device="cuda") 
+            b_seq_len = torch.full((batch_size,), len(system_prompt_ids), dtype=torch.int32, device="cuda")
+            
+            # 分配内存并设置b_loc
+            mem_index = self.model.mem_manager.alloc(total_token_num)
+            b_loc[0, :max_len_in_batch] = mem_index
+            
+            # 基础模型prefill
+            print(f"RPCServer: Computing base model system prompt KV cache...")
+            base_logits = self.model._prefill(batch_size, total_token_num, max_len_in_batch, 
+                                            prompt_tensor.view(-1), b_loc, b_start_loc, b_seq_len)
+            
+            # 提取KV缓存并存储到system prompt缓存中
+            key_states = []
+            value_states = []
+            for layer_id in range(self.model.layers_num):
+                # 获取当前层的KV缓存
+                layer_key_cache = self.model.mem_manager.key_buffer[layer_id][mem_index]
+                layer_value_cache = self.model.mem_manager.value_buffer[layer_id][mem_index] 
+                
+                key_states.append(layer_key_cache.clone())
+                value_states.append(layer_value_cache.clone())
+            
+            # 存储基础模型的system prompt KV缓存
+            self.model.mem_manager.set_system_prompt_kv(key_states, value_states, adapter_dir=None)
+            print(f"RPCServer:Stored base model system prompt KV cache")
+            
+            # 释放基础模型的临时内存
+            self.model.mem_manager.free(mem_index)
+            
+            # 为每个adapter计算system prompt的KV缓存
+            for adapter_dir in adapter_dirs:
+                if adapter_dir is None:
+                    continue
+                    
+                print(f"RPCServer::Computing system prompt KV cache for adapter: {adapter_dir}")
+                
+                # 加载adapter
+                adapter = self.adapters[self.adapter_id[adapter_dir]]
+                self.infer_adapter.load_adapters([adapter], prefetch=False)
+                
+                # 创建LoRA引擎
+                engine = LoraUnorderedBatchInfer(self.model, [adapter], infer_adapter=self.infer_adapter)
+                
+                # 重新分配内存（之前的已经被释放）
+                mem_index = self.model.mem_manager.alloc(total_token_num)
+                b_loc[0, :max_len_in_batch] = mem_index
+                
+                # 使用LoRA引擎计算
+                lora_logits = engine.forward(batch_size, total_token_num, max_len_in_batch,
+                                           prompt_tensor.view(-1), b_loc, b_start_loc, b_seq_len,
+                                           is_prefill=True, no_lora_compute=False)
+                
+                # 提取LoRA的KV缓存
+                adapter_key_states = []
+                adapter_value_states = []
+                for layer_id in range(self.model.layers_num):
+                    layer_key_cache = self.model.mem_manager.key_buffer[layer_id][mem_index]
+                    layer_value_cache = self.model.mem_manager.value_buffer[layer_id][mem_index]
+                    
+                    adapter_key_states.append(layer_key_cache.clone())
+                    adapter_value_states.append(layer_value_cache.clone())
+                
+                # 存储adapter的system prompt KV缓存
+                self.model.mem_manager.set_system_prompt_kv(adapter_key_states, adapter_value_states, adapter_dir=adapter_dir)
+                print(f"RPCServer:Stored system prompt KV cache for adapter: {adapter_dir}")
+                
+                # 释放临时内存
+                self.model.mem_manager.free(mem_index)
+                
+                # 卸载adapter
+                self.infer_adapter.offload_adapters([])
+            
+            print(f"RPCServer: Successfully initialized system prompt cache for all {len(adapter_dirs)} adapters")
+            return True
+            
+        except Exception as e:
+            print(f"RPCServer: Error initializing system prompt cache: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
 class ModelRpcClient:
     def __init__(self, model_rpc, world_size, rpc_server_process=None):
@@ -402,6 +505,7 @@ class ModelRpcClient:
             self._merge_batch = async_wrap(self.model.merge_batch)
             self._remove_batch = async_wrap(self.model.remove_batch)
             self._profile_prefill = async_wrap(self.model.profile_prefill)
+            self._init_system_prompt_kv = async_wrap(self.model.init_system_prompt_kv)
         else:
             self._init_model = self.model.exposed_init_model
             self._load_adapters = self.model.exposed_load_adapters
@@ -415,14 +519,15 @@ class ModelRpcClient:
             self._merge_batch = self.model.exposed_merge_batch
             self._remove_batch = self.model.exposed_remove_batch
             self._profile_prefill = self.model.exposed_profile_prefill
+            self._init_system_prompt_kv = self.model.exposed_init_system_prompt_kv
         return
 
     async def init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
                          max_total_token_num, load_way, mode, input_params,
-			 prefetch_stream):
+			 prefetch_stream,system_prompt_lens):
         ans : rpyc.AsyncResult = self._init_model(rank_id, world_size, weight_dir, adapter_dirs,
                                                   max_total_token_num, load_way, mode, input_params,
-						  prefetch_stream)
+						  prefetch_stream,system_prompt_lens)
         if self.use_rpc:
             await ans
             return
@@ -494,6 +599,14 @@ class ModelRpcClient:
         ans = self._profile_prefill()
         if self.use_rpc:
             return await ans
+        else:
+            return ans
+
+    async def init_system_prompt_kv(self,system_prompt_ids, adapter_dirs):
+        ans = self._init_system_prompt_kv(system_prompt_ids, adapter_dirs)
+        if self.use_rpc:
+            await ans
+            return
         else:
             return ans
 

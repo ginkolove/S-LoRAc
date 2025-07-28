@@ -21,6 +21,7 @@ class HttpServerManager:
         max_req_total_len,
         trust_remote_code,
         dummy=False,
+        system_prompt=None,
     ):
         context = zmq.asyncio.Context(2)
         self.send_to_router = context.socket(zmq.PUSH)
@@ -28,18 +29,24 @@ class HttpServerManager:
 
         self.recv_from_detokenization = context.socket(zmq.PULL)
         self.recv_from_detokenization.bind(f"tcp://127.0.0.1:{httpserver_port}")
-
+        self.system_prompt = system_prompt
         try: 
             self.tokenizer = get_tokenizer(model_weightdir, tokenizor_mode, trust_remote_code=trust_remote_code) 
         except:
             if dummy:
                 self.tokenizer = get_tokenizer("huggyllama/llama-7b", tokenizor_mode) 
-
+        self.system_prompt_ids = self.tokenizer.encode(self.system_prompt)
+        self.system_prompt_len = len(self.system_prompt_ids)
         self.req_id_to_out_inf = {}  # value type (out_str, metadata, finished, event)
 
         self.total_token_num = total_token_num
         self.max_req_input_len = max_req_input_len
         self.max_req_total_len = max_req_total_len
+
+    async def init_system_prompt_kv(self):
+        self.send_to_router.send_pyobj(
+            ("init_system_prompt_kv", self.system_prompt_ids)
+        )
 
     async def generate(self, adapter_dir, prompt, sampling_params, request_id):
 

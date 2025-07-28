@@ -65,7 +65,7 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds.
 app = FastAPI()
 
 isFirst = True
-
+SYS_PROMPT ="Hello" * 100
 
 def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse:
     return JSONResponse({"message": message}, status_code=status_code.value)
@@ -411,9 +411,13 @@ def main():
         max_req_total_len=args.max_req_total_len,
         trust_remote_code=args.trust_remote_code,
         dummy=args.dummy,
+        system_prompt = SYS_PROMPT,
     )
     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
+    system_prompt = SYS_PROMPT
+    system_prompt_ids = httpserver_manager.system_prompt_ids
+    system_prompt_len = httpserver_manager.system_prompt_len
     proc_router = mp.Process(
         target=start_router_process,
         args=(
@@ -423,6 +427,9 @@ def main():
             model_rpc_ports,
             args.mode,
             pipe_router_writer,
+            system_prompt,
+            system_prompt_ids,
+            system_prompt_len,
         ),
     )
     proc_router.start()

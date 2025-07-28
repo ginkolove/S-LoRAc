@@ -8,7 +8,7 @@ def suffix_cumsum(tensor, dim=-1, dtype=torch.int32):
 
 
 class MemoryAllocator:
-    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num):
+    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num,system_prompt_lens, adapter_dirs):
         assert tot_size >= cache_size
         self.dtype = dtype
         self.head_num = head_num
@@ -18,8 +18,13 @@ class MemoryAllocator:
 
         self.tot_size = tot_size
         self.cache_size = cache_size
+        self.system_prompt_lens = system_prompt_lens
+        self.adapter_dirs = adapter_dirs
+        self.base_system_prompt_kv ={}
+        self.adapters_system_prompt_kv = {}
 
         self.reset_all_pool()
+        self.reset_system_prompt_kv()
 
 
     def get_memory_size(self):
@@ -218,6 +223,56 @@ class MemoryAllocator:
     def delete_all_cache(self):
         self.delete_all_pool()
 
+    def reset_system_prompt_kv(self):
+        if self.system_prompt_lens is not None:
+            self.base_system_prompt_kv ={
+                "key": [torch.empty((self.system_prompt_lens, self.head_num, self.head_dim),
+                                       dtype=self.dtype, device="cuda")
+                           for _ in range(self.layer_num)],
+                "value": [torch.empty((self.system_prompt_lens, self.head_num, self.head_dim),
+                                      dtype=self.dtype, device="cuda")
+                          for _ in range(self.layer_num)]
+            }
+            for adpater_dir in self.adapter_dirs:
+                self.adapters_system_prompt_kv[adpater_dir] = {
+                "key": [torch.empty((self.system_prompt_lens, self.head_num, self.head_dim),
+                                       dtype=self.dtype, device="cuda")
+                           for _ in range(self.layer_num)],
+                "value": [torch.empty((self.system_prompt_lens, self.head_num, self.head_dim),
+                                      dtype=self.dtype, device="cuda")
+                          for _ in range(self.layer_num)]
+                }
+
+    def get_system_prompt_kv(self, adapter_dir=None):
+        if adapter_dir is None:
+            return self.base_system_prompt_kv
+        else:
+            return self.adapters_system_prompt_kv.get(adapter_dir, None)
+        
+    def set_system_prompt_kv(self, key_list, value_list, adapter_dir=None):
+        if adapter_dir is None:
+            for i in range(self.layer_num):
+                self.base_system_prompt_kv["key"][i].copy_(key_list[i])
+                self.base_system_prompt_kv["value"][i].copy_(value_list[i])
+        else:
+            if adapter_dir not in self.adapters_system_prompt_kv:
+                raise ValueError(f"Adapter directory {adapter_dir} not found in system prompt KV storage.")
+            for i in range(self.layer_num):
+                self.adapters_system_prompt_kv[adapter_dir]["key"][i].copy_(key_list[i])
+                self.adapters_system_prompt_kv[adapter_dir]["value"][i].copy_(value_list[i])
+    
+    def has_system_prompt_kv(self, adapter_dir=None):
+        if adapter_dir is None:
+            return self.base_system_prompt_kv is not None
+        else:
+            return adapter_dir in self.adapters_system_prompt_kv and \
+                   self.adapters_system_prompt_kv[adapter_dir] is not None
+        
+    def get_system_prompt_kv(self, adapter_dir=None):
+        if adapter_dir is None:
+            return self.base_system_prompt_kv
+        else:
+            return self.adapters_system_prompt_kv.get(adapter_dir, None)
 
     def reset_all_pool(self):
         self.mem_state = torch.ones((self.tot_size,), dtype=torch.bool, device="cuda")

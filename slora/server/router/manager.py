@@ -55,7 +55,7 @@ class RouterManager:
 
     def __init__(self, weightdir, adapter_dirs, load_way, world_size, eos_id,
                  router_port, detokenization_port, model_rpc_ports,
-                 input_params,
+                 input_params,system_prompt, system_prompt_ids, system_prompt_len,
                  mode=[], log_stats=True, log_stats_interval=10):
         self.model_weightdir = weightdir
         self.adapter_dirs = adapter_dirs
@@ -63,6 +63,9 @@ class RouterManager:
         self.load_way = load_way
         self.mode = mode
         self.input_params = input_params
+        self.system_prompt = system_prompt
+        self.system_prompt_ids = system_prompt_ids
+        self.system_prompt_len = system_prompt_len
 
         if self.input_params.prefetch:
             self.prefetch_stream = torch.cuda.Stream()
@@ -113,10 +116,29 @@ class RouterManager:
                     self.mode,
                     input_params=self.input_params,
                     prefetch_stream=self.prefetch_stream,
+                    system_prompt=self.system_prompt,
+                    system_prompt_ids=self.system_prompt_ids,
+                    system_prompt_lens=self.system_prompt_len,
                 ))
 
         await asyncio.gather(*init_model_ret)
         return
+    
+    async def init_system_prompt_kv(self):
+        res=[]
+        for rank_id in range(self.world_size):  # async init model process
+            res.append(
+                self.model_rpcs[rank_id].init_system_prompt_kv(system_prompt_ids=self.system_prompt_ids,adapter_dirs=self.adapter_dirs))
+        results = await asyncio.gather(*res)
+        success = True
+        for rank_result in results:
+            if self.world_size != 1:
+                rank_result = obtain(rank_result)
+            if rank_result is not True:
+                success = False
+                break
+                
+        print("Init system prompt kv result:", success)
     
     async def profile_prefill(self):
         res = []
@@ -376,7 +398,7 @@ class RouterManager:
         return
 
 
-def start_router_process(args, router_port, detokenization_port, model_rpc_ports, mode, pipe_writer):
+def start_router_process(args, router_port, detokenization_port, model_rpc_ports, mode, pipe_writer,system_prompt, system_prompt_ids, system_prompt_len):
     input_params = InputParams(max_req_total_len=args.max_req_total_len,
                                # kv cache manager parameters
                                max_total_token_num=args.max_total_token_num,
@@ -413,12 +435,16 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
             detokenization_port=detokenization_port,
             model_rpc_ports=model_rpc_ports,
             input_params=input_params,
+            system_prompt=system_prompt,
+            system_prompt_ids=system_prompt_ids,
+            system_prompt_len=system_prompt_len,
             mode=mode,
             log_stats = not args.disable_log_stats,
             log_stats_interval = args.log_stats_interval,
         )
     
         asyncio.run(router.wait_to_model_ready())
+        asyncio.run(router.init_system_prompt_kv())
         if input_params.profile:
             asyncio.run(router.profile_prefill())
         if input_params.scheduler == "pets" and input_params.profile:

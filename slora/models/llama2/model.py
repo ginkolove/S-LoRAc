@@ -16,10 +16,10 @@ class Llama2TpPartModel(LlamaTpPartModel):
     transformer_layer_infer_class = Llama2TransformerLayerInfer
 
     def __init__(self, tp_rank, world_size, weight_dir,
-                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[],
+                 max_total_token_num, system_prompt_lens,adapter_dirs,mem_adapter_size, load_way="HF", mode=[],
                  dummy=False):
         super().__init__(tp_rank, world_size, weight_dir,
-                         max_total_token_num, mem_adapter_size, load_way, mode, dummy=dummy)
+                         max_total_token_num, system_prompt_lens,adapter_dirs,mem_adapter_size, load_way, mode, dummy=dummy)
     
 
     def _init_config(self):
