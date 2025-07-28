@@ -116,8 +116,6 @@ class RouterManager:
                     self.mode,
                     input_params=self.input_params,
                     prefetch_stream=self.prefetch_stream,
-                    system_prompt=self.system_prompt,
-                    system_prompt_ids=self.system_prompt_ids,
                     system_prompt_lens=self.system_prompt_len,
                 ))
 

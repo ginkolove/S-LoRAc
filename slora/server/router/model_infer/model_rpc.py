@@ -33,7 +33,7 @@ class ModelRpcServer(rpyc.Service):
 
     def exposed_init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
                            max_total_token_num, load_way, mode, input_params,
-			   prefetch_stream,system_prompt, system_prompt_ids,system_prompt_lens):
+			   prefetch_stream,system_prompt_lens):
         import torch
         import torch.distributed as dist
         if world_size != 1:
@@ -47,8 +47,6 @@ class ModelRpcServer(rpyc.Service):
         self.mode = mode
         self.input_params = input_params
         self.prefetch_stream = prefetch_stream
-        self.system_prompt = system_prompt
-        self.system_prompt_ids = system_prompt_ids
         self.system_prompt_lens = system_prompt_lens
         self.cache = {}
 
