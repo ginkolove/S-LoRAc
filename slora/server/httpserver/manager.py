@@ -21,6 +21,7 @@ class HttpServerManager:
         max_req_total_len,
         trust_remote_code,
         dummy=False,
+        system_prompt=None
     ):
         context = zmq.asyncio.Context(2)
         self.send_to_router = context.socket(zmq.PUSH)
@@ -28,21 +29,21 @@ class HttpServerManager:
 
         self.recv_from_detokenization = context.socket(zmq.PULL)
         self.recv_from_detokenization.bind(f"tcp://127.0.0.1:{httpserver_port}")
-
+        self.system_rpmpt = system_prompt
         try: 
             self.tokenizer = get_tokenizer(model_weightdir, tokenizor_mode, trust_remote_code=trust_remote_code) 
         except:
             if dummy:
                 self.tokenizer = get_tokenizer("huggyllama/llama-7b", tokenizor_mode) 
-
+        self.system_ids = self.tokenizer.encode(system_prompt) if system_prompt else None
+        self.system_prompt_lens = len(self.system_ids) if self.system_ids else 0
         self.req_id_to_out_inf = {}  # value type (out_str, metadata, finished, event)
-
+        self.sys_init_out={}
         self.total_token_num = total_token_num
         self.max_req_input_len = max_req_input_len
         self.max_req_total_len = max_req_total_len
 
     async def generate(self, adapter_dir, prompt, sampling_params, request_id):
-
         prompt_ids = self.tokenizer.encode(prompt)
         prompt_tokens = len(prompt_ids)
         if prompt_tokens > self.max_req_input_len:
@@ -87,7 +88,7 @@ class HttpServerManager:
                 break
         return
 
-    async def generate_with_system_prompt(self, adapter_dir, system_prompt_text, user_prompt, sampling_params, request_id):
+    async def generate_with_system_prompt(self, adapter_dir, user_prompt, sampling_params, request_id):
         """
         使用system_prompt缓存进行推理
         
@@ -122,8 +123,8 @@ class HttpServerManager:
         sampling_params.stop_sentences_to_token_ids(self.tokenizer)
 
         # 发送带system_prompt标识的请求 (adapter_dir, prompt_ids, sampling_params, request_id, use_system_prompt, system_prompt_hash)
-        system_prompt_hash = hash(system_prompt_text)
-        system_prompt_request = (adapter_dir, user_prompt_ids, sampling_params, request_id, True, system_prompt_hash)
+
+        system_prompt_request = (adapter_dir, user_prompt_ids, sampling_params, request_id, True)
         self.send_to_router.send_pyobj(system_prompt_request)
         
         event = asyncio.Event()
@@ -161,63 +162,52 @@ class HttpServerManager:
             pass
         return
 
-    async def init_system_prompt_cache(self, system_prompt, lora_dirs=None):
+    async def init_system_prompt_cache(self):
         """
         初始化system_prompt的KV缓存
         
-        Args:
-            system_prompt (str): system prompt文本
-            lora_dirs (List[str], optional): 要初始化的lora目录列表，None表示所有lora
-            
         Returns:
-            bool: 初始化是否成功
+            tuple: (success: bool, metadata: dict) 初始化是否成功和相关信息
         """
         try:
-            # tokenize system prompt
-            prompt_ids = self.tokenizer.encode(system_prompt)
-            prompt_tokens = len(prompt_ids)
-            
-            # if prompt_tokens > self.max_req_input_len:
-            #     raise ValueError(f"System prompt too long: {prompt_tokens} > {self.max_req_input_len}")
-            
             # 发送system prompt初始化请求到router
             # 使用特殊的request_id来标识这是system prompt初始化请求
-            request_id = f"system_prompt_init_{hash(system_prompt)}"
+            request_id = f"system_prompt_init_{hash(self.system_rpmpt) if self.system_rpmpt else 0}"
             
-            # 发送初始化请求：常规请求+is_system_prompt标志+lora_dirs
-            # (adapter_dir, prompt_ids, sampling_params, request_id, is_system_prompt, lora_dirs)
-            init_request = ("system_prompt_init", prompt_ids, None, request_id, True, lora_dirs)
+            # 发送初始化请求
+            init_request = ("system_prompt_init", self.system_ids, request_id)
             self.send_to_router.send_pyobj(init_request)
             
-            # 等待初始化完成的确认
-            event = asyncio.Event()
-            self.req_id_to_out_inf[request_id] = ("", {}, False, event)
+            # 等待初始化完成的确认，使用轮询方式检查sys_init_out
+            timeout_counter = 0
+            max_timeout = 60  # 60秒超时
             
-            try:
-                # 等待最多200秒
-                await asyncio.wait_for(event.wait(), timeout=60)
+            while timeout_counter < max_timeout:
+                await asyncio.sleep(1)  # 每秒检查一次
+                timeout_counter += 1
                 
-                # 检查结果
-                if request_id in self.req_id_to_out_inf:
-                    _,  finished, _ = self.req_id_to_out_inf[request_id]
-                    if finished:
+                # 检查是否有初始化结果
+                if request_id in self.sys_init_out:
+                    result = self.sys_init_out[request_id]
                     # 清理
-                        try:
-                            del self.req_id_to_out_inf[request_id]
-                        except:
-                            pass
+                    try:
+                        del self.sys_init_out[request_id]
+                    except:
+                        pass
                     
-                    return finished
-                else:
-                    return False, {}
+                    # 解析结果
+                    if isinstance(result, dict):
+                        success = result.get("success", False)
+                        metadata = result.get("metadata", {})
+                    else:
+                        # 兼容旧格式
+                        success = bool(result)
+                        metadata = {"raw_result": result}
                     
-            except asyncio.TimeoutError:
-                # 清理超时的请求
-                try:
-                    del self.req_id_to_out_inf[request_id]
-                except:
-                    pass
-                return False, {"error": "Timeout waiting for system prompt cache initialization"}
+                    return success, metadata
+            
+            # 超时
+            return False, {"error": "Timeout waiting for system prompt cache initialization"}
                 
         except Exception as e:
             print(f"HTTP: Error initializing system prompt cache: {e}")
@@ -225,7 +215,7 @@ class HttpServerManager:
 
     async def handle_loop(self):
         while True:
-            recv_ans:Union(BatchStrOut, BatchAbortReq, BatchSysOut) = await self.recv_from_detokenization.recv_pyobj()
+            recv_ans = await self.recv_from_detokenization.recv_pyobj()
             assert isinstance(recv_ans, (BatchStrOut, BatchAbortReq,BatchSysOut)), f"error recv type {type(recv_ans)}"
             if isinstance(recv_ans, BatchStrOut):
                 for req_id, text, metadata, finished, abort in recv_ans.reqs_infs:
@@ -245,11 +235,12 @@ class HttpServerManager:
                         pass
             elif isinstance(recv_ans, BatchSysOut):
                 # 处理system prompt初始化的响应
-                for req_id, init_system_prompt, metadata in recv_ans.reqs_infs:
-                    if req_id in self.req_id_to_out_inf:
-                        _, _, finished, event = self.req_id_to_out_inf[req_id]
-                        self.req_id_to_out_inf[req_id] = ("", metadata, finished, event)
-                        event.set()
+                for req_id, success, metadata in recv_ans.reqs_infs:
+                    # 将结果存储到sys_init_out中，包含success状态和metadata
+                    self.sys_init_out[req_id] = {
+                        "success": success,
+                        "metadata": metadata
+                    }
             elif isinstance(recv_ans, BatchAbortReq):
                 print("abort reqs:", recv_ans.reqs)
                 for req_id in recv_ans.reqs:

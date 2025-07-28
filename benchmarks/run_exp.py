@@ -29,11 +29,6 @@ GB = 1024 ** 3
 REQUEST_LATENCY: List[Tuple[int, int, float]] = []
 vllm_packed_adapter_dir_to_url_map = {}
 
-def get_peak_mem(server):
-    url = server + "/get_peak_mem"
-    response = requests.post(url)
-    return response.json()["peak_mem"]
-
 
 async def send_request(
     backend: str,
@@ -318,7 +313,7 @@ if __name__ == "__main__":
         args.output = "debug_" + args.output
 
     suites = get_all_suites(mode=args.mode, debug=args.debug, suite=args.suite, breakdown=args.breakdown)
-
+    
     if not args.append:
         os.system(f"rm {args.output}")
         results = []

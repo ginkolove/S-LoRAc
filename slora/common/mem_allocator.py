@@ -8,7 +8,7 @@ def suffix_cumsum(tensor, dim=-1, dtype=torch.int32):
 
 
 class MemoryAllocator:
-    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num, system_prompt_size=0):
+    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num, system_prompt_lens=0,adapter_dirs=None):
         assert tot_size >= cache_size
         self.dtype = dtype
         self.head_num = head_num
@@ -19,7 +19,8 @@ class MemoryAllocator:
         self.tot_size = tot_size
         self.cache_size = cache_size
         # 新增：system_prompt专用空间大小
-        self.system_prompt_size = system_prompt_size
+        self.system_prompt_lens = system_prompt_lens
+        self.adapter_dirs = adapter_dirs
         # system_prompt缓存相关
         self.system_prompt_kv_caches = {}  # {adapter_dir: (key_cache, value_cache)}
         self.base_system_prompt_kv = None  # 基础模型的system_prompt KV缓存
@@ -29,11 +30,11 @@ class MemoryAllocator:
 
     def get_memory_size(self):
         dsize = 2 if self.dtype == torch.float16 else None
-        total_system_prompt_size = self.system_prompt_size * len(self.system_prompt_kv_caches)
-        return 2 * self.layer_num * (self.tot_size + total_system_prompt_size) * self.cell_size * dsize
+        total_system_prompt_lens = self.system_prompt_lens * len(self.system_prompt_kv_caches)
+        return 2 * self.layer_num * (self.tot_size + total_system_prompt_lens) * self.cell_size * dsize
 
 
-    def init_system_prompt_cache(self, adapter_dirs, system_prompt_tokens):
+    def init_system_prompt_cache(self):
         """
         初始化system_prompt的KV缓存空间
         
@@ -41,26 +42,25 @@ class MemoryAllocator:
             adapter_dirs (List[str]): 所有adapter的目录列表
             system_prompt_tokens (int): system_prompt的token数量
         """
-        self.system_prompt_tokens = system_prompt_tokens
         
         # 为基础模型分配system_prompt KV缓存
-        if system_prompt_tokens > 0:
+        if self.system_prompt_lens > 0:
             self.base_system_prompt_kv = {
-                'key_cache': [torch.empty((system_prompt_tokens, self.head_num, self.head_dim),
+                'key_cache': [torch.empty((self.system_prompt_lens, self.head_num, self.head_dim),
                                         dtype=self.dtype, device="cuda")
                             for _ in range(self.layer_num)],
-                'value_cache': [torch.empty((system_prompt_tokens, self.head_num, self.head_dim),
-                                          dtype=self.dtype, device="cuda") 
+                'value_cache': [torch.empty((self.system_prompt_lens, self.head_num, self.head_dim),
+                                          dtype=self.dtype, device="cuda")
                               for _ in range(self.layer_num)]
             }
             
             # 为每个adapter分配system_prompt KV缓存
-            for adapter_dir in adapter_dirs:
+            for adapter_dir in self.adapter_dirs:
                 self.system_prompt_kv_caches[adapter_dir] = {
-                    'key_cache': [torch.empty((system_prompt_tokens, self.head_num, self.head_dim),
+                    'key_cache': [torch.empty((self.system_prompt_lens, self.head_num, self.head_dim),
                                             dtype=self.dtype, device="cuda")
                                 for _ in range(self.layer_num)],
-                    'value_cache': [torch.empty((system_prompt_tokens, self.head_num, self.head_dim),
+                    'value_cache': [torch.empty((self.system_prompt_lens, self.head_num, self.head_dim),
                                               dtype=self.dtype, device="cuda")
                                   for _ in range(self.layer_num)]
                 }
@@ -329,7 +329,7 @@ class MemoryAllocator:
         self.value_buffer = [torch.empty((self.tot_size, self.head_num, self.head_dim),
                                        dtype=self.dtype, device="cuda")
                            for _ in range(self.layer_num)]
- 
+        self.init_system_prompt_cache()
 
     def reset_all_cache(self):
         self.reset_all_pool()

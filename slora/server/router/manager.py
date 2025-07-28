@@ -56,13 +56,16 @@ class RouterManager:
     def __init__(self, weightdir, adapter_dirs, load_way, world_size, eos_id,
                  router_port, detokenization_port, model_rpc_ports,
                  input_params,
-                 mode=[], log_stats=True, log_stats_interval=10):
+                 mode=[], log_stats=True, log_stats_interval=10, system_prompt_lens=0,system_prompt_ids=None, system_prompt=None):
         self.model_weightdir = weightdir
         self.adapter_dirs = adapter_dirs
         self.world_size = world_size
         self.load_way = load_way
         self.mode = mode
         self.input_params = input_params
+        self.system_prompt_lens = system_prompt_lens  # 存储系统提示词长度
+        self.system_prompt_ids = system_prompt_ids
+        self.system_prompt = system_prompt
 
         if self.input_params.prefetch:
             self.prefetch_stream = torch.cuda.Stream()
@@ -113,6 +116,7 @@ class RouterManager:
                     self.mode,
                     input_params=self.input_params,
                     prefetch_stream=self.prefetch_stream,
+                    system_prompt_lens=self.system_prompt_lens,
                 ))
 
         await asyncio.gather(*init_model_ret)
@@ -143,18 +147,14 @@ class RouterManager:
         sampling_params: SamplingParams,
         request_id: str,
         use_system_prompt: bool = False,
-        system_prompt_hash: int = None
     ):
         req = Req(adapter_dir, request_id, prompt_ids, sampling_params)
         
         # 如果使用system_prompt缓存，添加相关信息
         if use_system_prompt:
             req.use_system_prompt = True
-            req.system_prompt_hash = system_prompt_hash
-            print(f"Request {request_id} will use system prompt cache (hash: {system_prompt_hash})")
         else:
             req.use_system_prompt = False
-            req.system_prompt_hash = None
             
         self.req_queue.append(req)
         self.send_to_detokenization.send_pyobj(req.to_req_detokenization_state())
@@ -372,12 +372,16 @@ class RouterManager:
             if isinstance(recv_req, tuple) and len(recv_req) == 4:
                 adapter_dir, prompt_ids, sampling_params, request_id = recv_req
                 self.add_req(adapter_dir, prompt_ids, sampling_params, request_id)
-            elif isinstance(recv_req, tuple) and len(recv_req) == 6:
+            elif isinstance(recv_req, tuple) and len(recv_req) == 3:
                 # system prompt初始化请求或system prompt推理请求
-                sys_init, prompt_ids, sampling_params, request_id, flag, lora_dirs = recv_req
-                if flag is True and sys_init == "system_prompt_init" and isinstance(lora_dirs, list):
+                sys_init, prompt_ids, request_id = recv_req
+                if  sys_init == "system_prompt_init" :
                     # system prompt初始化请求: (adapter_dir, prompt_ids, sampling_params, request_id, is_system_prompt, lora_dirs)
-                    await self.init_system_prompt_cache(prompt_ids, lora_dirs, request_id)
+                    await self.init_system_prompt_cache(prompt_ids, request_id)
+            elif isinstance(recv_req, tuple) and len(recv_req) == 5:
+                # system prompt推理请求: (adapter_dir, prompt_ids, sampling_params, request_id, use_system_prompt)
+                adapter_dir, prompt_ids, sampling_params, request_id, use_system_prompt = recv_req
+                self.add_req(adapter_dir, prompt_ids, sampling_params, request_id, use_system_prompt)
             elif isinstance(recv_req, AbortReq):
                 abort_req = recv_req
                 request_id = abort_req.req_id
@@ -386,7 +390,7 @@ class RouterManager:
             else:
                 assert False, f"Router(loop): Error Req Inf {recv_req}"
 
-    async def init_system_prompt_cache(self, prompt_ids, lora_dirs, request_id):
+    async def init_system_prompt_cache(self, prompt_ids, request_id):
         """
         初始化system prompt的KV缓存
         
@@ -397,10 +401,9 @@ class RouterManager:
         """
         try:
             # 如果lora_dirs为空，则使用所有adapter
-            if lora_dirs is None or len(lora_dirs) == 0:
-                target_adapters = self.adapter_dirs
-            else:
-                target_adapters = lora_dirs
+
+            target_adapters = self.adapter_dirs
+            
             
             # 调用所有模型进程来初始化system prompt缓存
             init_tasks = []
@@ -423,7 +426,7 @@ class RouterManager:
                 "initialized_adapters": len(target_adapters),
                 "init_sys_cache" : True
             }
-            batch_out.reqs_infs.append((request_id, True, metadata))  # finished=True
+            batch_out.reqs_infs.append(("init_system", True, metadata))  # finished=True
             self.send_to_detokenization.send_pyobj(batch_out)
             
             if success:
@@ -447,7 +450,7 @@ class RouterManager:
         return
 
 
-def start_router_process(args, router_port, detokenization_port, model_rpc_ports, mode, pipe_writer):
+def start_router_process(args, router_port, detokenization_port, model_rpc_ports, mode, pipe_writer, system_prompt_lens=0,system_prompt_ids=None, system_prompt=None):
     input_params = InputParams(max_req_total_len=args.max_req_total_len,
                                # kv cache manager parameters
                                max_total_token_num=args.max_total_token_num,
@@ -487,6 +490,9 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
             mode=mode,
             log_stats = not args.disable_log_stats,
             log_stats_interval = args.log_stats_interval,
+            system_prompt_lens = system_prompt_lens,
+            system_prompt_ids=system_prompt_ids,
+            system_prompt=system_prompt,
         )
     
         asyncio.run(router.wait_to_model_ready())

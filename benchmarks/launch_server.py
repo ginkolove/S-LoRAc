@@ -47,10 +47,26 @@ if __name__ == "__main__":
         cmd += f" --model {base_model}"
         cmd += f" --tokenizer_mode auto"
 
+    cmd += f"-- num_adapter {args.num_adapter}"
+        # 计算生成的适配器总数
+        adapter_count = 0
+        adapter_list = []
         num_iter = args.num_adapter // len(adapter_dirs) + 1
+        
+        # 首先生成所有可能的适配器名称
         for i in range(num_iter):
             for adapter_dir in adapter_dirs:
-                cmd += f" --lora {adapter_dir}-{i}"
+                adapter_list.append(f"{adapter_dir}-{i}")
+                adapter_count += 1
+                # 如果已经达到指定数量，则停止生成
+                if adapter_count >= args.num_adapter:
+                    break
+            if adapter_count >= args.num_adapter:
+                break
+        
+        # 将适配器名称添加到命令中
+        for adapter_name in adapter_list[:args.num_adapter]:
+            cmd += f" --lora {adapter_name}"
 
         if args.dummy:
             cmd += " --dummy"

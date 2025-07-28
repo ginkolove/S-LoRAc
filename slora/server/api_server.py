@@ -66,7 +66,7 @@ app = FastAPI()
 
 isFirst = True
 
-
+SYS_PROMPT="Hello" * 100
 def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse:
     return JSONResponse({"message": message}, status_code=status_code.value)
 
@@ -148,24 +148,23 @@ async def init_system_prompt(request: Request):
 
     try:
         request_dict = await request.json()
-        system_prompt = request_dict.get("system_prompt", "")
-        lora_dirs = request_dict.get("lora_dirs", [])  # 可以指定特定的LoRA，为空则初始化所有LoRA
-        
-        if not system_prompt:
-            return create_error_response(HTTPStatus.BAD_REQUEST, "system_prompt is required")
+        init_sys = request_dict.get("init_system", False)
+        if not init_sys:
+            return create_error_response(HTTPStatus.BAD_REQUEST, "not init system prompt, please set init_system to true")
         
         # 调用httpserver_manager来初始化system_prompt缓存
-        success = await httpserver_manager.init_system_prompt_cache(system_prompt, lora_dirs)
+        success, metadata = await httpserver_manager.init_system_prompt_cache()
         
         if success:
             ret = {
                 "status": "success",
-                "message": f"System prompt KV cache initialized for {len(lora_dirs) if lora_dirs else 'all'} adapters",
-                "system_prompt_length": len(system_prompt)
+                "message": "System prompt KV cache initialized successfully",
+                "system_prompt_length": httpserver_manager.system_prompt_lens,
+                "metadata": metadata
             }
             return Response(content=json.dumps(ret, ensure_ascii=False).encode("utf-8"))
         else:
-            error_message = "error, Failed to initialize system prompt cache"
+            error_message = f"Failed to initialize system prompt cache: {metadata.get('error', 'Unknown error')}"
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, error_message)
             
     except Exception as e:
@@ -191,7 +190,7 @@ async def generate_stream(request: Request) -> Response:
     return_details = sample_params_dict.pop("return_details", False)
     sampling_params = SamplingParams(**sample_params_dict)
     sampling_params.verify()
-
+  
     if "req_id" in request_dict:
         request_id = request_dict["req_id"]
     else:
@@ -200,7 +199,7 @@ async def generate_stream(request: Request) -> Response:
     # 根据是否使用system_prompt选择不同的生成器
     if use_system_prompt:
         results_generator = httpserver_manager.generate_with_system_prompt(
-            adapter_dir, system_prompt_text, prompt, sampling_params, request_id)
+            adapter_dir, prompt, sampling_params, request_id)
     else:
         results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
 
@@ -436,6 +435,9 @@ def main():
     parser.add_argument("--no-lora", action="store_true")
     ''' end of slora arguments '''
 
+    #lorac parameters
+    parser.add_argument("--system_prompt", type=str, default=None)
+
     args = parser.parse_args()
 
     assert args.max_req_input_len < args.max_req_total_len
@@ -468,9 +470,14 @@ def main():
         max_req_total_len=args.max_req_total_len,
         trust_remote_code=args.trust_remote_code,
         dummy=args.dummy,
+        system_prompt=args.system_prompt,
     )
     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
+    # 获取system_prompt_lens用于传递给RouterManager
+    system_prompt_lens = httpserver_manager.system_prompt_lens
+    system_prompt_ids = httpserver_manager.system_ids
+    system_prompt = httpserver_manager.system_prompt
     proc_router = mp.Process(
         target=start_router_process,
         args=(
@@ -480,6 +487,9 @@ def main():
             model_rpc_ports,
             args.mode,
             pipe_router_writer,
+            system_prompt_lens,
+            system_prompt_ids,
+            system_prompt,
         ),
     )
     proc_router.start()

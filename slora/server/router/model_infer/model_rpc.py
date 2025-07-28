@@ -33,7 +33,7 @@ class ModelRpcServer(rpyc.Service):
 
     def exposed_init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
                            max_total_token_num, load_way, mode, input_params,
-			   prefetch_stream):
+			   prefetch_stream,system_prompt_lens=0):
         import torch
         import torch.distributed as dist
         if world_size != 1:
@@ -47,6 +47,7 @@ class ModelRpcServer(rpyc.Service):
         self.mode = mode
         self.input_params = input_params
         self.prefetch_stream = prefetch_stream
+        self.system_prompt_lens = system_prompt_lens
 
         self.cache = {}
 
@@ -70,7 +71,7 @@ class ModelRpcServer(rpyc.Service):
                                                     max_total_token_num,
                                                     mem_adapter_size=input_params.pool_size_lora,
                                                     load_way=load_way, mode=mode,
-                                                    dummy=input_params.dummy)
+                                                    dummy=input_params.dummy,system_prompt_lens=self.system_prompt_lens,adapter_dirs=self.adapter_dirs)
             else:
                 raise Exception(f"can not support {self.model_type} now")
         except Exception as e:
@@ -408,9 +409,6 @@ class ModelRpcServer(rpyc.Service):
                 print("Error: prompt_ids is empty")
                 return False
             
-            # 初始化内存管理器的system prompt缓存空间
-            self.model.mem_manager.init_system_prompt_cache(adapter_dirs, len(prompt_ids))
-            print(f"RPCServer:Initialized system prompt cache space for {len(adapter_dirs)} adapters with {len(prompt_ids)} tokens")
             
             # 为基础模型计算system prompt的KV缓存
             prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device="cuda").unsqueeze(0)
@@ -551,10 +549,10 @@ class ModelRpcClient:
 
     async def init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
                          max_total_token_num, load_way, mode, input_params,
-			 prefetch_stream):
+			 prefetch_stream,system_prompt_lens=0):
         ans : rpyc.AsyncResult = self._init_model(rank_id, world_size, weight_dir, adapter_dirs,
                                                   max_total_token_num, load_way, mode, input_params,
-						  prefetch_stream)
+						  prefetch_stream,system_prompt_lens)
         if self.use_rpc:
             await ans
             return

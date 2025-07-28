@@ -18,7 +18,7 @@ class Req:
         
         # system_prompt缓存相关属性
         self.use_system_prompt = False
-        self.system_prompt_hash = None
+
 
     def to_rpc_obj(self):
         rpc_obj = {"adapter_dir": self.adapter_dir,
@@ -30,7 +30,6 @@ class Req:
         # 添加system_prompt信息到RPC对象
         if self.use_system_prompt:
             rpc_obj["use_system_prompt"] = True
-            rpc_obj["system_prompt_hash"] = self.system_prompt_hash
         else:
             rpc_obj["use_system_prompt"] = False
             
