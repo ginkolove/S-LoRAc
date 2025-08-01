@@ -7,7 +7,7 @@ from typing import List, Tuple, Any
 from tqdm import tqdm
 import random
 from transformers import AutoTokenizer
-
+from sysprompt import system_pormpt
 class Request:
     def __init__(self, req_id, model_dir, adapter_dir, prompt, prompt_len, output_len, req_time):
         self.req_id = req_id
@@ -43,7 +43,7 @@ def generate_requests(num_adapters, alpha, req_rate, cv, duration,
     ind = (probs * num_adapters).astype(int)
 
     # generate input output len
-    input_lens = np.random.randint(input_range[0], input_range[1], tot_req)
+    input_lens = np.full(tot_req, len(system_pormpt))
     output_lens = np.random.randint(output_range[0], output_range[1], tot_req)
 
     # generate timestamp
@@ -56,7 +56,7 @@ def generate_requests(num_adapters, alpha, req_rate, cv, duration,
     for i in range(tot_req):
         tic += intervals[i]
         requests.append(Request(i, adapter_dirs[ind[i]][0], adapter_dirs[ind[i]][1],
-                                dummy_prompt(input_lens[i]), int(input_lens[i]), int(output_lens[i]),
+                                system_pormpt, int(input_lens[i]), int(output_lens[i]),
                                 tic))
     return requests
 
