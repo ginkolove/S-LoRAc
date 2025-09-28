@@ -5,7 +5,7 @@ import collections
 from slora.common.configs.config import setting
 from dataclasses import dataclass
 from typing import List, Dict
-from slora.common.mem_manager import MemoryManager
+# from slora.common.mem_manager import MemoryManager
 from slora.utils.infer_utils import mark_start, mark_end
 from slora.utils.infer_utils import calculate_time
 
@@ -54,7 +54,7 @@ class InferBatch:
     nopad_b_loc: torch.Tensor
     nopad_b_start_loc: torch.Tensor
     nopad_b_seq_len: torch.Tensor
-    mem_manager: MemoryManager
+    # mem_manager: MemoryManager
 
     adapter_dirs: List[str]
 
