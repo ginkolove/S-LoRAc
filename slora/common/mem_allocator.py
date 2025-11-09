@@ -8,24 +8,41 @@ def suffix_cumsum(tensor, dim=-1, dtype=torch.int32):
 
 
 class MemoryAllocator:
-    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num):
+    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num,
+                 sys_len, adapter_num, rank):
         assert tot_size >= cache_size
         self.dtype = dtype
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
+        self.sys_len = sys_len
+        self.adapter_num = adapter_num
+        self.rank = rank
         self.cell_size = head_num * head_dim
+        self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
         self.tot_size = tot_size
         self.cache_size = cache_size
+
+        self.key_buffer = []
+        self.value_buffer = []
+        self.static_key_buffer = []
+        self.static_value_buffer = []
+        self.mini_key_buffer = []
+        self.mini_value_buffer = []
+        self.buffer = None
 
         self.reset_all_pool()
 
 
     def get_memory_size(self):
-        dsize = 2 if self.dtype == torch.float16 else None
-        return 2 * self.layer_num * self.tot_size * self.cell_size * dsize
-  
+        dynamic_bytes = 2 * self.layer_num * self.tot_size * self.cell_size * self.element_size
+        static_main = 2 * self.layer_num * self.sys_len * self.cell_size * self.element_size
+        adapter_bytes = 0
+        if self.adapter_num > 0 and self.rank > 0:
+            adapter_bytes = 2 * self.layer_num * self.adapter_num * self.sys_len * self.rank * self.element_size
+        return dynamic_bytes + static_main + adapter_bytes
+
 
     def alloc(self, need_size):
         if need_size > self.can_use_mem_size:
@@ -213,6 +230,12 @@ class MemoryAllocator:
         # self.can_use_mem_size_prefix = 0
         # self.can_use_mem_size_suffix = 0
         self.buffer = None
+        self.key_buffer = None
+        self.value_buffer = None
+        self.static_key_buffer = None
+        self.static_value_buffer = None
+        self.mini_key_buffer = None
+        self.mini_value_buffer = None
         gc.collect()
 
     def delete_all_cache(self):
@@ -232,6 +255,23 @@ class MemoryAllocator:
         self.value_buffer = [torch.empty((self.tot_size, self.head_num, self.head_dim),
                                        dtype=self.dtype, device="cuda")
                            for _ in range(self.layer_num)]
+        # Static prompt buffers stay resident for the whole session
+        self.static_key_buffer = [torch.empty((self.sys_len, self.head_num, self.head_dim),
+                                              dtype=self.dtype, device="cuda")
+                                  for _ in range(self.layer_num)]
+        self.static_value_buffer = [torch.empty((self.sys_len, self.head_num, self.head_dim),
+                                                dtype=self.dtype, device="cuda")
+                                    for _ in range(self.layer_num)]
+        if self.adapter_num > 0 and self.rank > 0:
+            # Adapter-specific static buffers (one per adapter slot)
+            adapter_shape = (self.adapter_num, self.sys_len, self.rank)
+            self.mini_key_buffer = [torch.empty(adapter_shape, dtype=self.dtype, device="cuda")
+                                    for _ in range(self.layer_num)]
+            self.mini_value_buffer = [torch.empty(adapter_shape, dtype=self.dtype, device="cuda")
+                                         for _ in range(self.layer_num)]
+        else:
+            self.mini_key_buffer = []
+            self.mini_value_buffer = []
  
 
     def reset_all_cache(self):
