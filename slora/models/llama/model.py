@@ -10,7 +10,6 @@ from slora.models.llama.layer_weights.transformer_layer_weight import LlamaTrans
 from slora.models.llama.infer_struct import LlamaInferStateInfo
 # from slora.common.mem_manager import MemoryManager
 from slora.common.mem_allocator import MemoryAllocator
-from slora.common.int8kv_mem_manager import INT8KVMemoryManager
 from slora.common.basemodel import TpPartBaseModel
 
 
@@ -32,9 +31,12 @@ class LlamaTpPartModel(TpPartBaseModel):
     memory_manager_class = MemoryAllocator
 
     def __init__(self, tp_rank, world_size, weight_dir, 
-                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[], dummy=False):
+                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[],
+                 dummy=False, shared_prefix_length=0, lora_ranks=None, lora_dirs=None):
         super().__init__(tp_rank, world_size, weight_dir,
-                         max_total_token_num, mem_adapter_size, load_way, mode, dummy=dummy)
+                         max_total_token_num, mem_adapter_size, load_way, mode,
+                         dummy=dummy, shared_prefix_length=shared_prefix_length,
+                         lora_ranks=lora_ranks, lora_dirs=lora_dirs)
         return
     
     def _init_config(self):
@@ -47,19 +49,18 @@ class LlamaTpPartModel(TpPartBaseModel):
         assert self.load_way == "HF", "llama only support HF format to load Now!"
 
     def _init_mem_manager(self):
-        mem_dict = {
-            "int8kv" : INT8KVMemoryManager
-        }
-        for _mode in self.mode:
-            if _mode in mem_dict:
-                print("Model using mode", _mode)
-                self.memory_manager_class = mem_dict[_mode]
-        self.mem_manager = self.memory_manager_class(tot_size=self.max_total_token_num + self.mem_adapter_size, 
-                                                     cache_size=self.max_total_token_num,
-                                                     dtype=torch.float16,
-                                                     head_num=self.config["num_attention_heads"] // self.world_size_,
-                                                     head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
-                                                     layer_num=self.config["num_hidden_layers"])
+        mem_kwargs = dict(
+            tot_size=self.max_total_token_num,
+            dtype=torch.float16,
+            head_num=self.config["num_attention_heads"] // self.world_size_,
+            head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
+            layer_num=self.config["num_hidden_layers"],
+        )
+        if self.memory_manager_class is MemoryAllocator:
+            mem_kwargs["shared_prefix_length"] = self.shared_prefix_length
+            mem_kwargs["lora_ranks"] = self.lora_ranks
+            mem_kwargs["lora_dirs"] = self.lora_dirs
+        self.mem_manager = self.memory_manager_class(**mem_kwargs)
 
     def _init_custom(self):
         """
@@ -129,4 +130,3 @@ class LlamaTpPartModel(TpPartBaseModel):
             self._cos_cached[seq_loc_index:seq_loc_index + 1, :] = torch.cos(freqs).to(torch.float16).cuda()
             self._sin_cached[seq_loc_index:seq_loc_index + 1, :] = torch.sin(freqs).to(torch.float16).cuda()
         return
-

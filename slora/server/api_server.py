@@ -42,6 +42,7 @@ from .router.manager import start_router_process
 
 from slora.utils.net_utils import alloc_can_use_network_port
 from slora.common.configs.config import setting
+from slora.common.mem_allocator import calculate_static_token_equivalent
 from .api_models import (
     ChatCompletionRequest,
     UsageInfo,
@@ -55,6 +56,8 @@ from .api_models import (
 
 from slora.mprophet.measure import ModelProphet
 from slora.mprophet.lora_stats import LoRAProphet
+from slora.models.peft.lora_adapter import get_lora_config
+from slora.utils.model_utils import get_model_config
 
 
 GB = 1024 ** 3
@@ -71,7 +74,7 @@ def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse
     return JSONResponse({"message": message}, status_code=status_code.value)
 
 
-@app.get("/healthz")
+
 @app.get("/health")
 def healthcheck():
     return "OK"
@@ -320,6 +323,37 @@ def print_mem_stats(args):
     print(f"avg adapter estimated size: {tot_lora_size / len(args.lora_dirs) / MB:.2f} MB")
 
 
+def _get_model_hidden_size(model_cfg):
+    return model_cfg.get("hidden_size", model_cfg.get("n_embd", model_cfg.get("n_embed")))
+
+
+def _get_model_attention_heads(model_cfg):
+    return model_cfg.get("num_attention_heads", model_cfg.get("n_head"))
+
+
+def _compute_static_token_reservation(args):
+    if args.shared_prefix_length <= 0 or len(args.lora_dirs) == 0:
+        return 0
+
+    model_cfg = get_model_config(args.model_dir, dummy=args.dummy)
+    hidden_size = _get_model_hidden_size(model_cfg)
+    num_attention_heads = _get_model_attention_heads(model_cfg)
+    num_kv_heads = model_cfg.get("num_key_value_heads", num_attention_heads)
+    assert hidden_size is not None and num_attention_heads is not None
+    assert num_kv_heads % args.tp == 0
+    assert num_attention_heads % args.tp == 0
+
+    head_dim = hidden_size // num_attention_heads
+    per_rank_kv_heads = num_kv_heads // args.tp
+    cell_size = per_rank_kv_heads * head_dim
+
+    total_lora_rank = 0
+    for lora_dir in args.lora_dirs:
+        config, _ = get_lora_config(lora_dir, args.dummy)
+        total_lora_rank += int(config["r"])
+    return calculate_static_token_equivalent(args.shared_prefix_length, total_lora_rank, cell_size)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="127.0.0.1")
@@ -344,10 +378,12 @@ def main():
                         help="the max value for req input tokens num")
     parser.add_argument("--max_req_total_len", type=int, default=2048 + 1024,
                         help="the max value for req_input_len + req_output_len")
+    parser.add_argument("--shared-prefix-length", type=int, default=0,
+                        help="reserve a static shared-prefix region for one base kv plus one mini kv per LoRA")
     parser.add_argument("--nccl_port", type=int, default=28765,
                         help="the nccl_port to build a distributed environment for PyTorch")
     parser.add_argument("--mode", type=str, default=[], nargs='+',
-                        help="Model mode: [int8kv] [int8weight | int4weight]")
+                        help="Model mode: [int8weight | int4weight]")
     parser.add_argument("--trust_remote_code", action='store_true',
                         help="Whether or not to allow for custom models defined on the Hub in their own modeling files.")
     parser.add_argument("--disable_log_stats", action='store_true',
@@ -381,9 +417,27 @@ def main():
 
     args = parser.parse_args()
 
+    args.total_token_budget_num = args.max_total_token_num
+    args.static_token_reservation = _compute_static_token_reservation(args)
+    args.max_total_token_num = args.total_token_budget_num - args.static_token_reservation
+    if args.max_total_token_num <= 0:
+        raise ValueError(
+            "shared prefix static reservation exhausts the dynamic kv budget: "
+            f"budget={args.total_token_budget_num}, reserved={args.static_token_reservation}"
+        )
+
     assert args.max_req_input_len < args.max_req_total_len
     setting["max_req_total_len"] = args.max_req_total_len
     setting["nccl_port"] = args.nccl_port
+
+    if args.static_token_reservation > 0:
+        print(
+            "shared prefix reserves",
+            args.static_token_reservation,
+            "token-equivalent slots;",
+            "dynamic max_total_token_num becomes",
+            args.max_total_token_num,
+        )
 
     if args.batch_max_tokens is None:
         batch_max_tokens = int(1 / 6 * args.max_total_token_num)

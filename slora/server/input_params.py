@@ -21,7 +21,10 @@ class InputParams:
 
     def __init__(
         self,
+        total_token_budget_num,
+        static_token_reservation,
         max_req_total_len,
+        shared_prefix_length,
         # kv cache manager parameters
         max_total_token_num,
         pool_size_lora,
@@ -50,7 +53,10 @@ class InputParams:
         # fairness
         fair_weights,
     ) -> None:
+        self.total_token_budget_num = total_token_budget_num
+        self.static_token_reservation = static_token_reservation
         self.max_req_total_len = max_req_total_len
+        self.shared_prefix_length = shared_prefix_length
         self.max_total_token_num = max_total_token_num
         self.pool_size_lora = pool_size_lora
         self.batch_max_tokens = batch_max_tokens

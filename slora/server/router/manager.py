@@ -4,6 +4,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 import os
 import pickle
 import time
+from collections import defaultdict
 import torch
 import zmq
 import zmq.asyncio
@@ -46,7 +47,8 @@ def get_scheduler(input_params, adapter_dirs):
                              input_params.running_max_req_size)
     elif input_params.scheduler == "slora":
         return ReqQueue(input_params.max_total_token_num, input_params.batch_max_tokens,
-                        input_params.running_max_req_size)
+                        input_params.running_max_req_size,
+                        shared_prefix_length=input_params.shared_prefix_length)
     else:
         raise Exception("unrecognized scheduler")
 
@@ -92,6 +94,93 @@ class RouterManager:
         self.model_rpc_ports = model_rpc_ports
 
         self.stats_tool = Stats(log_stats, log_stats_interval)
+        self.prefix_adapter_heat = defaultdict(int)
+        self.prefix_lookahead_batches = getattr(input_params, "prefix_lookahead_batches", 4)
+        self.prefix_debug_enabled = os.environ.get("SLORA_PREFIX_DEBUG", "0") == "1"
+        self.scheduler_debug_enabled = os.environ.get("SLORA_SCHED_DEBUG", "0") == "1"
+
+    def _prefix_debug(self, message):
+        if self.prefix_debug_enabled:
+            print(f"[prefix-router] {message}", flush=True)
+
+    def _sched_debug(self, message):
+        if self.scheduler_debug_enabled:
+            print(f"[sched-router] {message}", flush=True)
+
+    def _prefix_scheduler_enabled(self):
+        return (
+            self.input_params.shared_prefix_length > 0
+            and self.input_params.scheduler == "slora"
+            and not self.input_params.no_lora
+            and not self.input_params.no_kernel
+            and not self.input_params.no_lora_compute
+            and not self.input_params.bmm
+        )
+
+    def _build_lookahead_base_batch(self, batch: Batch):
+        if self.running_batch is None:
+            return batch
+        return Batch("lookahead-merged", list(self.running_batch.reqs) + list(batch.reqs))
+
+    async def _get_cached_prefix_loras(self):
+        if not self._prefix_scheduler_enabled():
+            return set()
+        if not hasattr(self, "model_rpcs") or len(self.model_rpcs) == 0:
+            return set()
+        cached_loras = await self.model_rpcs[0].get_cached_prefix_loras()
+        return set(cached_loras)
+
+    def _compute_future_reuse(self, batch: Batch, preferred_adapter_dirs=None):
+        if not self._prefix_scheduler_enabled():
+            return {}
+        if not hasattr(self.req_queue, "peek_future_batches"):
+            return {}
+        lookahead_base_batch = self._build_lookahead_base_batch(batch)
+        future_batches = self.req_queue.peek_future_batches(
+            lookahead_base_batch,
+            self.lora_ranks,
+            self.prefix_lookahead_batches,
+            preferred_adapter_dirs=preferred_adapter_dirs,
+        )
+        future_reuse = defaultdict(int)
+        for future_batch in future_batches:
+            for lora_dir in future_batch.adapter_dirs:
+                if lora_dir is not None:
+                    future_reuse[lora_dir] += 1
+        return dict(future_reuse)
+
+    async def _prepare_prefix_cache_for_batch(self, batch: Batch):
+        if not self._prefix_scheduler_enabled():
+            return True
+        cached_prefix_loras = await self._get_cached_prefix_loras()
+        future_reuse = self._compute_future_reuse(batch, preferred_adapter_dirs=cached_prefix_loras)
+        prompt_token_num = batch.input_tokens()
+        adapter_heat = dict(self.prefix_adapter_heat)
+        self._prefix_debug(
+            f"prepare batch_id={batch.batch_id} batch_loras={list(batch.adapter_dirs)} "
+            f"prompt_tokens={prompt_token_num} cached={sorted(cached_prefix_loras)} "
+            f"future_reuse={future_reuse} heat={adapter_heat}"
+        )
+        rets = []
+        for tp_rank in range(self.world_size):
+            rets.append(
+                self.model_rpcs[tp_rank].prepare_prefix_cache_for_admission(
+                    list(batch.adapter_dirs),
+                    prompt_token_num,
+                    future_reuse,
+                    adapter_heat,
+                )
+            )
+        results = await asyncio.gather(*rets)
+        self._prefix_debug(f"prepare-results batch_id={batch.batch_id} results={results}")
+        return all(ret.get("admitted", False) for ret in results)
+
+    def _update_adapter_heat(self, batch: Batch):
+        if not self._prefix_scheduler_enabled():
+            return
+        for lora_dir in batch.adapter_dirs:
+            if lora_dir is not None:
+                self.prefix_adapter_heat[lora_dir] += 1
 
 
     async def wait_to_model_ready(self):
@@ -108,7 +197,7 @@ class RouterManager:
                     self.world_size,
                     self.model_weightdir,
                     self.adapter_dirs,
-                    self.input_params.max_total_token_num,
+                    self.input_params.total_token_budget_num,
                     self.load_way,
                     self.mode,
                     input_params=self.input_params,
@@ -178,13 +267,33 @@ class RouterManager:
         """
         事件处理循环
         """
+        self._sched_debug(
+            f"step running_batch={0 if self.running_batch is None else len(self.running_batch.reqs)} "
+            f"waiting={len(self.req_queue.waiting_req_list)} has_wait_tokens={self.has_wait_tokens}"
+        )
         # 删除所有已经 finished 的 req
         if self.running_batch is None:
-            new_batch = self.req_queue.generate_new_batch(self.running_batch, self.lora_ranks)
+            preferred_adapter_dirs = await self._get_cached_prefix_loras()
+            new_batch = self.req_queue.generate_new_batch(
+                self.running_batch,
+                self.lora_ranks,
+                preferred_adapter_dirs=preferred_adapter_dirs,
+            )
+            self._sched_debug(
+                f"new-batch running=None preferred={sorted(preferred_adapter_dirs)} "
+                f"created={0 if new_batch is None else len(new_batch.reqs)}"
+            )
             if self.input_params.enable_abort and len(self.req_queue.abort_req_list) > 0:
                 self.send_to_detokenization.send_pyobj(BatchAbortReq(self.req_queue.abort_req_list))
                 self.req_queue.reset_abort_list()
             if new_batch is not None:
+                if not await self._prepare_prefix_cache_for_batch(new_batch):
+                    self._sched_debug(
+                        f"new-batch-admission-failed batch_id={new_batch.batch_id} "
+                        f"size={len(new_batch.reqs)}"
+                    )
+                    self.req_queue.prepend_reqs(new_batch.reqs)
+                    return
                 self.stats_tool.count_prompt_tokens(new_batch)
                 self.running_batch = new_batch
 
@@ -195,7 +304,7 @@ class RouterManager:
                         ret.append(self.model_rpcs[tp_rank].load_adapters(new_batch.adapter_dirs))
                     await asyncio.gather(*ret)
 
-                
+            
                 # merge adapter to base model
                 if self.input_params.scheduler == "peft":
                     torch.cuda.synchronize()
@@ -205,12 +314,21 @@ class RouterManager:
                     await asyncio.gather(*ret)
             
                 torch.cuda.synchronize()
+                self._update_adapter_heat(self.running_batch)
+                self._sched_debug(
+                    f"prefill-running batch_id={self.running_batch.batch_id} "
+                    f"size={len(self.running_batch.reqs)} adapters={list(self.running_batch.adapter_dirs)}"
+                )
                 await self._prefill_batch(self.running_batch)
                 await self._filter_runing_batch()
                 self.has_wait_tokens = 0
             return
 
         if self.has_wait_tokens < self.max_wait_tokens:
+            self._sched_debug(
+                f"decode-only batch_id={self.running_batch.batch_id} size={len(self.running_batch.reqs)} "
+                f"waiting={len(self.req_queue.waiting_req_list)} has_wait_tokens={self.has_wait_tokens}"
+            )
             self.stats_tool.count_output_tokens(self.running_batch)
             # prefetch
             if (not self.input_params.no_lora and
@@ -229,11 +347,31 @@ class RouterManager:
             self.has_wait_tokens += 1
             return
         else:
-            new_mini_batch = self.req_queue.generate_new_batch(self.running_batch, self.lora_ranks)
+            preferred_adapter_dirs = await self._get_cached_prefix_loras()
+            new_mini_batch = self.req_queue.generate_new_batch(
+                self.running_batch,
+                self.lora_ranks,
+                preferred_adapter_dirs=preferred_adapter_dirs,
+            )
+            self._sched_debug(
+                f"mini-batch-check running_batch={len(self.running_batch.reqs)} "
+                f"waiting={len(self.req_queue.waiting_req_list)} preferred={sorted(preferred_adapter_dirs)} "
+                f"created={0 if new_mini_batch is None else len(new_mini_batch.reqs)}"
+            )
             if self.input_params.enable_abort and len(self.req_queue.abort_req_list) > 0:
                 self.send_to_detokenization.send_pyobj(BatchAbortReq(self.req_queue.abort_req_list))
                 self.req_queue.reset_abort_list()
             if new_mini_batch is not None:
+                if not await self._prepare_prefix_cache_for_batch(new_mini_batch):
+                    self._sched_debug(
+                        f"mini-batch-admission-failed batch_id={new_mini_batch.batch_id} "
+                        f"size={len(new_mini_batch.reqs)}"
+                    )
+                    self.req_queue.prepend_reqs(new_mini_batch.reqs)
+                    self.stats_tool.count_output_tokens(self.running_batch)
+                    await self._decode_batch(self.running_batch)
+                    await self._filter_runing_batch()
+                    return
                 self.stats_tool.count_prompt_tokens(new_mini_batch)
 
                 if not self.input_params.no_lora:
@@ -242,12 +380,25 @@ class RouterManager:
                         ret.append(self.model_rpcs[tp_rank].load_adapters(new_mini_batch.adapter_dirs))
                     await asyncio.gather(*ret)
 
+                self._update_adapter_heat(new_mini_batch)
+                self._sched_debug(
+                    f"prefill-mini batch_id={new_mini_batch.batch_id} size={len(new_mini_batch.reqs)} "
+                    f"adapters={list(new_mini_batch.adapter_dirs)}"
+                )
                 await self._prefill_batch(new_mini_batch, minibatch=True)
                 if not new_mini_batch.is_clear():
+                    self._sched_debug(
+                        f"merge-mini into_running batch_id={self.running_batch.batch_id} "
+                        f"mini_size={len(new_mini_batch.reqs)} running_before={len(self.running_batch.reqs)}"
+                    )
                     await self._merge_batch(self.running_batch, new_mini_batch)
                     self.running_batch.merge(new_mini_batch)
                 self.has_wait_tokens = 0
             else:
+                self._sched_debug(
+                    f"mini-batch-miss decode-fallback batch_id={self.running_batch.batch_id} "
+                    f"size={len(self.running_batch.reqs)} waiting={len(self.req_queue.waiting_req_list)}"
+                )
                 self.stats_tool.count_output_tokens(self.running_batch)
                 await self._decode_batch(self.running_batch)
                 await self._filter_runing_batch()
@@ -377,7 +528,10 @@ class RouterManager:
 
 
 def start_router_process(args, router_port, detokenization_port, model_rpc_ports, mode, pipe_writer):
-    input_params = InputParams(max_req_total_len=args.max_req_total_len,
+    input_params = InputParams(total_token_budget_num=args.total_token_budget_num,
+                               static_token_reservation=args.static_token_reservation,
+                               max_req_total_len=args.max_req_total_len,
+                               shared_prefix_length=args.shared_prefix_length,
                                # kv cache manager parameters
                                max_total_token_num=args.max_total_token_num,
                                pool_size_lora=args.pool_size_lora,

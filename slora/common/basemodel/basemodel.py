@@ -27,7 +27,8 @@ class TpPartBaseModel:
     infer_state_class = InferStateInfo
 
     def __init__(self, tp_rank, world_size, weight_dir,
-                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[], dummy=False):
+                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[],
+                 dummy=False, shared_prefix_length=0, lora_ranks=None, lora_dirs=None):
         self.tp_rank_ = tp_rank
         self.world_size_ = world_size
         self.weight_dir_ = weight_dir
@@ -36,6 +37,9 @@ class TpPartBaseModel:
         self.load_way = load_way
         self.mode = mode
         self.dummy = dummy
+        self.shared_prefix_length = shared_prefix_length
+        self.lora_ranks = list(lora_ranks or [])
+        self.lora_dirs = list(lora_dirs or [])
 
         self._init_config()
         self._verify_must()
@@ -87,12 +91,14 @@ class TpPartBaseModel:
     def _init_mem_manager(self):
         assert self.config["num_attention_heads"] % self.world_size_ == 0
         self.mem_manager = MemoryAllocator(
-                            tot_size=self.max_total_token_num + self.mem_adapter_size,
-                            cache_size=self.max_total_token_num, 
+                            tot_size=self.max_total_token_num,
                             dtype=torch.float16,
                             head_num=self.config["num_attention_heads"] // self.world_size_,
                             head_dim=self.config["n_embed"] // self.config["num_attention_heads"],
-                            layer_num=self.config["n_layer"])
+                            layer_num=self.config["n_layer"],
+                            shared_prefix_length=self.shared_prefix_length,
+                            lora_ranks=self.lora_ranks,
+                            lora_dirs=self.lora_dirs)
         return 
     
     def _init_infer_layer(self):
@@ -110,6 +116,7 @@ class TpPartBaseModel:
     
     def _init_some_value(self):
         self.head_dim_ = self.config["n_embed"] // self.config["num_attention_heads"]
+        self.tp_q_head_num_ = self.config["num_attention_heads"] // self.world_size_
         self.tp_k_head_num_ = self.config["num_attention_heads"] // self.world_size_
         self.tp_v_head_num_ = self.tp_k_head_num_
         self.layers_num = self.config["n_layer"]
@@ -171,6 +178,9 @@ class TpPartBaseModel:
         infer_state.b_seq_len = b_seq_len
         
         infer_state.mem_manager = self.mem_manager
+        prefix_cache = getattr(self.mem_manager, "prefix_cache", None)
+        if prefix_cache is not None:
+            prefix_cache.ensure_available(batch_size)
 
         alloc_mem = self.mem_manager.alloc_contiguous(batch_size)
         if alloc_mem is not None:

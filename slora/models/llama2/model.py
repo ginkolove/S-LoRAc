@@ -2,6 +2,7 @@ import os
 import json
 import torch
 
+from slora.common.mem_allocator import MemoryAllocator
 from slora.models.llama2.layer_infer.transformer_layer_infer import Llama2TransformerLayerInfer
 from slora.models.llama2.layer_weights.transformer_layer_weight import Llama2TransformerLayerWeight
 
@@ -17,9 +18,11 @@ class Llama2TpPartModel(LlamaTpPartModel):
 
     def __init__(self, tp_rank, world_size, weight_dir,
                  max_total_token_num, mem_adapter_size, load_way="HF", mode=[],
-                 dummy=False):
+                 dummy=False, shared_prefix_length=0, lora_ranks=None, lora_dirs=None):
         super().__init__(tp_rank, world_size, weight_dir,
-                         max_total_token_num, mem_adapter_size, load_way, mode, dummy=dummy)
+                         max_total_token_num, mem_adapter_size, load_way, mode,
+                         dummy=dummy, shared_prefix_length=shared_prefix_length,
+                         lora_ranks=lora_ranks, lora_dirs=lora_dirs)
     
 
     def _init_config(self):
@@ -35,16 +38,23 @@ class Llama2TpPartModel(LlamaTpPartModel):
         return
 
     def _init_mem_manager(self):
-        self.mem_manager = self.memory_manager_class(tot_size=self.max_total_token_num + self.mem_adapter_size, 
-                                                     cache_size=self.max_total_token_num,
-                                                     dtype=torch.float16,
-                                                     head_num=self.config["num_key_value_heads"] // self.world_size_,
-                                                     head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
-                                                     layer_num=self.config["num_hidden_layers"])
+        mem_kwargs = dict(
+            tot_size=self.max_total_token_num,
+            dtype=torch.float16,
+            head_num=self.config["num_key_value_heads"] // self.world_size_,
+            head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
+            layer_num=self.config["num_hidden_layers"],
+        )
+        if self.memory_manager_class is MemoryAllocator:
+            mem_kwargs["shared_prefix_length"] = self.shared_prefix_length
+            mem_kwargs["lora_ranks"] = self.lora_ranks
+            mem_kwargs["lora_dirs"] = self.lora_dirs
+        self.mem_manager = self.memory_manager_class(**mem_kwargs)
         return
     
     def _init_some_value(self):
         self.head_dim_ = self.config["n_embed"] // self.config["num_attention_heads"]
+        self.tp_q_head_num_ = self.config["num_attention_heads"] // self.world_size_
         self.tp_k_head_num_ = self.config["num_key_value_heads"] // self.world_size_
         self.tp_v_head_num_ = self.tp_k_head_num_
         self.layers_num = self.config["n_layer"]

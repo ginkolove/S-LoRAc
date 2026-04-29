@@ -17,7 +17,7 @@ from slora.server.router.model_infer.infer_batch import InferBatch
 from slora.common.configs.config import setting
 from slora.models.llama.model import LlamaTpPartModel
 from slora.models.llama2.model import Llama2TpPartModel
-from slora.models.peft.lora_adapter import LoraTpPartAdapter
+from slora.models.peft.lora_adapter import LoraTpPartAdapter, get_lora_config
 from slora.models.peft.lora_unordered_batch_infer import LoraUnorderedBatchInfer
 from slora.models.peft.lora_single_batch_infer import LoraPEFTBatchInfer
 from slora.models.bmm.lora_bmm_infer import LoraBmmInfer
@@ -54,6 +54,10 @@ class ModelRpcServer(rpyc.Service):
         torch.cuda.set_device(rank_id)
 
         model_cfg = get_model_config(weight_dir, dummy=input_params.dummy)
+        adapter_ranks = []
+        for adapter_dir in adapter_dirs:
+            config, _ = get_lora_config(adapter_dir, input_params.dummy)
+            adapter_ranks.append(config["r"])
 
         try:
             self.model_type = model_cfg["model_type"]
@@ -63,14 +67,20 @@ class ModelRpcServer(rpyc.Service):
                                                     max_total_token_num,
                                                     mem_adapter_size=input_params.pool_size_lora,
                                                     load_way=load_way, mode=mode,
-                                                    dummy=input_params.dummy)
+                                                    dummy=input_params.dummy,
+                                                    shared_prefix_length=input_params.shared_prefix_length,
+                                                    lora_ranks=adapter_ranks,
+                                                    lora_dirs=adapter_dirs)
                     
                 else:
                     self.model = LlamaTpPartModel(rank_id, world_size, weight_dir,
                                                     max_total_token_num,
                                                     mem_adapter_size=input_params.pool_size_lora,
                                                     load_way=load_way, mode=mode,
-                                                    dummy=input_params.dummy)
+                                                    dummy=input_params.dummy,
+                                                    shared_prefix_length=input_params.shared_prefix_length,
+                                                    lora_ranks=adapter_ranks,
+                                                    lora_dirs=adapter_dirs)
             else:
                 raise Exception(f"can not support {self.model_type} now")
         except Exception as e:
@@ -188,6 +198,50 @@ class ModelRpcServer(rpyc.Service):
         del batch
         # torch.cuda.empty_cache()
         return
+
+    def exposed_prepare_prefix_cache_for_admission(self, batch_adapter_dirs, prompt_token_num, future_reuse, adapter_heat):
+        mem_manager = self.model.mem_manager
+        prefix_cache = getattr(mem_manager, "prefix_cache", None)
+        if self.world_size != 1:
+            batch_adapter_dirs = obtain(batch_adapter_dirs)
+            prompt_token_num = obtain(prompt_token_num)
+            future_reuse = obtain(future_reuse)
+            adapter_heat = obtain(adapter_heat)
+        extra_slots = 0
+        if hasattr(self, "infer_adapter") and self.infer_adapter is not None:
+            unique_batch_loras = []
+            seen = set()
+            for lora_dir in batch_adapter_dirs:
+                if lora_dir is None or lora_dir in seen:
+                    continue
+                seen.add(lora_dir)
+                unique_batch_loras.append(lora_dir)
+            for lora_dir in unique_batch_loras:
+                if lora_dir not in self.infer_adapter.idx_map:
+                    extra_slots += self.adapters[self.adapter_id[lora_dir]].r * 4
+        if prefix_cache is None:
+            return {
+                "admitted": True,
+                "required_slots": int(prompt_token_num) + int(extra_slots),
+                "free_slots": mem_manager.can_use_mem_size,
+                "evicted": [],
+                "missing_prefixes": 0,
+                "extra_slots": int(extra_slots),
+            }
+        return prefix_cache.prepare_for_admission(
+            batch_adapter_dirs=batch_adapter_dirs,
+            prompt_token_num=prompt_token_num,
+            future_reuse=future_reuse,
+            adapter_heat=adapter_heat,
+            extra_slots=extra_slots,
+        )
+
+    def exposed_get_cached_prefix_loras(self):
+        mem_manager = self.model.mem_manager
+        prefix_cache = getattr(mem_manager, "prefix_cache", None)
+        if prefix_cache is None:
+            return []
+        return list(prefix_cache.entries.keys())
     
     def forward(self, batch_id, is_prefill):
         batch: InferBatch = self.cache.pop(batch_id)
@@ -236,6 +290,15 @@ class ModelRpcServer(rpyc.Service):
             # kwargs["no_lora_copy"] = self.input_params.no_lora_copy 
 
         logits = engine.forward(**kwargs)
+        if is_prefill:
+            prefix_total = getattr(engine, "prefill_prefix_total", 0)
+            effective_max_len = getattr(engine, "prefill_effective_max_len", batch.nopad_max_len_in_batch)
+            prefix_lens = getattr(engine, "prefill_prefix_lens", [])
+            prefix_indices = getattr(engine, "prefill_prefix_indices", [])
+            batch.set_shared_prefix_metadata(prefix_lens, prefix_indices)
+            if prefix_total > 0:
+                batch.nopad_total_token_num += prefix_total
+                batch.nopad_max_len_in_batch = effective_max_len
         next_token_ids, next_token_probs = sample(logits, batch)
         next_token_ids = next_token_ids.detach().cpu().numpy()
         next_token_logprobs = torch.log(next_token_probs).detach().cpu().numpy()
@@ -401,6 +464,8 @@ class ModelRpcClient:
             self._filter_batch = async_wrap(self.model.filter_batch)
             self._merge_batch = async_wrap(self.model.merge_batch)
             self._remove_batch = async_wrap(self.model.remove_batch)
+            self._prepare_prefix_cache_for_admission = async_wrap(self.model.prepare_prefix_cache_for_admission)
+            self._get_cached_prefix_loras = async_wrap(self.model.get_cached_prefix_loras)
             self._profile_prefill = async_wrap(self.model.profile_prefill)
         else:
             self._init_model = self.model.exposed_init_model
@@ -414,6 +479,8 @@ class ModelRpcClient:
             self._filter_batch = self.model.exposed_filter_batch
             self._merge_batch = self.model.exposed_merge_batch
             self._remove_batch = self.model.exposed_remove_batch
+            self._prepare_prefix_cache_for_admission = self.model.exposed_prepare_prefix_cache_for_admission
+            self._get_cached_prefix_loras = self.model.exposed_get_cached_prefix_loras
             self._profile_prefill = self.model.exposed_profile_prefill
         return
 
@@ -489,6 +556,25 @@ class ModelRpcClient:
             return
         else:
             return
+
+    async def prepare_prefix_cache_for_admission(self, batch_adapter_dirs, prompt_token_num, future_reuse, adapter_heat):
+        ans = self._prepare_prefix_cache_for_admission(
+            batch_adapter_dirs,
+            prompt_token_num,
+            future_reuse,
+            adapter_heat,
+        )
+        if self.use_rpc:
+            return await ans
+        else:
+            return ans
+
+    async def get_cached_prefix_loras(self):
+        ans = self._get_cached_prefix_loras()
+        if self.use_rpc:
+            return await ans
+        else:
+            return ans
     
     async def profile_prefill(self):
         ans = self._profile_prefill()

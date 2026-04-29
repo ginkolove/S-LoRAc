@@ -15,6 +15,7 @@ class Req:
         self.output_metadata_list = []
         self.has_generate_finished = False
         self.aborted = False
+        self.schedule_skip_count = 0
 
     def to_rpc_obj(self):
         return {"adapter_dir": self.adapter_dir,

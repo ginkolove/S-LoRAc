@@ -12,6 +12,9 @@ if __name__ == "__main__":
     parser.add_argument("--backend", type=str, default="slora",
                         choices=["slora", "vllm", "lightllm", "vllm-packed"])
     parser.add_argument("--model-setting", type=str, default="S1")
+    parser.add_argument("--base-model-override", type=str, default=None)
+    parser.add_argument("--adapter-template-override", type=str, default=None)
+    parser.add_argument("--cuda-visible-devices", type=str, default=None)
 
     parser.add_argument("--num-adapter", type=int)
     parser.add_argument("--num-token", type=int)
@@ -24,10 +27,14 @@ if __name__ == "__main__":
     parser.add_argument("--batch-num-adapters", type=int, default=None)
     parser.add_argument("--enable-abort", action="store_true")
     parser.add_argument("--vllm-mem-ratio", type=float, default=0.95)
+    parser.add_argument("--shared-prefix-length", type=int, default=0)
+    parser.add_argument("--max-req-input-len", type=int, default=None)
+    parser.add_argument("--max-req-total-len", type=int, default=None)
+    parser.add_argument("--batch-max-tokens", type=int, default=None)
     args = parser.parse_args()
 
-    base_model = BASE_MODEL[args.model_setting]
-    adapter_dirs = LORA_DIR[args.model_setting]
+    base_model = args.base_model_override or BASE_MODEL[args.model_setting]
+    adapter_dirs = [args.adapter_template_override] if args.adapter_template_override else LORA_DIR[args.model_setting]
 
     if args.device == "a10g":
         if args.num_adapter is None: args.num_adapter = 200
@@ -47,10 +54,16 @@ if __name__ == "__main__":
         cmd += f" --model {base_model}"
         cmd += f" --tokenizer_mode auto"
 
-        num_iter = args.num_adapter // len(adapter_dirs) + 1
+        num_iter = (args.num_adapter + len(adapter_dirs) - 1) // len(adapter_dirs)
+        launched = 0
         for i in range(num_iter):
             for adapter_dir in adapter_dirs:
+                if launched >= args.num_adapter:
+                    break
                 cmd += f" --lora {adapter_dir}-{i}"
+                launched += 1
+            if launched >= args.num_adapter:
+                break
 
         if args.dummy:
             cmd += " --dummy"
@@ -71,6 +84,14 @@ if __name__ == "__main__":
         # cmd += " --no-kernel"
         if args.bmm:
             cmd += " --bmm"
+        if args.shared_prefix_length > 0:
+            cmd += f" --shared-prefix-length {args.shared_prefix_length}"
+        if args.max_req_input_len is not None:
+            cmd += f" --max_req_input_len {args.max_req_input_len}"
+        if args.max_req_total_len is not None:
+            cmd += f" --max_req_total_len {args.max_req_total_len}"
+        if args.batch_max_tokens is not None:
+            cmd += f" --batch_max_tokens {args.batch_max_tokens}"
 
     elif args.backend == "lightllm":
         cmd = f"python -m lightllm.server.api_server" \
@@ -102,6 +123,9 @@ if __name__ == "__main__":
             os.wait()
 
         sys.exit(0)
+
+    if args.cuda_visible_devices is not None:
+        cmd = f"CUDA_VISIBLE_DEVICES={args.cuda_visible_devices} " + cmd
 
     # print(cmd)
     os.system(cmd)

@@ -10,8 +10,24 @@ def sample(logits, batch:InferBatch):
     
     apply_penalty(logits, presence_penalties, frequency_penalties, p_token_ids, p_token_counts, p_cumsum_seq_len, p_max_len_in_batch) 
     logits.div_(temperatures.view((-1, 1)))
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+    if torch.all(top_ks == 1):
+        batch_next_token_ids = torch.argmax(logits, dim=-1)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        batch_next_token_probs = torch.exp(
+            torch.gather(log_probs, dim=1, index=batch_next_token_ids.view(-1, 1))
+        ).view(-1)
+        return batch_next_token_ids.view(-1), batch_next_token_probs.view(-1)
+
     probs = torch.softmax(logits, dim=-1)
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    probs.clamp_(min=0.0)
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     probs_sort, probs_idx = _top_p_top_k(probs, top_ps, top_ks)
+    probs_sort = torch.nan_to_num(probs_sort, nan=0.0, posinf=0.0, neginf=0.0)
+    probs_sort.clamp_(min=0.0)
+    probs_sort = probs_sort / probs_sort.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     sampled_index = torch.multinomial(probs_sort, num_samples=1, replacement=True)
     
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)

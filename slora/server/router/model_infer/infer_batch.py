@@ -3,7 +3,7 @@ import numpy as np
 import collections
 
 from slora.common.configs.config import setting
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict
 from slora.common.mem_manager import MemoryManager
 from slora.utils.infer_utils import mark_start, mark_end
@@ -57,6 +57,77 @@ class InferBatch:
     mem_manager: MemoryManager
 
     adapter_dirs: List[str]
+    shared_prefix_lens: List[int] = field(default_factory=list)
+    shared_prefix_indices: List = field(default_factory=list)
+
+    def set_shared_prefix_metadata(self, prefix_lens, prefix_indices):
+        if len(prefix_lens) != len(self) or len(prefix_indices) != len(self):
+            self.shared_prefix_lens = []
+            self.shared_prefix_indices = []
+            return
+        self.shared_prefix_lens = [int(prefix_len) for prefix_len in prefix_lens]
+        self.shared_prefix_indices = list(prefix_indices)
+
+    def _has_shared_prefix_metadata(self):
+        return (
+            len(self.shared_prefix_lens) == len(self)
+            and len(self.shared_prefix_indices) == len(self)
+        )
+
+    def _shared_prefix_len(self, idx):
+        if not self._has_shared_prefix_metadata():
+            return 0
+        return self.shared_prefix_lens[idx]
+
+    def _shared_prefix_index(self, idx):
+        if not self._has_shared_prefix_metadata():
+            return None
+        return self.shared_prefix_indices[idx]
+
+    def _history_index_range(self, idx):
+        seq_len = int(self.nopad_b_seq_len[idx].item())
+        end = self.nopad_max_len_in_batch - 1
+        start = end - (seq_len - 1)
+        return start, end
+
+    @staticmethod
+    def _prefix_key(prefix_index):
+        if prefix_index is None or prefix_index.numel() == 0:
+            return None
+        return tuple(prefix_index.detach().cpu().tolist())
+
+    def _free_index_list(self, index_list):
+        index_list = [
+            index for index in index_list
+            if index is not None and index.numel() > 0
+        ]
+        if len(index_list) == 0:
+            return
+        remove_index = torch.cat(index_list, dim=-1)
+        if remove_index.numel() == 0:
+            return
+        self.mem_manager.free(torch.unique(remove_index))
+
+    def _has_cache_owned_prefix(self):
+        return (
+            self._has_shared_prefix_metadata()
+            and hasattr(self.mem_manager, "prefix_cache")
+            and self.mem_manager.prefix_cache is not None
+        )
+
+    def _release_prefix_refs(self, indices):
+        if not self._has_cache_owned_prefix():
+            return
+        release_counts = {}
+        for idx in indices:
+            if self._shared_prefix_len(idx) <= 0:
+                continue
+            lora_dir = self.adapter_dirs[idx]
+            if lora_dir is None:
+                continue
+            release_counts[lora_dir] = release_counts.get(lora_dir, 0) + 1
+        for lora_dir, count in release_counts.items():
+            self.mem_manager.prefix_cache.release(lora_dir, count)
 
     @classmethod
     @torch.no_grad()
@@ -131,10 +202,16 @@ class InferBatch:
     @torch.no_grad()
     def free_self(self):
         remove_index = []
+        all_indices = list(range(len(self)))
         for idx in range(len(self)):
-            remove_index.append(self.nopad_b_loc[idx, (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1): (self.nopad_max_len_in_batch - 1)])
-        remove_index = torch.cat(remove_index, dim=-1)
-        self.mem_manager.free(remove_index)
+            start, end = self._history_index_range(idx)
+            if self._has_cache_owned_prefix():
+                request_owned_start = min(start + self._shared_prefix_len(idx), end)
+                remove_index.append(self.nopad_b_loc[idx, request_owned_start:end])
+            else:
+                remove_index.append(self.nopad_b_loc[idx, start:end])
+        self._free_index_list(remove_index)
+        self._release_prefix_refs(all_indices)
         return
         
     # @calculate_time(show=True, min_cost_ms=0)
@@ -163,14 +240,21 @@ class InferBatch:
             left_idx.append(idx)
         
         left_idx_set = set(left_idx)
+        removed_indices = []
         remove_index = []
         for idx in range(len(self)):
             if idx not in left_idx_set:
-                remove_index.append(self.nopad_b_loc[idx, (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1): (self.nopad_max_len_in_batch - 1)])
-        remove_index = torch.cat(remove_index, dim=-1)
+                removed_indices.append(idx)
+                start, end = self._history_index_range(idx)
+                if self._has_cache_owned_prefix():
+                    request_owned_start = min(start + self._shared_prefix_len(idx), end)
+                    remove_index.append(self.nopad_b_loc[idx, request_owned_start:end])
+                else:
+                    remove_index.append(self.nopad_b_loc[idx, start:end])
    
         # mark_start("filter free mem manager")
-        self.mem_manager.free(remove_index)
+        self._free_index_list(remove_index)
+        self._release_prefix_refs(removed_indices)
         # mark_end("filter free mem manager")
 
         # ''' sort according to adapters '''
@@ -196,6 +280,8 @@ class InferBatch:
         
         nopad_b_loc[:, 0 : (nopad_max_len_in_batch - 1)] = self.nopad_b_loc[indices, (self.nopad_max_len_in_batch - 1) - (nopad_max_len_in_batch - 1): (self.nopad_max_len_in_batch - 1)]
         adapter_dirs = []
+        shared_prefix_lens = []
+        shared_prefix_indices = []
         for i, request_id in enumerate(request_ids):
             idx = self.requests_idx_mapping[request_id]
             requests_idx_mapping[request_id] = i
@@ -203,6 +289,8 @@ class InferBatch:
             all_input_ids.append(self.all_input_ids[idx])
             input_lengths.append(self.input_lengths[idx])
             adapter_dirs.append(self.requests[idx]["adapter_dir"])
+            shared_prefix_lens.append(self._shared_prefix_len(idx))
+            shared_prefix_indices.append(self._shared_prefix_index(idx))
         
         input_ids = self.input_ids[indices]
 
@@ -222,6 +310,8 @@ class InferBatch:
             sampling_param_list=[self.sampling_param_list[_i] for _i in indices],
             mem_manager=self.mem_manager,
             adapter_dirs=adapter_dirs,
+            shared_prefix_lens=shared_prefix_lens,
+            shared_prefix_indices=shared_prefix_indices,
         )
 
 
@@ -247,6 +337,8 @@ class InferBatch:
         nopad_b_seq_len = torch.zeros(new_batch_size, dtype=torch.int32, device='cuda')
         nopad_start_loc_len_temp = 0
         adapter_dirs = []
+        shared_prefix_lens = []
+        shared_prefix_indices = []
         batches = [batch1, batch2]
         for i, batch in enumerate(batches):
             if i == 0:
@@ -263,6 +355,8 @@ class InferBatch:
             nopad_b_loc[start_index: end_index, nopad_max_len_in_batch - batch.nopad_max_len_in_batch: nopad_max_len_in_batch -
                         1] = batch.nopad_b_loc[:, :batch.nopad_max_len_in_batch - 1]
             adapter_dirs += batch.adapter_dirs
+            shared_prefix_lens.extend([batch._shared_prefix_len(idx) for idx in range(len(batch))])
+            shared_prefix_indices.extend([batch._shared_prefix_index(idx) for idx in range(len(batch))])
 
             all_input_ids.extend(batch.all_input_ids)
 
@@ -290,6 +384,8 @@ class InferBatch:
             sampling_param_list=sampling_param_list,
             mem_manager=batches[0].mem_manager,
             adapter_dirs=adapter_dirs,
+            shared_prefix_lens=shared_prefix_lens,
+            shared_prefix_indices=shared_prefix_indices,
         )
 
     def __len__(self):

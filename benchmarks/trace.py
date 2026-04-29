@@ -1,9 +1,6 @@
-from collections import Counter
 import json
-import logging
-from itertools import groupby
 import numpy as np
-from typing import List, Tuple, Any
+from typing import Dict
 from tqdm import tqdm
 import random
 from transformers import AutoTokenizer
@@ -30,21 +27,126 @@ def dummy_prompt(prompt_len):
     return "Hello " * prompt_len
 
 
+def sample_adapter_indices(num_adapters, alpha, tot_req, adapter_distribution="power"):
+    if adapter_distribution == "zipf":
+        ranks = np.arange(1, num_adapters + 1, dtype=np.float64)
+        probs = 1.0 / np.power(ranks, alpha)
+        probs = probs / probs.sum()
+        return np.random.choice(num_adapters, size=tot_req, p=probs)
+
+    probs = np.random.power(alpha, tot_req)
+    return np.minimum((probs * num_adapters).astype(int), num_adapters - 1)
+
+
+def _tokenizer_len(tokenizer, text, add_special_tokens=False):
+    return len(tokenizer(text, add_special_tokens=add_special_tokens).input_ids)
+
+
+def _find_exact_prompt_token_id(tokenizer):
+    candidate_texts = [" hello", " world", " test", " data", " token", " prompt", " sample"]
+    for text in candidate_texts:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(token_ids) != 1:
+            continue
+        probe_ids = token_ids * 16
+        probe_text = tokenizer.decode(
+            probe_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if _tokenizer_len(tokenizer, probe_text, add_special_tokens=False) == len(probe_ids):
+            return token_ids[0]
+
+    max_scan = min(getattr(tokenizer, "vocab_size", 32000), 32000)
+    special_ids = set(getattr(tokenizer, "all_special_ids", []))
+    for token_id in range(max_scan):
+        if token_id in special_ids:
+            continue
+        probe_ids = [token_id] * 16
+        probe_text = tokenizer.decode(
+            probe_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if probe_text and _tokenizer_len(tokenizer, probe_text, add_special_tokens=False) == len(probe_ids):
+            return token_id
+    raise RuntimeError("Unable to find a stable single-token prompt unit for exact synthetic prompts")
+
+
+def build_exact_token_prompt(tokenizer, prompt_len, prompt_cache: Dict[int, str] = None):
+    if prompt_len <= 0:
+        return ""
+
+    if prompt_cache is not None and prompt_len in prompt_cache:
+        return prompt_cache[prompt_len]
+
+    unit_token_id = _find_exact_prompt_token_id(tokenizer)
+    target_len = int(prompt_len)
+    empty_special_len = _tokenizer_len(tokenizer, "", add_special_tokens=True)
+    raw_target_len = max(target_len - empty_special_len, 0)
+
+    def _decode_repeated(raw_len):
+        return tokenizer.decode(
+            [unit_token_id] * raw_len,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+    prompt = _decode_repeated(raw_target_len)
+    actual_len = _tokenizer_len(tokenizer, prompt, add_special_tokens=True)
+    if actual_len != target_len:
+        matched_prompt = None
+        for candidate_raw_len in range(max(raw_target_len - 8, 0), raw_target_len + 9):
+            candidate_prompt = _decode_repeated(candidate_raw_len)
+            candidate_len = _tokenizer_len(tokenizer, candidate_prompt, add_special_tokens=True)
+            if candidate_len == target_len:
+                matched_prompt = candidate_prompt
+                break
+        if matched_prompt is None:
+            raise ValueError(
+                f"Exact synthetic prompt generation failed: target_len={target_len}, actual_len={actual_len}"
+            )
+        prompt = matched_prompt
+
+    if prompt_cache is not None:
+        prompt_cache[prompt_len] = prompt
+    return prompt
+
+
 def generate_requests(num_adapters, alpha, req_rate, cv, duration,
                       input_range, output_range,
                       adapter_dirs, # (base_dir, adapter_dir)
-                      seed=42):
+                      seed=42,
+                      fixed_input_len=None,
+                      fixed_output_len=None,
+                      logical_input_len=None,
+                      exact_prompt_tokens=False,
+                      tokenizer_name=None,
+                      adapter_distribution="power"):
     np.random.seed(seed)
 
     tot_req = int(req_rate * duration)
 
     # generate adapter id
-    probs = np.random.power(alpha, tot_req)
-    ind = (probs * num_adapters).astype(int)
+    ind = sample_adapter_indices(num_adapters, alpha, tot_req, adapter_distribution=adapter_distribution)
 
     # generate input output len
-    input_lens = np.random.randint(input_range[0], input_range[1], tot_req)
-    output_lens = np.random.randint(output_range[0], output_range[1], tot_req)
+    if fixed_input_len is not None:
+        input_lens = np.full(tot_req, int(fixed_input_len), dtype=np.int64)
+    else:
+        input_lens = np.random.randint(input_range[0], input_range[1], tot_req)
+    if fixed_output_len is not None:
+        output_lens = np.full(tot_req, int(fixed_output_len), dtype=np.int64)
+    else:
+        output_lens = np.random.randint(output_range[0], output_range[1], tot_req)
+
+    tokenizer = None
+    prompt_cache = {}
+    exact_prompt_unit_token_id = None
+    if exact_prompt_tokens:
+        if tokenizer_name is None:
+            tokenizer_name = adapter_dirs[0][0]
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
     # generate timestamp
     requests = []
@@ -55,9 +157,21 @@ def generate_requests(num_adapters, alpha, req_rate, cv, duration,
     intervals = np.random.gamma(shape, scale, tot_req)
     for i in range(tot_req):
         tic += intervals[i]
-        requests.append(Request(i, adapter_dirs[ind[i]][0], adapter_dirs[ind[i]][1],
-                                dummy_prompt(input_lens[i]), int(input_lens[i]), int(output_lens[i]),
-                                tic))
+        actual_prompt_len = int(input_lens[i])
+        req_prompt_len = int(logical_input_len) if logical_input_len is not None else actual_prompt_len
+        if exact_prompt_tokens:
+            prompt = build_exact_token_prompt(tokenizer, actual_prompt_len, prompt_cache)
+        else:
+            prompt = dummy_prompt(actual_prompt_len)
+        requests.append(Request(
+            i,
+            adapter_dirs[ind[i]][0],
+            adapter_dirs[ind[i]][1],
+            prompt,
+            req_prompt_len,
+            int(output_lens[i]),
+            tic,
+        ))
     return requests
 
 def get_real_requests(trace_file, req_rate, duration, base_model, adapter_dirs, input_range, output_range, seed=42):
@@ -131,4 +245,3 @@ def parse_into_req(base_model, conversations, model_mapping, tokenizer):
         reqs.append(req)
     # print(reqs)
     return reqs
-

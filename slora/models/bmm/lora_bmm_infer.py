@@ -156,6 +156,9 @@ class LoraBmmInfer:
         infer_state.b_seq_len = b_seq_len
         
         infer_state.mem_manager = self.base_model.mem_manager
+        prefix_cache = getattr(self.base_model.mem_manager, "prefix_cache", None)
+        if prefix_cache is not None:
+            prefix_cache.ensure_available(batch_size)
 
         alloc_mem = self.base_model.mem_manager.alloc_contiguous(batch_size)
         if alloc_mem is not None:
@@ -434,4 +437,3 @@ class LoraBmmInfer:
                                                   self.batch_lora_A[layer_id,3,i]),
                                         self.batch_lora_B[layer_id,3,i]) * adapter_scaling
         return o
-

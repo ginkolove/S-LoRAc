@@ -14,7 +14,7 @@ import os
 import sys
 import time
 from tqdm import tqdm
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import aiohttp
 
@@ -139,17 +139,17 @@ async def benchmark(
 
 def get_adapter_dirs(num_adapters, adapter_dirs, backend=None):
     ret = []
-    num_iter = num_adapters // len(adapter_dirs) + 1
+    num_iter = (num_adapters + len(adapter_dirs) - 1) // len(adapter_dirs)
 
     if backend == "vllm-packed":
-        num_iter = num_adapters // len(adapter_dirs)
+        num_iter = max(1, num_adapters // len(adapter_dirs))
 
     for i in range(num_iter):
         for adapter_dir in adapter_dirs:
             ret.append(adapter_dir + f"-{i}")
-    return ret
+    return ret[:num_adapters]
 
-def get_res_stats(per_req_latency, benchmark_time, backend, warmup_time=0, warmup_num=0):
+def get_res_stats(per_req_latency, benchmark_time, backend, config_dict, warmup_time=0, warmup_num=0):
     # get throughput
     num_abort = len([i for i in per_req_latency if i[3] is None])
     per_req_latency = [i for i in per_req_latency if i[3] is not None]
@@ -212,21 +212,124 @@ def get_res_stats(per_req_latency, benchmark_time, backend, warmup_time=0, warmu
               "avg_first_token_latency": avg_first_token_latency,
               "avg_satisfaction": avg_satisfaction,
               "avg_attainment": avg_attainment}
-    res = {"config": to_dict(config), "result": result}
+    res = {"config": config_dict, "result": result}
     
     return res
 
 
-def run_exp(model_setting, backend, server, config, output, mode, seed=42, debug=False):
+def _override_config(config, args):
+    num_adapters, alpha, req_rate, cv, duration, input_range, output_range = config
+    if args.num_adapters_override is not None:
+        num_adapters = args.num_adapters_override
+    if args.alpha_override is not None:
+        alpha = args.alpha_override
+    if args.req_rate_override is not None:
+        req_rate = args.req_rate_override
+    if args.cv_override is not None:
+        cv = args.cv_override
+    if args.duration_override is not None:
+        duration = args.duration_override
+    if args.fixed_input_len is not None:
+        input_range = (args.fixed_input_len, args.fixed_input_len + 1)
+    if args.fixed_output_len is not None:
+        output_range = (args.fixed_output_len, args.fixed_output_len + 1)
+    return num_adapters, alpha, req_rate, cv, duration, input_range, output_range
+
+
+def _resolve_prompt_lengths(args):
+    if args.shared_prefix_ratio is None:
+        return None, None
+    assert args.fixed_input_len is not None, "--fixed-input-len is required with --shared-prefix-ratio"
+    shared_prefix_len = int(round(args.fixed_input_len * args.shared_prefix_ratio))
+    query_len = args.fixed_input_len - shared_prefix_len
+    assert query_len >= 0, "shared prefix length cannot exceed logical input length"
+    return shared_prefix_len, query_len
+
+
+def _build_config_dict(base_config, args, logical_input_len, request_input_len, shared_prefix_len):
+    config_dict = to_dict(base_config)
+    config_dict.update({
+        "mode": args.mode,
+        "model_setting": args.model_setting,
+        "base_model_override": args.base_model_override,
+        "adapter_template_override": args.adapter_template_override,
+        "num_adapters_effective": args.num_adapters_override if args.num_adapters_override is not None else config_dict["num_adapters"],
+        "alpha_effective": args.alpha_override if args.alpha_override is not None else config_dict["alpha"],
+        "req_rate_effective": args.req_rate_override if args.req_rate_override is not None else config_dict["req_rate"],
+        "cv_effective": args.cv_override if args.cv_override is not None else config_dict["cv"],
+        "duration_effective": args.duration_override if args.duration_override is not None else config_dict["duration"],
+        "fixed_input_len": args.fixed_input_len,
+        "fixed_output_len": args.fixed_output_len,
+        "logical_input_len": logical_input_len,
+        "request_input_len": request_input_len,
+        "shared_prefix_ratio": args.shared_prefix_ratio,
+        "shared_prefix_len": shared_prefix_len,
+        "query_only_prefix_workload": args.query_only_prefix_workload,
+        "exact_prompt_tokens": args.exact_prompt_tokens,
+        "adapter_distribution": args.adapter_distribution,
+    })
+    return config_dict
+
+
+def _has_custom_workload(args):
+    return any([
+        args.num_adapters_override is not None,
+        args.base_model_override is not None,
+        args.adapter_template_override is not None,
+        args.alpha_override is not None,
+        args.req_rate_override is not None,
+        args.cv_override is not None,
+        args.duration_override is not None,
+        args.fixed_input_len is not None,
+        args.fixed_output_len is not None,
+        args.shared_prefix_ratio is not None,
+        args.query_only_prefix_workload,
+        args.exact_prompt_tokens,
+        args.adapter_distribution != "power",
+    ])
+
+
+def _build_custom_config(args):
+    input_len = args.fixed_input_len if args.fixed_input_len is not None else 8
+    output_len = args.fixed_output_len if args.fixed_output_len is not None else 8
+    return BenchmarkConfig(
+        num_adapters=args.num_adapters_override if args.num_adapters_override is not None else 1,
+        alpha=args.alpha_override if args.alpha_override is not None else 1.0,
+        req_rate=args.req_rate_override if args.req_rate_override is not None else 1.0,
+        cv=args.cv_override if args.cv_override is not None else 1.0,
+        duration=args.duration_override if args.duration_override is not None else 60,
+        input_range=[input_len, input_len + 1],
+        output_range=[output_len, output_len + 1],
+    )
+
+
+def run_exp(model_setting, backend, server, config, output, mode, args):
     if mode == "real":
         print("*** num_adapters, cv and alpha are not used in real mode ***")
     print([(k, v) for k, v in zip(BenchmarkConfig._fields, config)])
 
-    num_adapters, alpha, req_rate, cv, duration, input_range, output_range = config
+    num_adapters, alpha, req_rate, cv, duration, input_range, output_range = _override_config(config, args)
+    logical_input_len = args.fixed_input_len
+    shared_prefix_len, query_len = _resolve_prompt_lengths(args)
+    request_input_len = args.fixed_input_len
+    if args.query_only_prefix_workload:
+        assert args.shared_prefix_ratio is not None, "--shared-prefix-ratio is required with --query-only-prefix-workload"
+        logical_input_len = args.fixed_input_len
+        request_input_len = query_len
+    elif args.shared_prefix_ratio is not None and logical_input_len is None:
+        logical_input_len = None
+    config_dict = _build_config_dict(config, args, logical_input_len, request_input_len, shared_prefix_len)
+
+    if args.shared_prefix_ratio is not None:
+        print(
+            f"shared_prefix_ratio={args.shared_prefix_ratio:.4f} "
+            f"shared_prefix_len={shared_prefix_len} request_input_len={request_input_len} "
+            f"logical_input_len={logical_input_len}"
+        )
     # assert duration >= 30
     if mode == "synthetic":
-        base_model = BASE_MODEL[model_setting]
-        adapter_dirs = LORA_DIR[model_setting]
+        base_model = args.base_model_override or BASE_MODEL[model_setting]
+        adapter_dirs = [args.adapter_template_override] if args.adapter_template_override else LORA_DIR[model_setting]
         adapter_dirs = get_adapter_dirs(num_adapters, adapter_dirs)
         adapter_dirs = [(base_model, adapter_dirs[i]) for i in range(num_adapters)]
         if num_adapters == 0:
@@ -234,27 +337,38 @@ def run_exp(model_setting, backend, server, config, output, mode, seed=42, debug
             num_adapters = 1
         requests = generate_requests(num_adapters, alpha, req_rate, cv, duration,
                                  input_range, output_range, adapter_dirs,
-                                 seed=seed)
+                                 seed=args.seed,
+                                 fixed_input_len=request_input_len,
+                                 fixed_output_len=args.fixed_output_len,
+                                 logical_input_len=logical_input_len,
+                                 exact_prompt_tokens=args.exact_prompt_tokens,
+                                 tokenizer_name=base_model,
+                                 adapter_distribution=args.adapter_distribution)
         avg_prompt_len = np.mean([req.prompt_len for req in requests])
         avg_output_len = np.mean([req.output_len for req in requests])
         avg_len = np.mean([req.prompt_len + req.output_len for req in requests])
-        print("avg_len:", avg_len, "avg_prompt_len:", avg_prompt_len, "avg_output_len:", avg_output_len)
+        print(
+            "avg_len:", avg_len,
+            "avg_prompt_len:", avg_prompt_len,
+            "avg_output_len:", avg_output_len,
+            "request_input_len:", request_input_len,
+        )
     else:
         # first generate your data using real_trace/clean_chat_data.py
-        base_model = BASE_MODEL[model_setting]
-        adapter_dirs = LORA_DIR[model_setting]
+        base_model = args.base_model_override or BASE_MODEL[model_setting]
+        adapter_dirs = [args.adapter_template_override] if args.adapter_template_override else LORA_DIR[model_setting]
         adapter_dirs, requests = get_real_requests(trace_file="../../../real_trace/clean_chat_conv_20231019.json",
                                                    req_rate=req_rate, duration=duration,
                                                    base_model=base_model, adapter_dirs=adapter_dirs,
                                                    input_range=input_range, output_range=output_range,
-                                                   seed=seed)
+                                                   seed=args.seed)
         # print(requests)
         avg_prompt_len = np.mean([req.prompt_len for req in requests])
         avg_output_len = np.mean([req.output_len for req in requests])
         avg_len = np.mean([req.prompt_len + req.output_len for req in requests])
         print("num_adapters", len(adapter_dirs), "num_requests", len(requests), "avg_len:", avg_len, "avg_prompt_len:", avg_prompt_len, "avg_output_len:", avg_output_len)
         
-    if debug:
+    if args.debug:
         print("num requests:", len(requests))
         for req in requests[:4]:
             print(req)
@@ -265,14 +379,14 @@ def run_exp(model_setting, backend, server, config, output, mode, seed=42, debug
 
     # benchmark
     benchmark_start_time = time.time()
-    per_req_latency = asyncio.run(benchmark(backend, server, requests, debug))
+    per_req_latency = asyncio.run(benchmark(backend, server, requests, args.debug))
     benchmark_end_time = time.time()
     benchmark_time = benchmark_end_time - benchmark_start_time
 
     warmup_time = 10
     warmup_num = int(req_rate * warmup_time)
     res = get_res_stats(per_req_latency, benchmark_time, backend,
-                        warmup_time=warmup_time, warmup_num=warmup_num)
+                        config_dict=config_dict, warmup_time=warmup_time, warmup_num=warmup_num)
 
     with open(output, "a") as f:
         f.write(json.dumps(res) + "\n")
@@ -298,10 +412,25 @@ if __name__ == "__main__":
     parser.add_argument("--server", type=str, default="http://localhost:8000")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--num-adapters-override", type=int, default=None)
+    parser.add_argument("--base-model-override", type=str, default=None)
+    parser.add_argument("--adapter-template-override", type=str, default=None)
+    parser.add_argument("--alpha-override", type=float, default=None)
+    parser.add_argument("--req-rate-override", type=float, default=None)
+    parser.add_argument("--cv-override", type=float, default=None)
+    parser.add_argument("--duration-override", type=float, default=None)
+    parser.add_argument("--fixed-input-len", type=int, default=None)
+    parser.add_argument("--fixed-output-len", type=int, default=None)
+    parser.add_argument("--shared-prefix-ratio", type=float, default=None)
+    parser.add_argument("--query-only-prefix-workload", action="store_true")
+    parser.add_argument("--exact-prompt-tokens", action="store_true")
+    parser.add_argument("--adapter-distribution", type=str, default="power", choices=["power", "zipf"])
     args = parser.parse_args()
 
     assert not args.no_lora_copy or args.no_lora_compute
     assert not (args.debug and args.breakdown)
+    assert args.shared_prefix_ratio is None or 0.0 <= args.shared_prefix_ratio <= 1.0
+    assert not args.query_only_prefix_workload or args.fixed_input_len is not None
 
     # set output file name
     if args.output is None:
@@ -317,7 +446,11 @@ if __name__ == "__main__":
     if args.debug or args.breakdown:
         args.output = "debug_" + args.output
 
-    suites = get_all_suites(mode=args.mode, debug=args.debug, suite=args.suite, breakdown=args.breakdown)
+    custom_workload = _has_custom_workload(args)
+    if custom_workload:
+        suites = [_build_custom_config(args)]
+    else:
+        suites = get_all_suites(mode=args.mode, debug=args.debug, suite=args.suite, breakdown=args.breakdown)
 
     if not args.append:
         os.system(f"rm {args.output}")
@@ -328,6 +461,6 @@ if __name__ == "__main__":
         results = [json.loads(line)["config"] for line in lines]
 
     for config in tqdm(suites, desc="suites"):
-        if to_dict(config) not in results:
+        if custom_workload or to_dict(config) not in results:
             stats = run_exp(args.model_setting, args.backend, args.server, config,
-                            args.output, args.mode, args.seed, args.debug)
+                            args.output, args.mode, args)
