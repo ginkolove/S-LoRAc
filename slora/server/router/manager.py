@@ -15,20 +15,28 @@ from .model_infer.model_rpc import start_model_process, ModelRpcClient
 from .req_queue import ReqQueue
 from rpyc.utils.classic import obtain
 from slora.utils.infer_utils import calculate_time
-from ..io_struct import BatchTokenIdOut, AbortReq
+from ..io_struct import BatchTokenIdOut, AbortReq, LowRAResetReq, LowRAResetAck
 from .stats import Stats
 
 from slora.server.input_params import InputParams
 from slora.models.peft.lora_adapter import get_lora_config
+from slora.common.lowra_static import LowRAStaticPrefixStore
+from slora.utils.model_utils import get_model_config
 from slora.server.router.profiler import AlphaModel, BetaModel
 from slora.server.router.abort_req_queue import AbortReqQueue
 from slora.server.router.cluster_req_queue import ClusterReqQueue
 from slora.server.router.vtc_req_queue import VTCReqQueue
 from slora.server.router.pets_req_queue import PETSReqQueue
 from slora.server.router.peft_req_queue import PEFTReqQueue
+from slora.server.router.lowra_req_queue import LowRAPrefixAwareReqQueue
 
 
 def get_scheduler(input_params, adapter_dirs):
+    if input_params.enable_lowra:
+        return LowRAPrefixAwareReqQueue(input_params.max_total_token_num, input_params.batch_max_tokens,
+                                        input_params.running_max_req_size,
+                                        input_params.lowra_shared_prefix_len,
+                                        input_params.lowra_window_n)
     if input_params.scheduler == "vtc_fair":
         return VTCReqQueue(input_params.max_total_token_num, input_params.batch_max_tokens,
                            input_params.running_max_req_size, adapter_dirs, input_params.fair_weights)
@@ -75,6 +83,32 @@ class RouterManager:
             config, _ = get_lora_config(lora_dir, input_params.dummy)
             self.lora_ranks[lora_dir] = config["r"]
         self.lora_ranks[None] = 0
+
+        if self.input_params.enable_lowra and self.input_params.lowra_shared_prefix_len > 0:
+            model_cfg = get_model_config(weightdir, dummy=input_params.dummy)
+            static_tokens = LowRAStaticPrefixStore.token_equivalent_static_size_from_config(
+                self.input_params.lowra_shared_prefix_len,
+                [self.lora_ranks[lora_dir] for lora_dir in adapter_dirs],
+                model_cfg,
+                world_size,
+            )
+            self.input_params.lowra_static_token_num = static_tokens
+            self.input_params.max_total_token_num -= static_tokens
+            if self.input_params.max_total_token_num <= 0:
+                raise ValueError(
+                    f"LowRA static region consumes {static_tokens} token-equivalent entries, "
+                    "leaving no dynamic Unified Paging budget"
+                )
+            print(
+                f"LowRA static region: {static_tokens} token-equivalent entries, "
+                f"dynamic Unified Paging budget: {self.input_params.max_total_token_num}"
+            )
+        else:
+            self.input_params.lowra_static_token_num = 0
+        if self.input_params.enable_lowra:
+            model_cfg = get_model_config(weightdir, dummy=input_params.dummy)
+            max_sequence_length = model_cfg.get("max_sequence_length", model_cfg.get("max_position_embeddings", self.input_params.max_req_total_len))
+            self.input_params.lowra_window_n = max(1, self.input_params.lowra_original_total_token_num // int(max_sequence_length))
 
         self.req_queue = get_scheduler(input_params, adapter_dirs)
 
@@ -141,9 +175,10 @@ class RouterManager:
         adapter_dir: str,
         prompt_ids: List[int],
         sampling_params: SamplingParams,
-        request_id: str
+        request_id: str,
+        lowra_lengths=None,
     ):
-        req = Req(adapter_dir, request_id, prompt_ids, sampling_params)
+        req = Req(adapter_dir, request_id, prompt_ids, sampling_params, lowra_lengths)
         self.req_queue.append(req)
         self.send_to_detokenization.send_pyobj(req.to_req_detokenization_state())
         return
@@ -180,6 +215,7 @@ class RouterManager:
         """
         # 删除所有已经 finished 的 req
         if self.running_batch is None:
+            await self._sync_lowra_prefix_cache_state()
             new_batch = self.req_queue.generate_new_batch(self.running_batch, self.lora_ranks)
             if self.input_params.enable_abort and len(self.req_queue.abort_req_list) > 0:
                 self.send_to_detokenization.send_pyobj(BatchAbortReq(self.req_queue.abort_req_list))
@@ -188,6 +224,7 @@ class RouterManager:
                 self.stats_tool.count_prompt_tokens(new_batch)
                 self.running_batch = new_batch
 
+                await self._evict_lowra_prefixes_for_batch(new_batch)
                 if not self.input_params.no_lora:
                     # load adapters
                     ret = []
@@ -195,7 +232,6 @@ class RouterManager:
                         ret.append(self.model_rpcs[tp_rank].load_adapters(new_batch.adapter_dirs))
                     await asyncio.gather(*ret)
 
-                
                 # merge adapter to base model
                 if self.input_params.scheduler == "peft":
                     torch.cuda.synchronize()
@@ -229,6 +265,7 @@ class RouterManager:
             self.has_wait_tokens += 1
             return
         else:
+            await self._sync_lowra_prefix_cache_state()
             new_mini_batch = self.req_queue.generate_new_batch(self.running_batch, self.lora_ranks)
             if self.input_params.enable_abort and len(self.req_queue.abort_req_list) > 0:
                 self.send_to_detokenization.send_pyobj(BatchAbortReq(self.req_queue.abort_req_list))
@@ -236,6 +273,7 @@ class RouterManager:
             if new_mini_batch is not None:
                 self.stats_tool.count_prompt_tokens(new_mini_batch)
 
+                await self._evict_lowra_prefixes_for_batch(new_mini_batch)
                 if not self.input_params.no_lora:
                     ret = []
                     for tp_rank in range(self.world_size):
@@ -252,6 +290,58 @@ class RouterManager:
                 await self._decode_batch(self.running_batch)
                 await self._filter_runing_batch()
         
+    async def _sync_lowra_prefix_cache_state(self):
+        if not self.input_params.enable_lowra or not hasattr(self.req_queue, "update_prefix_cache_state"):
+            return
+        if not hasattr(self, "model_rpcs"):
+            return
+        states = await asyncio.gather(*[
+            self.model_rpcs[tp_rank].lowra_prefix_cache_state()
+            for tp_rank in range(self.world_size)
+        ])
+        self.req_queue.update_prefix_cache_state(states[0])
+
+    async def _evict_lowra_prefixes_for_batch(self, batch):
+        evict_lora_dirs = getattr(batch, "lowra_evict_prefix_lora_dirs", [])
+        if not evict_lora_dirs:
+            return
+        await asyncio.gather(*[
+            self.model_rpcs[tp_rank].evict_lowra_prefixes(evict_lora_dirs)
+            for tp_rank in range(self.world_size)
+        ])
+
+    async def _reset_lowra_runtime(self, request_id):
+        if not self.input_params.enable_lowra:
+            self.send_to_detokenization.send_pyobj(
+                LowRAResetAck(request_id, False, "LowRA is not enabled")
+            )
+            return
+        if self.running_batch is not None or len(self.req_queue.waiting_req_list) > 0:
+            self.send_to_detokenization.send_pyobj(
+                LowRAResetAck(
+                    request_id,
+                    False,
+                    "LowRA runtime reset requires an idle server",
+                    {
+                        "running_batch_size": 0 if self.running_batch is None else len(self.running_batch.reqs),
+                        "waiting_queue_size": len(self.req_queue.waiting_req_list),
+                    },
+                )
+            )
+            return
+        try:
+            stats_list = await asyncio.gather(*[
+                self.model_rpcs[tp_rank].reset_lowra_runtime()
+                for tp_rank in range(self.world_size)
+            ])
+            await self._sync_lowra_prefix_cache_state()
+            self.send_to_detokenization.send_pyobj(
+                LowRAResetAck(request_id, True, "LowRA runtime reset complete", {"per_rank": stats_list})
+            )
+        except Exception as exc:
+            self.send_to_detokenization.send_pyobj(
+                LowRAResetAck(request_id, False, repr(exc))
+            )
 
     async def _init_batch(self, batch: Batch):
         reqs = [r.to_rpc_obj() for r in batch.reqs]
@@ -357,7 +447,10 @@ class RouterManager:
     async def loop_for_netio_req(self):
         while True:
             recv_req = await self.recv_from_httpserver.recv_pyobj()
-            if isinstance(recv_req, tuple) and len(recv_req) == 4:
+            if isinstance(recv_req, tuple) and len(recv_req) == 5:
+                adapter_dir, prompt_ids, sampling_params, request_id, lowra_lengths = recv_req
+                self.add_req(adapter_dir, prompt_ids, sampling_params, request_id, lowra_lengths)
+            elif isinstance(recv_req, tuple) and len(recv_req) == 4:
                 adapter_dir, prompt_ids, sampling_params, request_id = recv_req
                 self.add_req(adapter_dir, prompt_ids, sampling_params, request_id)
             elif isinstance(recv_req, AbortReq):
@@ -365,6 +458,8 @@ class RouterManager:
                 request_id = abort_req.req_id
                 await self.abort(request_id)
                 self.send_to_detokenization.send_pyobj(abort_req)
+            elif isinstance(recv_req, LowRAResetReq):
+                await self._reset_lowra_runtime(recv_req.req_id)
             else:
                 assert False, f"Error Req Inf {recv_req}"
 
@@ -400,6 +495,8 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
                                bmm=args.bmm,
                                no_lora=args.no_lora,
                                fair_weights=args.fair_weights,
+                               enable_lowra=args.enable_lowra,
+                               lowra_shared_prefix_len=args.lowra_shared_prefix_len,
                               )
 
     try:
@@ -432,9 +529,10 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
     
     except Exception as e:
         import traceback
-        err_str = '\n'.join(traceback.format_exception(e))
+        err_str = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
         pipe_writer.send(err_str)
-        router.clean_up()
+        if "router" in locals():
+            router.clean_up()
         raise
 
     pipe_writer.send('init ok')

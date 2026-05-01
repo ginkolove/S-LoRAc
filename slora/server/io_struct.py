@@ -4,12 +4,16 @@ import asyncio
 
 
 class Req:
-    def __init__(self, adapter_dir, request_id, prompt_ids, sample_params: SamplingParams):
+    def __init__(self, adapter_dir, request_id, prompt_ids, sample_params: SamplingParams, lowra_lengths=None):
         self.adapter_dir = adapter_dir
         self.request_id = request_id
         self.prompt_ids = prompt_ids
         self.input_len = len(prompt_ids)
         self.max_output_len = sample_params.max_new_tokens
+        lowra_lengths = lowra_lengths or {}
+        self.lowra_shared_prefix_len = int(lowra_lengths.get("shared_prefix_len", 0))
+        self.lowra_query_len = int(lowra_lengths.get("query_len", self.input_len))
+        self.lowra_decode_len = int(lowra_lengths.get("decode_len", self.max_output_len))
         self.sample_params = sample_params
         self.output_ids = []
         self.output_metadata_list = []
@@ -21,6 +25,9 @@ class Req:
                 "request_id": self.request_id,
                 "input_id": self.prompt_ids,
                 "output_len": self.max_output_len,
+                "lowra_shared_prefix_len": self.lowra_shared_prefix_len,
+                "lowra_query_len": self.lowra_query_len,
+                "lowra_decode_len": self.lowra_decode_len,
                 "sampling_param": self.sample_params.to_dict() }
 
     def to_req_detokenization_state(self):
@@ -148,3 +155,16 @@ class AbortReq:
 class BatchAbortReq:
     def __init__(self, req_ids):
         self.reqs: List[str] = req_ids
+
+
+class LowRAResetReq:
+    def __init__(self, req_id):
+        self.req_id = req_id
+
+
+class LowRAResetAck:
+    def __init__(self, req_id, ok, message, stats=None):
+        self.req_id = req_id
+        self.ok = ok
+        self.message = message
+        self.stats = stats or {}

@@ -71,10 +71,48 @@ def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse
     return JSONResponse({"message": message}, status_code=status_code.value)
 
 
+def _pop_lowra_lengths(request_dict, sample_params_dict):
+    lengths = request_dict.pop("lowra_lengths", None)
+    if lengths is None:
+        lengths = {}
+    else:
+        lengths = dict(lengths)
+
+    aliases = {
+        "shared_prefix_len": ("shared_prefix_len", "lowra_shared_prefix_len"),
+        "query_len": ("query_len", "lowra_query_len"),
+        "decode_len": ("decode_len", "lowra_decode_len"),
+    }
+    for canonical, names in aliases.items():
+        for name in names:
+            if name in request_dict:
+                lengths[canonical] = request_dict.pop(name)
+            if name in sample_params_dict:
+                lengths[canonical] = sample_params_dict.pop(name)
+    if not lengths:
+        return None
+    return {key: int(value) for key, value in lengths.items()}
+
+
 @app.get("/healthz")
 @app.get("/health")
 def healthcheck():
     return "OK"
+
+
+@app.post("/lowra/reset_runtime")
+async def lowra_reset_runtime() -> Response:
+    global isFirst
+    if isFirst:
+        loop = asyncio.get_event_loop()
+        loop.create_task(httpserver_manager.handle_loop())
+        isFirst = False
+
+    request_id = f"lowra-reset-{uuid.uuid4().hex}"
+    result = await httpserver_manager.reset_lowra_runtime(request_id)
+    status_code = 200 if result.get("ok") else 409
+    return JSONResponse(result, status_code=status_code)
+
 
 @app.post("/generate")
 async def generate(request: Request) -> Response:
@@ -89,6 +127,7 @@ async def generate(request: Request) -> Response:
     prompt = request_dict.pop("inputs")
     sample_params_dict = request_dict["parameters"]
     return_details = sample_params_dict.pop("return_details", False)
+    lowra_lengths = _pop_lowra_lengths(request_dict, sample_params_dict)
     sampling_params = SamplingParams(**sample_params_dict)
     sampling_params.verify()
 
@@ -96,7 +135,7 @@ async def generate(request: Request) -> Response:
         request_id = request_dict["req_id"]
     else:
         request_id = uuid.uuid4().hex
-    results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
+    results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id, lowra_lengths)
 
     # Non-streaming case
     final_output = []
@@ -138,6 +177,7 @@ async def generate_stream(request: Request) -> Response:
     prompt = request_dict.pop("inputs")
     sample_params_dict = request_dict["parameters"]
     return_details = sample_params_dict.pop("return_details", False)
+    lowra_lengths = _pop_lowra_lengths(request_dict, sample_params_dict)
     sampling_params = SamplingParams(**sample_params_dict)
     sampling_params.verify()
 
@@ -145,7 +185,7 @@ async def generate_stream(request: Request) -> Response:
         request_id = request_dict["req_id"]
     else:
         request_id = uuid.uuid4().hex
-    results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id)
+    results_generator = httpserver_manager.generate(adapter_dir, prompt, sampling_params, request_id, lowra_lengths)
 
     # Streaming case
     async def stream_results() -> AsyncGenerator[bytes, None]:
@@ -220,7 +260,7 @@ async def chat_completions(
     sampling_params.verify()
 
     request_id = f"chatcmpl-{uuid.uuid4().hex}"
-    results_generator = httpserver_manager.generate(prompt, sampling_params, request_id)
+    results_generator = httpserver_manager.generate(None, prompt, sampling_params, request_id)
 
     # Non-streaming case
     if not request.stream:
@@ -377,6 +417,8 @@ def main():
     parser.add_argument("--no-mem-pool", action="store_true")
     parser.add_argument("--bmm", action="store_true")
     parser.add_argument("--no-lora", action="store_true")
+    parser.add_argument("--enable-lowra", action="store_true")
+    parser.add_argument("--lowra-shared-prefix-len", type=int, default=0)
     ''' end of slora arguments '''
 
     args = parser.parse_args()
@@ -411,6 +453,8 @@ def main():
         max_req_total_len=args.max_req_total_len,
         trust_remote_code=args.trust_remote_code,
         dummy=args.dummy,
+        enable_lowra=args.enable_lowra,
+        lowra_shared_prefix_len=args.lowra_shared_prefix_len,
     )
     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)

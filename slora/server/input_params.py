@@ -49,9 +49,14 @@ class InputParams:
         no_lora,
         # fairness
         fair_weights,
+        # LowRA
+        enable_lowra=False,
+        lowra_shared_prefix_len=0,
     ) -> None:
         self.max_req_total_len = max_req_total_len
         self.max_total_token_num = max_total_token_num
+        self.lowra_original_total_token_num = max_total_token_num
+        self.lowra_window_n = 1
         self.pool_size_lora = pool_size_lora
         self.batch_max_tokens = batch_max_tokens
         self.running_max_req_size = running_max_req_size
@@ -77,5 +82,7 @@ class InputParams:
         self.no_lora = no_lora
         
         self.fair_weights = fair_weights
+        self.enable_lowra = enable_lowra
+        self.lowra_shared_prefix_len = lowra_shared_prefix_len
         return
  

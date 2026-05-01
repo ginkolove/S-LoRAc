@@ -132,10 +132,23 @@ class InferBatch:
     def free_self(self):
         remove_index = []
         for idx in range(len(self)):
-            remove_index.append(self.nopad_b_loc[idx, (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1): (self.nopad_max_len_in_batch - 1)])
-        remove_index = torch.cat(remove_index, dim=-1)
-        self.mem_manager.free(remove_index)
+            remove_index.append(self._free_indices_for_req(idx))
+        remove_index = [indices for indices in remove_index if indices.numel() > 0]
+        if remove_index:
+            remove_index = torch.cat(remove_index, dim=-1)
+            self.mem_manager.free(remove_index)
         return
+
+    def _free_indices_for_req(self, idx):
+        seq_len = int(self.nopad_b_seq_len[idx].item())
+        start = self.nopad_max_len_in_batch - seq_len
+        end = self.nopad_max_len_in_batch - 1
+        prefix_len = int(getattr(self, "lowra_prefix_len", 0))
+        if prefix_len > 0:
+            start += prefix_len
+        if start >= end:
+            return self.nopad_b_loc[idx, 0:0]
+        return self.nopad_b_loc[idx, start:end]
         
     # @calculate_time(show=True, min_cost_ms=0)
     @torch.no_grad()
@@ -166,11 +179,12 @@ class InferBatch:
         remove_index = []
         for idx in range(len(self)):
             if idx not in left_idx_set:
-                remove_index.append(self.nopad_b_loc[idx, (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1): (self.nopad_max_len_in_batch - 1)])
-        remove_index = torch.cat(remove_index, dim=-1)
+                remove_index.append(self._free_indices_for_req(idx))
    
         # mark_start("filter free mem manager")
-        self.mem_manager.free(remove_index)
+        remove_index = [indices for indices in remove_index if indices.numel() > 0]
+        if remove_index:
+            self.mem_manager.free(torch.cat(remove_index, dim=-1))
         # mark_end("filter free mem manager")
 
         # ''' sort according to adapters '''
