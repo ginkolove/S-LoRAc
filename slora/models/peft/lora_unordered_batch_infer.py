@@ -5,6 +5,7 @@ from typing import final
 
 from slora.common.infer_utils import init_bloc
 from slora.models.llama.triton_kernel.context_flashattention_nopad import context_attention_fwd
+from slora.models.prefix_slora.prefix_attention import context_attention_fwd_with_prefix
 from slora.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
 from slora.models.peft.triton_kernel.lora.lora_prefill import lora_get_qkvo_fwd_shrink, lora_get_qkvo_fwd_expand
 from slora.server.router.model_infer.naive_infer_adapter import NaiveInferAdapter
@@ -53,7 +54,9 @@ class LoraUnorderedBatchInfer:
             is_prefill=True,
             use_bmm=True,
             no_lora_compute=False,
-            no_lora_copy=False):
+            no_lora_copy=False,
+            prefix_slora_prefix_len=0,
+            prefix_slora_b_loc=None):
 
         # Notice that batch_lora only support decoding
         assert len(b_loc) == len(b_start_loc) == len(b_seq_len)
@@ -70,7 +73,8 @@ class LoraUnorderedBatchInfer:
 
             return self._prefill(batch_size, total_token_num, max_len_in_batch,
                                  input_ids,
-                                 b_loc, b_start_loc, b_seq_len, no_lora_compute)
+                                 b_loc, b_start_loc, b_seq_len, no_lora_compute,
+                                 prefix_slora_prefix_len, prefix_slora_b_loc)
         else:
             for _ in range(3):
                 self.delta.append(torch.zeros((len(b_seq_len), self.max_lora_dim), dtype=torch.float16, device="cuda"))
@@ -82,7 +86,8 @@ class LoraUnorderedBatchInfer:
 
     def _prefill(self, batch_size, total_token_num, max_len_in_batch,
                  input_ids,
-                 b_loc, b_start_loc, b_seq_len, no_lora_compute=False):
+                 b_loc, b_start_loc, b_seq_len, no_lora_compute=False,
+                 prefix_slora_prefix_len=0, prefix_slora_b_loc=None):
 
         infer_state = self.base_model.infer_state_class()
         infer_state.is_prefill = True
@@ -93,8 +98,14 @@ class LoraUnorderedBatchInfer:
         assert (b_loc.shape[0] == b_start_loc.shape[0] == b_seq_len.shape[0])
 
         b_seq_len_numpy = b_seq_len.cpu().numpy()
-        position_ids = torch.from_numpy(np.concatenate([np.arange(0, b_seq_len_numpy[i])
-                                        for i in range(len(b_seq_len_numpy))], axis=0)).cuda()
+        if prefix_slora_prefix_len > 0:
+            position_ids = torch.from_numpy(np.concatenate([
+                np.arange(prefix_slora_prefix_len, prefix_slora_prefix_len + b_seq_len_numpy[i])
+                for i in range(len(b_seq_len_numpy))
+            ], axis=0)).cuda()
+        else:
+            position_ids = torch.from_numpy(np.concatenate([np.arange(0, b_seq_len_numpy[i])
+                                            for i in range(len(b_seq_len_numpy))], axis=0)).cuda()
         infer_state.position_cos = torch.index_select(
                 self.base_model._cos_cached, 0, position_ids).view(position_ids.shape[0], -1)
         infer_state.position_sin = torch.index_select(
@@ -105,6 +116,8 @@ class LoraUnorderedBatchInfer:
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
         infer_state.mem_manager = self.base_model.mem_manager
+        infer_state.prefix_slora_prefix_len = prefix_slora_prefix_len
+        infer_state.prefix_slora_b_loc = prefix_slora_b_loc
         infer_state.prefill_mem_index = self.base_model.mem_manager.alloc(infer_state.total_token_num)
         infer_state.prefill_key_buffer = torch.empty(
                 (infer_state.total_token_num, self.base_model.tp_k_head_num_, self.base_model.head_dim_),
@@ -217,7 +230,12 @@ class LoraUnorderedBatchInfer:
         input1 = None
         layer_infer._post_cache_kv(cache_k, cache_v, infer_state, layer_weight)
         # compute attention
-        o = layer_infer._context_attention_kernel(q, cache_k, cache_v, infer_state, layer_weight)
+        if getattr(infer_state, "prefix_slora_prefix_len", 0) > 0:
+            o = self._prefix_slora_context_attention(
+                layer_infer, layer_weight, q, cache_k, cache_v, infer_state, layer_id
+            )
+        else:
+            o = layer_infer._context_attention_kernel(q, cache_k, cache_v, infer_state, layer_weight)
         q = None
         o = self._lora_get_o(layer_id, o, infer_state, no_lora_compute)
         # if self.world_size_ > 1:
@@ -225,6 +243,28 @@ class LoraUnorderedBatchInfer:
         # residual
         input_embs.add_(o.view(-1, layer_infer.embed_dim_))
         return
+
+    def _prefix_slora_context_attention(self, layer_infer, layer_weight, q, cache_k, cache_v,
+                                        infer_state, layer_id):
+        prefix_len = infer_state.prefix_slora_prefix_len
+        prefix_b_loc = infer_state.prefix_slora_b_loc
+        assert prefix_len > 0
+        assert prefix_b_loc is not None
+        o = torch.empty_like(q)
+        context_attention_fwd_with_prefix(
+            q.view(-1, layer_infer.tp_q_head_num_, layer_infer.head_dim_),
+            cache_k,
+            cache_v,
+            o.view(-1, layer_infer.tp_q_head_num_, layer_infer.head_dim_),
+            prefix_b_loc,
+            prefix_len,
+            infer_state.mem_manager.key_buffer[layer_id],
+            infer_state.mem_manager.value_buffer[layer_id],
+            infer_state.b_start_loc,
+            infer_state.b_seq_len,
+            infer_state.max_len_in_batch,
+        )
+        return o
 
 
     # @calculate_time(show=True, min_cost_ms=0)
@@ -481,4 +521,3 @@ class LoraUnorderedBatchInfer:
                             self.batch_req_bins, 3, self.infer_adapter.a_scaling)
             # delta_oA = None
         return o
-

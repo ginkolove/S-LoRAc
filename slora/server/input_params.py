@@ -37,6 +37,10 @@ class InputParams:
         profile,
         batch_num_adapters,
         enable_abort,
+        enable_prefix_slora,
+        prefix_slora_shared_prefix_len,
+        prefix_slora_gpu_prefix_num,
+        prefix_slora_cpu_prefix_num,
         # kernel,
         # # debug
         dummy,
@@ -65,6 +69,10 @@ class InputParams:
         self.profile = profile
         self.batch_num_adapters = batch_num_adapters
         self.enable_abort = enable_abort
+        self.enable_prefix_slora = enable_prefix_slora
+        self.prefix_slora_shared_prefix_len = prefix_slora_shared_prefix_len
+        self.prefix_slora_gpu_prefix_num = prefix_slora_gpu_prefix_num
+        self.prefix_slora_cpu_prefix_num = prefix_slora_cpu_prefix_num
         # self.kernel = kernel
 
         self.dummy = dummy

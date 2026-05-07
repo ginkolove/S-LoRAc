@@ -23,7 +23,12 @@ if __name__ == "__main__":
     parser.add_argument("--bmm", action="store_true")
     parser.add_argument("--batch-num-adapters", type=int, default=None)
     parser.add_argument("--enable-abort", action="store_true")
+    parser.add_argument("--enable-prefix-slora", action="store_true")
+    parser.add_argument("--prefix-slora-shared-prefix-len", type=int, default=0)
+    parser.add_argument("--prefix-slora-gpu-prefix-num", type=int, default=0)
+    parser.add_argument("--prefix-slora-cpu-prefix-num", type=int, default=None)
     parser.add_argument("--vllm-mem-ratio", type=float, default=0.95)
+    parser.add_argument("--print-only", action="store_true")
     args = parser.parse_args()
 
     base_model = BASE_MODEL[args.model_setting]
@@ -44,13 +49,19 @@ if __name__ == "__main__":
 
     if args.backend == "slora":
         cmd = f"python -m slora.server.api_server --max_total_token_num {args.num_token}"
-        cmd += f" --model {base_model}"
+        cmd += f" --model_dir {base_model}"
         cmd += f" --tokenizer_mode auto"
 
-        num_iter = args.num_adapter // len(adapter_dirs) + 1
-        for i in range(num_iter):
+        expanded_adapter_dirs = []
+        i = 0
+        while len(expanded_adapter_dirs) < args.num_adapter:
             for adapter_dir in adapter_dirs:
-                cmd += f" --lora {adapter_dir}-{i}"
+                if len(expanded_adapter_dirs) >= args.num_adapter:
+                    break
+                expanded_adapter_dirs.append(f"{adapter_dir}-{i}")
+            i += 1
+        for adapter_dir in expanded_adapter_dirs:
+            cmd += f" --lora-dirs {adapter_dir}"
 
         if args.dummy:
             cmd += " --dummy"
@@ -61,6 +72,12 @@ if __name__ == "__main__":
             cmd += " --enable-abort"
         if args.batch_num_adapters:
             cmd += f" --batch-num-adapters {args.batch_num_adapters}"
+        if args.enable_prefix_slora:
+            cmd += " --enable-prefix-slora"
+            cmd += f" --prefix-slora-shared-prefix-len {args.prefix_slora_shared_prefix_len}"
+            cmd += f" --prefix-slora-gpu-prefix-num {args.prefix_slora_gpu_prefix_num}"
+            if args.prefix_slora_cpu_prefix_num is not None:
+                cmd += f" --prefix-slora-cpu-prefix-num {args.prefix_slora_cpu_prefix_num}"
         if args.no_lora_compute:
             cmd += " --no-lora-compute"
         if args.prefetch:
@@ -103,5 +120,7 @@ if __name__ == "__main__":
 
         sys.exit(0)
 
-    # print(cmd)
+    if args.print_only:
+        print(cmd)
+        sys.exit(0)
     os.system(cmd)

@@ -26,9 +26,20 @@ from slora.server.router.cluster_req_queue import ClusterReqQueue
 from slora.server.router.vtc_req_queue import VTCReqQueue
 from slora.server.router.pets_req_queue import PETSReqQueue
 from slora.server.router.peft_req_queue import PEFTReqQueue
+from slora.server.router.prefix_slora_req_queue import PrefixSLoraReqQueue
 
 
 def get_scheduler(input_params, adapter_dirs):
+    if input_params.enable_prefix_slora:
+        return PrefixSLoraReqQueue(
+            input_params.max_total_token_num,
+            input_params.batch_max_tokens,
+            input_params.running_max_req_size,
+            adapter_dirs,
+            input_params.prefix_slora_shared_prefix_len,
+            input_params.prefix_slora_gpu_prefix_num,
+            input_params.prefix_slora_cpu_prefix_num,
+        )
     if input_params.scheduler == "vtc_fair":
         return VTCReqQueue(input_params.max_total_token_num, input_params.batch_max_tokens,
                            input_params.running_max_req_size, adapter_dirs, input_params.fair_weights)
@@ -391,6 +402,10 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
                                profile=args.profile,
                                batch_num_adapters=args.batch_num_adapters,
                                enable_abort=args.enable_abort,
+                               enable_prefix_slora=args.enable_prefix_slora,
+                               prefix_slora_shared_prefix_len=args.prefix_slora_shared_prefix_len,
+                               prefix_slora_gpu_prefix_num=args.prefix_slora_gpu_prefix_num,
+                               prefix_slora_cpu_prefix_num=args.prefix_slora_cpu_prefix_num,
                                # mem_ratio=args.mem_ratio,
                                dummy=args.dummy,
                                no_lora_swap=args.no_lora_swap,

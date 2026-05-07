@@ -23,6 +23,7 @@ from slora.models.peft.lora_single_batch_infer import LoraPEFTBatchInfer
 from slora.models.bmm.lora_bmm_infer import LoraBmmInfer
 from slora.server.router.model_infer.infer_adapter import InferAdapter
 from slora.server.router.model_infer.naive_infer_adapter import NaiveInferAdapter
+from slora.common.prefix_slora_cache import PrefixSLoraPrefixCache
 from slora.utils.infer_utils import set_random_seed
 from slora.utils.infer_utils import calculate_time, mark_start, mark_end
 from slora.utils.model_utils import get_model_config
@@ -77,6 +78,18 @@ class ModelRpcServer(rpyc.Service):
             print("#" * 16)
             print("load model error:", str(e), e, type(e))
             raise e
+
+        self.prefix_slora_cache = None
+        if input_params.enable_prefix_slora:
+            self.prefix_slora_cache = PrefixSLoraPrefixCache(
+                self.model.mem_manager,
+                adapter_dirs,
+                input_params.prefix_slora_shared_prefix_len,
+                input_params.prefix_slora_gpu_prefix_num,
+                input_params.prefix_slora_cpu_prefix_num,
+            )
+            if rank_id == 0:
+                print("Prefix-S-LoRA prefix cache:", self.prefix_slora_cache.state_dict())
 
         ''' init adapters '''
         # TODO support TP for adapters
@@ -147,6 +160,16 @@ class ModelRpcServer(rpyc.Service):
         else:
             assert False, "error dtype"
         batch_data = InferBatch.init_batch(batch_id, reqs, dtype, torch.cuda.current_device(), self.model.mem_manager, self.model.vocab_size)
+        if self.prefix_slora_cache is not None:
+            lora_dirs = [r["adapter_dir"] for r in reqs]
+            prefix_map = self.prefix_slora_cache.acquire_many(lora_dirs)
+            prefix_len = self.prefix_slora_cache.shared_prefix_len
+            prefix_b_loc = torch.empty((len(reqs), prefix_len), dtype=torch.long, device="cuda")
+            for i, lora_dir in enumerate(lora_dirs):
+                assert lora_dir in prefix_map, f"Prefix-S-LoRA prefix is not registered for {lora_dir}"
+                prefix_b_loc[i, :] = prefix_map[lora_dir]
+            batch_data.prefix_slora_prefix_len = prefix_len
+            batch_data.prefix_slora_b_loc = prefix_b_loc
         self.cache[batch_id] = batch_data
         return
     
@@ -166,6 +189,13 @@ class ModelRpcServer(rpyc.Service):
             batch_id, req_id_list = obtain(batch_id), obtain(req_id_list)
         # print("filter old size:", len(batch.reqs), "new size:", len(req_id_list))
         batch = self.cache.pop(batch_id)
+        if self.prefix_slora_cache is not None:
+            keep_ids = set(req_id_list)
+            removed_lora_dirs = [
+                r["adapter_dir"] for r in batch.requests
+                if r["request_id"] not in keep_ids
+            ]
+            self.prefix_slora_cache.release_many(removed_lora_dirs)
         filter_batch = batch.filter(req_id_list)
         del batch
         self.cache[batch_id] = filter_batch
@@ -184,9 +214,43 @@ class ModelRpcServer(rpyc.Service):
     # @calculate_time(show=True, min_cost_ms=10)
     def exposed_remove_batch(self, batch_id):
         batch = self.cache.pop(batch_id)
+        if self.prefix_slora_cache is not None:
+            self.prefix_slora_cache.release_many([r["adapter_dir"] for r in batch.requests])
         batch.free_self()
         del batch
         # torch.cuda.empty_cache()
+        return
+
+    @torch.no_grad()
+    def _expand_batch_for_prefix_slora(self, batch: InferBatch):
+        if batch.prefix_slora_expanded or batch.prefix_slora_prefix_len <= 0:
+            return
+        prefix_len = batch.prefix_slora_prefix_len
+        old_max_len = batch.nopad_max_len_in_batch
+        new_max_len = old_max_len + prefix_len
+        new_b_loc = torch.empty(
+            (len(batch), new_max_len + 12), dtype=torch.long, device="cuda"
+        )
+        new_b_seq_len = batch.nopad_b_seq_len + prefix_len
+        new_b_start_loc = torch.zeros(len(batch), dtype=torch.int32, device="cuda")
+
+        for i in range(len(batch)):
+            query_len = int(batch.nopad_b_seq_len[i].item())
+            old_start = old_max_len - query_len
+            new_start = new_max_len - (prefix_len + query_len)
+            new_b_loc[i, new_start:new_start + prefix_len] = batch.prefix_slora_b_loc[i]
+            new_b_loc[i, new_start + prefix_len:new_start + prefix_len + query_len] = (
+                batch.nopad_b_loc[i, old_start:old_start + query_len]
+            )
+
+        new_b_start_loc[1:] = torch.cumsum(new_b_seq_len, dim=0, dtype=torch.int32)[0:-1]
+        batch.nopad_b_loc = new_b_loc
+        batch.nopad_b_seq_len = new_b_seq_len
+        batch.nopad_b_start_loc = new_b_start_loc
+        batch.nopad_total_token_num = torch.sum(new_b_seq_len).item()
+        batch.nopad_max_len_in_batch = new_max_len
+        batch.prefix_slora_b_loc = None
+        batch.prefix_slora_expanded = True
         return
     
     def forward(self, batch_id, is_prefill):
@@ -203,6 +267,9 @@ class ModelRpcServer(rpyc.Service):
             "b_seq_len": batch.nopad_b_seq_len,
             "is_prefill": is_prefill
         }
+        if is_prefill and batch.prefix_slora_prefix_len > 0:
+            kwargs["prefix_slora_prefix_len"] = batch.prefix_slora_prefix_len
+            kwargs["prefix_slora_b_loc"] = batch.prefix_slora_b_loc
 
         # assert False, f"{kwargs}"
 
@@ -237,6 +304,8 @@ class ModelRpcServer(rpyc.Service):
 
         logits = engine.forward(**kwargs)
         next_token_ids, next_token_probs = sample(logits, batch)
+        if is_prefill and batch.prefix_slora_prefix_len > 0:
+            self._expand_batch_for_prefix_slora(batch)
         next_token_ids = next_token_ids.detach().cpu().numpy()
         next_token_logprobs = torch.log(next_token_probs).detach().cpu().numpy()
         output_dict = {}

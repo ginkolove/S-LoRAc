@@ -21,6 +21,8 @@ class HttpServerManager:
         max_req_total_len,
         trust_remote_code,
         dummy=False,
+        enable_prefix_slora=False,
+        prefix_slora_shared_prefix_len=0,
     ):
         context = zmq.asyncio.Context(2)
         self.send_to_router = context.socket(zmq.PUSH)
@@ -40,11 +42,17 @@ class HttpServerManager:
         self.total_token_num = total_token_num
         self.max_req_input_len = max_req_input_len
         self.max_req_total_len = max_req_total_len
+        self.enable_prefix_slora = enable_prefix_slora
+        self.prefix_slora_shared_prefix_len = prefix_slora_shared_prefix_len
 
     async def generate(self, adapter_dir, prompt, sampling_params, request_id):
 
         prompt_ids = self.tokenizer.encode(prompt)
-        prompt_tokens = len(prompt_ids)
+        query_tokens = len(prompt_ids)
+        prompt_tokens = query_tokens
+        if self.enable_prefix_slora:
+            prompt_tokens = self.prefix_slora_shared_prefix_len + query_tokens
+
         if prompt_tokens > self.max_req_input_len:
             raise ValueError(
                 f"the input prompt token len {prompt_tokens} is too long > {self.max_req_input_len}"

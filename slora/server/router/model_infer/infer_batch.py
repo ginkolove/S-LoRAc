@@ -4,7 +4,7 @@ import collections
 
 from slora.common.configs.config import setting
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List, Dict, Optional
 from slora.common.mem_manager import MemoryManager
 from slora.utils.infer_utils import mark_start, mark_end
 from slora.utils.infer_utils import calculate_time
@@ -57,6 +57,9 @@ class InferBatch:
     mem_manager: MemoryManager
 
     adapter_dirs: List[str]
+    prefix_slora_prefix_len: int = 0
+    prefix_slora_b_loc: Optional[torch.Tensor] = None
+    prefix_slora_expanded: bool = False
 
     @classmethod
     @torch.no_grad()
@@ -132,9 +135,18 @@ class InferBatch:
     def free_self(self):
         remove_index = []
         for idx in range(len(self)):
-            remove_index.append(self.nopad_b_loc[idx, (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1): (self.nopad_max_len_in_batch - 1)])
-        remove_index = torch.cat(remove_index, dim=-1)
-        self.mem_manager.free(remove_index)
+            if self.prefix_slora_expanded and self.prefix_slora_prefix_len > 0:
+                start = self.nopad_max_len_in_batch - self.nopad_b_seq_len[idx]
+                start += self.prefix_slora_prefix_len
+                end = self.nopad_max_len_in_batch
+            else:
+                start = (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1)
+                end = self.nopad_max_len_in_batch - 1
+            if start < end:
+                remove_index.append(self.nopad_b_loc[idx, start:end])
+        if remove_index:
+            remove_index = torch.cat(remove_index, dim=-1)
+            self.mem_manager.free(remove_index)
         return
         
     # @calculate_time(show=True, min_cost_ms=0)
@@ -166,11 +178,20 @@ class InferBatch:
         remove_index = []
         for idx in range(len(self)):
             if idx not in left_idx_set:
-                remove_index.append(self.nopad_b_loc[idx, (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1): (self.nopad_max_len_in_batch - 1)])
-        remove_index = torch.cat(remove_index, dim=-1)
+                if self.prefix_slora_expanded and self.prefix_slora_prefix_len > 0:
+                    start = self.nopad_max_len_in_batch - self.nopad_b_seq_len[idx]
+                    start += self.prefix_slora_prefix_len
+                    end = self.nopad_max_len_in_batch
+                else:
+                    start = (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1)
+                    end = self.nopad_max_len_in_batch - 1
+                if start < end:
+                    remove_index.append(self.nopad_b_loc[idx, start:end])
    
         # mark_start("filter free mem manager")
-        self.mem_manager.free(remove_index)
+        if remove_index:
+            remove_index = torch.cat(remove_index, dim=-1)
+            self.mem_manager.free(remove_index)
         # mark_end("filter free mem manager")
 
         # ''' sort according to adapters '''
@@ -222,6 +243,9 @@ class InferBatch:
             sampling_param_list=[self.sampling_param_list[_i] for _i in indices],
             mem_manager=self.mem_manager,
             adapter_dirs=adapter_dirs,
+            prefix_slora_prefix_len=self.prefix_slora_prefix_len,
+            prefix_slora_b_loc=self.prefix_slora_b_loc[indices] if self.prefix_slora_b_loc is not None else None,
+            prefix_slora_expanded=self.prefix_slora_expanded,
         )
 
 
@@ -290,6 +314,11 @@ class InferBatch:
             sampling_param_list=sampling_param_list,
             mem_manager=batches[0].mem_manager,
             adapter_dirs=adapter_dirs,
+            prefix_slora_prefix_len=max(
+                batch1.prefix_slora_prefix_len, batch2.prefix_slora_prefix_len
+            ),
+            prefix_slora_b_loc=None,
+            prefix_slora_expanded=batch1.prefix_slora_expanded or batch2.prefix_slora_expanded,
         )
 
     def __len__(self):
