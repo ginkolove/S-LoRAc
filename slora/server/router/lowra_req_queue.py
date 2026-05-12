@@ -1,12 +1,12 @@
 import uuid
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 
 from ..io_struct import Batch
 from .req_queue import ReqQueue
 
 
 class LowRAPrefixAwareReqQueue(ReqQueue):
-    """FIFO-window LowRA admission with prefix-aware eviction planning."""
+    """Naive cache-aware LoRA clustering for LowRA admission."""
 
     def __init__(
         self,
@@ -32,20 +32,12 @@ class LowRAPrefixAwareReqQueue(ReqQueue):
             return
         self.prefix_cache_state = state
 
-    def _front_non_aborted(self, limit, start=0):
-        out = []
-        seen = 0
-        for req in self.waiting_req_list:
-            if req.aborted:
-                continue
-            if seen < start:
-                seen += 1
-                continue
-            if len(out) >= limit:
-                break
-            out.append(req)
-            seen += 1
-        return out
+    def _non_aborted_waiting_with_order(self):
+        return [
+            (idx, req)
+            for idx, req in enumerate(self.waiting_req_list)
+            if not req.aborted
+        ]
 
     def _unique_loras(self, reqs):
         return {req.adapter_dir for req in reqs if req.adapter_dir is not None}
@@ -104,35 +96,36 @@ class LowRAPrefixAwareReqQueue(ReqQueue):
             + self._resident_prefix_need(candidate, evict_prefixes)
         )
 
-    def _candidate_tokens(self, candidate):
-        return sum(self._query_len(req) for req in candidate)
-
     def _fits(self, current_batch, candidate, lora_ranks, evict_prefixes=()):
         if not candidate:
             return False
         if current_batch is not None and len(current_batch.reqs) + len(candidate) > self.running_max_req_size:
             return False
-        if self._candidate_tokens(candidate) > self.batch_max_tokens:
-            return False
         return self._total_need(current_batch, candidate, lora_ranks, evict_prefixes) <= self.max_total_tokens
 
-    def _sorted_evictable_prefixes(self, W0, W1, current_batch):
+    def _sorted_evictable_prefixes_for_candidate(self, candidate, current_batch):
         running_loras = self._unique_loras(current_batch.reqs) if current_batch is not None else set()
-        pinned = running_loras | self._unique_loras(W0)
+        pinned = running_loras | self._unique_loras(candidate)
         inactive = self.prefix_cache_state.get("inactive_lora_dirs", set())
         heat = self.prefix_cache_state.get("heat_by_lora", {})
-        w1_reuse = Counter(req.adapter_dir for req in W1 if req.adapter_dir is not None)
         evictable = [lora_dir for lora_dir in inactive if lora_dir not in pinned]
-        evictable.sort(key=lambda lora_dir: (w1_reuse[lora_dir], heat.get(lora_dir, 0)))
+        evictable.sort(key=lambda lora_dir: heat.get(lora_dir, 0))
         return evictable
 
-    def _eviction_plan_for_W0(self, W0, W1, current_batch, lora_ranks):
-        evictable = self._sorted_evictable_prefixes(W0, W1, current_batch)
+    def _eviction_plan_for_candidate(self, candidate, current_batch, lora_ranks, base_plan=()):
+        running_loras = self._unique_loras(current_batch.reqs) if current_batch is not None else set()
+        pinned = running_loras | self._unique_loras(candidate)
+        plan = [lora_dir for lora_dir in (base_plan or []) if lora_dir not in pinned]
+        if self._fits(current_batch, candidate, lora_ranks, evict_prefixes=plan):
+            return plan
 
-        plan = []
-        for lora_dir in evictable:
+        planned = set(plan)
+        for lora_dir in self._sorted_evictable_prefixes_for_candidate(candidate, current_batch):
+            if lora_dir in planned:
+                continue
             plan.append(lora_dir)
-            if self._fits(current_batch, W0, lora_ranks, evict_prefixes=plan):
+            planned.add(lora_dir)
+            if self._fits(current_batch, candidate, lora_ranks, evict_prefixes=plan):
                 return plan
         return None
 
@@ -149,52 +142,71 @@ class LowRAPrefixAwareReqQueue(ReqQueue):
         ]
         return self._attach_lowra_plan(Batch(uuid.uuid4().hex, reqs), evict_prefixes)
 
-    def _groups_by_lora(self, reqs):
+    def _cluster_waiting_groups(self):
         groups = OrderedDict()
-        for req in reqs:
-            groups.setdefault(req.adapter_dir, []).append(req)
-        return list(groups.items())
+        for idx, req in self._non_aborted_waiting_with_order():
+            if req.adapter_dir not in groups:
+                groups[req.adapter_dir] = {
+                    "lora_dir": req.adapter_dir,
+                    "reqs": [],
+                    "first_order": idx,
+                }
+            groups[req.adapter_dir]["reqs"].append(req)
 
-    def _fallback_partial_W0(self, W0, current_batch, lora_ranks, evict_prefixes=()):
         cached = self.prefix_cache_state.get("cached_lora_dirs", set())
-        groups = self._groups_by_lora(W0)
-        resident_groups = [(lora_dir, reqs) for lora_dir, reqs in groups if lora_dir in cached]
-        missing_groups = [(lora_dir, reqs) for lora_dir, reqs in groups if lora_dir not in cached]
-
-        selected = []
-        for _, group_reqs in resident_groups + missing_groups:
-            for req in group_reqs:
-                trial = selected + [req]
-                if self._fits(current_batch, trial, lora_ranks, evict_prefixes=evict_prefixes):
-                    selected.append(req)
-                else:
-                    break
-        if not selected:
-            return None
-        return self._make_batch(selected, evict_prefixes)
+        clustered = list(groups.values())
+        clustered.sort(key=lambda group: (
+            group["lora_dir"] not in cached,
+            -len(group["reqs"]),
+            group["first_order"],
+        ))
+        return clustered
 
     def generate_new_batch(self, current_batch: Batch, lora_ranks: dict[str, int]):
         if current_batch is not None and len(current_batch.reqs) >= self.running_max_req_size:
             return None
 
-        W0 = self._front_non_aborted(self.window_size)
-        if not W0:
+        clustered_groups = self._cluster_waiting_groups()
+        if not clustered_groups:
             self.waiting_req_list = [req for req in self.waiting_req_list if not req.aborted]
             return None
-        W1 = self._front_non_aborted(self.window_size, start=len(W0))
 
-        if self._fits(current_batch, W0, lora_ranks):
-            return self._make_batch(W0)
+        selected = []
+        evict_plan = []
+        for group in clustered_groups:
+            group_reqs = group["reqs"]
+            full_trial = selected + group_reqs
+            full_plan = self._eviction_plan_for_candidate(
+                full_trial, current_batch, lora_ranks, evict_plan
+            )
+            if full_plan is not None:
+                selected = full_trial
+                evict_plan = full_plan
+                continue
 
-        evict_plan = self._eviction_plan_for_W0(W0, W1, current_batch, lora_ranks)
-        if evict_plan is not None:
-            return self._make_batch(W0, evict_plan)
+            for req in group_reqs:
+                trial = selected + [req]
+                partial_plan = self._eviction_plan_for_candidate(
+                    trial, current_batch, lora_ranks, evict_plan
+                )
+                if partial_plan is None:
+                    break
+                selected = trial
+                evict_plan = partial_plan
 
-        all_evictable = self._sorted_evictable_prefixes(W0, W1, current_batch)
-        return self._fallback_partial_W0(W0, current_batch, lora_ranks, all_evictable)
+        if not selected:
+            return None
+        return self._make_batch(selected, evict_plan)
 
     def next_batch(self):
-        W0 = self._front_non_aborted(self.window_size)
-        if W0:
-            return Batch(uuid.uuid4().hex, W0)
+        selected = []
+        for group in self._cluster_waiting_groups():
+            if len(selected) >= self.running_max_req_size:
+                break
+            for req in group["reqs"]:
+                if len(selected) >= self.running_max_req_size:
+                    break
+                selected.append(req)
+        if selected:
+            return Batch(uuid.uuid4().hex, selected)
         return None

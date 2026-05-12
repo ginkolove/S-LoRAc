@@ -71,6 +71,18 @@ def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse
     return JSONResponse({"message": message}, status_code=status_code.value)
 
 
+def _json_safe(obj):
+    if isinstance(obj, set):
+        return sorted(obj)
+    if isinstance(obj, tuple):
+        return [_json_safe(item) for item in obj]
+    if isinstance(obj, list):
+        return [_json_safe(item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _json_safe(value) for key, value in obj.items()}
+    return obj
+
+
 def _pop_lowra_lengths(request_dict, sample_params_dict):
     lengths = request_dict.pop("lowra_lengths", None)
     if lengths is None:
@@ -110,6 +122,7 @@ async def lowra_reset_runtime() -> Response:
 
     request_id = f"lowra-reset-{uuid.uuid4().hex}"
     result = await httpserver_manager.reset_lowra_runtime(request_id)
+    result = _json_safe(result)
     status_code = 200 if result.get("ok") else 409
     return JSONResponse(result, status_code=status_code)
 
