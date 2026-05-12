@@ -198,8 +198,10 @@ def summarize_results(
     requests: List[LowRARequest],
     results: List[RequestResult],
     benchmark_time: float,
+    benchmark_start_time: float,
     warmup: float,
     cooldown: float,
+    steady_end: Optional[float],
 ) -> dict:
     successful = [result for result in results if result.success]
     failed = [result for result in results if not result.success]
@@ -209,9 +211,28 @@ def summarize_results(
         if result.req_time >= warmup and result.req_time <= measure_end
     ]
     measure_time = max(1e-9, measure_end - warmup)
+    drain_measured = [
+        result for result in successful
+        if result.req_time >= warmup
+    ]
+    if drain_measured:
+        drain_end = max(result.end_time - benchmark_start_time for result in drain_measured)
+        drain_time = max(1e-9, drain_end - warmup)
+    else:
+        drain_end = warmup
+        drain_time = 0.0
 
-    latencies = [result.latency for result in measured if result.latency is not None]
-    ttfts = [result.ttft for result in measured if result.ttft is not None]
+    if steady_end is None:
+        steady_end = measure_end
+    steady_end = float(steady_end)
+    steady = [
+        result for result in successful
+        if warmup <= result.end_time - benchmark_start_time <= steady_end
+    ]
+    steady_time = max(0.0, steady_end - warmup)
+
+    latencies = [result.latency for result in successful if result.latency is not None]
+    ttfts = [result.ttft for result in successful if result.ttft is not None]
     output_len = requests[0].output_len if requests else 0
     query_len = requests[0].query_len if requests else 0
     prefix_len = requests[0].prefix_len if requests else 0
@@ -225,15 +246,45 @@ def summarize_results(
         "completed_requests": len(successful),
         "failed_requests": len(failed),
         "measured_requests": len(measured),
+        "drain_measured_requests": len(drain_measured),
+        "steady_requests": len(steady),
+        "latency_ttft_requests": len(successful),
         "benchmark_time": benchmark_time,
         "measure_start": warmup,
         "measure_end": measure_end,
         "measure_time": measure_time,
+        "steady_start": warmup,
+        "steady_end": steady_end,
+        "steady_time": steady_time,
+        "steady_scope": "completion_time_in_[warmup,steady_end]",
+        "drain_end": drain_end,
+        "drain_time": drain_time,
         "completed_req_per_s_total": len(successful) / benchmark_time if benchmark_time > 0 else 0,
         "completed_req_per_s_measured": len(measured) / measure_time,
+        "completed_req_per_s_measured_with_drain": (
+            len(drain_measured) / drain_time if drain_time > 0 else 0
+        ),
+        "completed_req_per_s_steady": len(steady) / steady_time if steady_time > 0 else 0,
         "output_tokens_per_s_measured": len(measured) * output_len / measure_time,
         "query_tokens_per_s_measured": len(measured) * query_len / measure_time,
         "logical_tokens_per_s_measured": len(measured) * (prefix_len + query_len + output_len) / measure_time,
+        "output_tokens_per_s_measured_with_drain": (
+            len(drain_measured) * output_len / drain_time if drain_time > 0 else 0
+        ),
+        "query_tokens_per_s_measured_with_drain": (
+            len(drain_measured) * query_len / drain_time if drain_time > 0 else 0
+        ),
+        "logical_tokens_per_s_measured_with_drain": (
+            len(drain_measured) * (prefix_len + query_len + output_len) / drain_time
+            if drain_time > 0 else 0
+        ),
+        "output_tokens_per_s_steady": len(steady) * output_len / steady_time if steady_time > 0 else 0,
+        "query_tokens_per_s_steady": len(steady) * query_len / steady_time if steady_time > 0 else 0,
+        "logical_tokens_per_s_steady": (
+            len(steady) * (prefix_len + query_len + output_len) / steady_time
+            if steady_time > 0 else 0
+        ),
+        "latency_ttft_scope": "all_successful_requests",
         "latency_mean": float(np.mean(latencies)) if latencies else None,
         "latency_p50": percentile(latencies, 50),
         "latency_p95": percentile(latencies, 95),
@@ -269,6 +320,9 @@ def parse_args():
     parser.add_argument("--duration", type=float, default=300.0)
     parser.add_argument("--warmup", type=float, default=60.0)
     parser.add_argument("--cooldown", type=float, default=60.0)
+    parser.add_argument("--steady-end", type=float, default=None,
+                        help="End time, relative to benchmark start, for steady throughput. "
+                             "Defaults to duration - cooldown.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--input-len", type=int, default=3840)
     parser.add_argument("--output-len", type=int, default=128)
@@ -299,6 +353,13 @@ def main():
 
     adapter_bases = args.adapter_base or ["dummy-lora-7b-rank-16"]
     adapter_dirs = expand_adapter_dirs(adapter_bases, args.num_adapters)
+    steady_end = args.steady_end
+    if steady_end is None:
+        steady_end = max(0.0, args.duration - args.cooldown)
+    if steady_end <= args.warmup:
+        raise ValueError(
+            f"steady_end={steady_end} must be larger than warmup={args.warmup}"
+        )
     requests = make_requests(
         adapter_dirs=adapter_dirs,
         prefix_len=prefix_len,
@@ -332,6 +393,7 @@ def main():
         "duration": args.duration,
         "warmup": args.warmup,
         "cooldown": args.cooldown,
+        "steady_end": steady_end,
         "seed": args.seed,
         "adapter_dirs": adapter_dirs,
         "prompt_mode": "token_ids",
@@ -345,13 +407,18 @@ def main():
     start = time.time()
     results = asyncio.run(run_benchmark(args.server, requests, debug=args.debug))
     benchmark_time = time.time() - start
+    effective_steady_end = min(steady_end, benchmark_time)
     summary = summarize_results(
         requests,
         results,
         benchmark_time=benchmark_time,
+        benchmark_start_time=start,
         warmup=args.warmup,
         cooldown=args.cooldown,
+        steady_end=effective_steady_end,
     )
+    summary["steady_end_requested"] = steady_end
+    summary["steady_end_clamped_to_benchmark_time"] = effective_steady_end < steady_end
 
     record = {"config": config, "result": summary}
     print(json.dumps(record, indent=2))
