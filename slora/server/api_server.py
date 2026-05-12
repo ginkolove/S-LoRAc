@@ -325,7 +325,7 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
 
-    parser.add_argument("--model_dir", type=str, default=None,
+    parser.add_argument("--model_dir", "--model-dir", "--model", dest="model_dir", type=str, default=None,
                         help="the model weight dir path, the app will load config, weights and tokenizer from this dir")
     parser.add_argument("--tokenizer_mode", type=str, default="slow",
                         help="""tokenizer load mode, can be slow or auto, slow mode load fast but run slow, slow mode is good for debug and test, 
@@ -356,8 +356,12 @@ def main():
                         help="log stats interval in second.")
 
     ''' slora arguments '''
-    parser.add_argument("--lora-dirs", type=str, default=[], action="append",
+    parser.add_argument("--lora-dirs", "--lora", dest="lora_dirs", type=str, default=[], action="append",
                         help="the adapter weight dirs associate with base model dir")
+    parser.add_argument("--adapter-base", dest="adapter_bases", type=str, default=[], action="append",
+                        help="base adapter path/name expanded as '<adapter-base>-i'")
+    parser.add_argument("--adapter-num", "--adapter_num", dest="adapter_num", type=int, default=None,
+                        help="number of adapters to expand from --adapter-base")
     parser.add_argument("--fair-weights", type=int, default=[], action="append")
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--swap", action="store_true")
@@ -380,6 +384,20 @@ def main():
     ''' end of slora arguments '''
 
     args = parser.parse_args()
+
+    if args.adapter_bases:
+        if args.adapter_num is None:
+            parser.error("--adapter-num must be set when --adapter-base is used")
+        expanded_lora_dirs = []
+        num_iter = args.adapter_num // len(args.adapter_bases) + 1
+        for i in range(num_iter):
+            for adapter_base in args.adapter_bases:
+                expanded_lora_dirs.append(f"{adapter_base}-{i}")
+                if len(expanded_lora_dirs) == args.adapter_num:
+                    break
+            if len(expanded_lora_dirs) == args.adapter_num:
+                break
+        args.lora_dirs.extend(expanded_lora_dirs)
 
     assert args.max_req_input_len < args.max_req_total_len
     setting["max_req_total_len"] = args.max_req_total_len

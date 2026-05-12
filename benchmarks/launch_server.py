@@ -12,9 +12,15 @@ if __name__ == "__main__":
     parser.add_argument("--backend", type=str, default="slora",
                         choices=["slora", "vllm", "lightllm", "vllm-packed"])
     parser.add_argument("--model-setting", type=str, default="S1")
+    parser.add_argument("--model-dir", type=str, default=None)
+    parser.add_argument("--adapter-base", action="append", default=None)
 
     parser.add_argument("--num-adapter", type=int)
     parser.add_argument("--num-token", type=int)
+    parser.add_argument("--max-req-input-len", type=int, default=None)
+    parser.add_argument("--max-req-total-len", type=int, default=None)
+    parser.add_argument("--batch-max-tokens", type=int, default=None)
+    parser.add_argument("--running-max-req-size", type=int, default=None)
 
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--no-lora-compute", action="store_true")
@@ -24,10 +30,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch-num-adapters", type=int, default=None)
     parser.add_argument("--enable-abort", action="store_true")
     parser.add_argument("--vllm-mem-ratio", type=float, default=0.95)
+    parser.add_argument("--print-only", action="store_true")
     args = parser.parse_args()
 
-    base_model = BASE_MODEL[args.model_setting]
-    adapter_dirs = LORA_DIR[args.model_setting]
+    base_model = args.model_dir or BASE_MODEL[args.model_setting]
+    adapter_dirs = args.adapter_base or LORA_DIR[args.model_setting]
 
     if args.device == "a10g":
         if args.num_adapter is None: args.num_adapter = 200
@@ -44,16 +51,23 @@ if __name__ == "__main__":
 
     if args.backend == "slora":
         cmd = f"python -m slora.server.api_server --max_total_token_num {args.num_token}"
-        cmd += f" --model {base_model}"
+        cmd += f" --model_dir {base_model}"
         cmd += f" --tokenizer_mode auto"
 
-        num_iter = args.num_adapter // len(adapter_dirs) + 1
-        for i in range(num_iter):
-            for adapter_dir in adapter_dirs:
-                cmd += f" --lora {adapter_dir}-{i}"
+        for adapter_dir in adapter_dirs:
+            cmd += f" --adapter-base {adapter_dir}"
+        cmd += f" --adapter-num {args.num_adapter}"
 
         if args.dummy:
             cmd += " --dummy"
+        if args.max_req_total_len is not None:
+            cmd += f" --max_req_total_len {args.max_req_total_len}"
+        if args.max_req_input_len is not None:
+            cmd += f" --max_req_input_len {args.max_req_input_len}"
+        if args.batch_max_tokens is not None:
+            cmd += f" --batch_max_tokens {args.batch_max_tokens}"
+        if args.running_max_req_size is not None:
+            cmd += f" --running_max_req_size {args.running_max_req_size}"
         cmd += " --swap"
         # cmd += " --scheduler pets"
         # cmd += " --profile"
@@ -103,5 +117,8 @@ if __name__ == "__main__":
 
         sys.exit(0)
 
-    # print(cmd)
+    if args.print_only:
+        print(cmd)
+        sys.exit(0)
+
     os.system(cmd)

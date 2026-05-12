@@ -43,7 +43,10 @@ class HttpServerManager:
 
     async def generate(self, adapter_dir, prompt, sampling_params, request_id):
 
-        prompt_ids = self.tokenizer.encode(prompt)
+        if isinstance(prompt, list):
+            prompt_ids = [int(token_id) for token_id in prompt]
+        else:
+            prompt_ids = self.tokenizer.encode(prompt)
         prompt_tokens = len(prompt_ids)
         if prompt_tokens > self.max_req_input_len:
             raise ValueError(
