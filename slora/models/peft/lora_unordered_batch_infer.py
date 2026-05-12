@@ -126,22 +126,6 @@ class LoraUnorderedBatchInfer:
                 (infer_state.total_token_num, self.base_model.tp_k_head_num_, self.base_model.head_dim_),
                 dtype=torch.float16, device="cuda")
         init_bloc(b_loc, b_seq_len, max_len_in_batch, infer_state.prefill_mem_index)
-        if prefix_slora_prefix_len > 0:
-            full_max_len = prefix_slora_prefix_len + max_len_in_batch
-            full_b_loc = torch.empty(
-                (batch_size, full_max_len), dtype=b_loc.dtype, device=b_loc.device
-            )
-            for i, cur_q_len in enumerate(b_seq_len_numpy):
-                q_start = max_len_in_batch - int(cur_q_len)
-                full_b_loc[i, 0:prefix_slora_prefix_len] = prefix_slora_b_loc[
-                    i, 0:prefix_slora_prefix_len
-                ]
-                full_b_loc[
-                    i,
-                    prefix_slora_prefix_len:prefix_slora_prefix_len + int(cur_q_len),
-                ] = b_loc[i, q_start:q_start + int(cur_q_len)]
-            infer_state.prefix_slora_full_b_loc = full_b_loc
-            infer_state.prefix_slora_full_max_len = full_max_len
         
         predict_logics = self._context_forward(input_ids, infer_state, no_lora_compute)
         return predict_logics
@@ -269,14 +253,17 @@ class LoraUnorderedBatchInfer:
         o = torch.empty_like(q)
         context_attention_fwd_with_prefix(
             q.view(-1, layer_infer.tp_q_head_num_, layer_infer.head_dim_),
+            cache_k.view(-1, layer_infer.tp_k_head_num_, layer_infer.head_dim_),
+            cache_v.view(-1, layer_infer.tp_v_head_num_, layer_infer.head_dim_),
             o.view(-1, layer_infer.tp_q_head_num_, layer_infer.head_dim_),
-            infer_state.prefix_slora_full_b_loc,
-            prefix_len,
-            infer_state.mem_manager.key_buffer[layer_id],
-            infer_state.mem_manager.value_buffer[layer_id],
             infer_state.b_start_loc,
             infer_state.b_seq_len,
             infer_state.max_len_in_batch,
+            prefix_b_loc,
+            prefix_len,
+            infer_state.mem_manager.key_buffer[layer_id],
+            infer_state.mem_manager.value_buffer[layer_id],
+            context_attention_fwd,
         )
         return o
 
