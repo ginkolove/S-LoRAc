@@ -138,7 +138,7 @@ class InferBatch:
             if self.prefix_slora_expanded and self.prefix_slora_prefix_len > 0:
                 start = self.nopad_max_len_in_batch - self.nopad_b_seq_len[idx]
                 start += self.prefix_slora_prefix_len
-                end = self.nopad_max_len_in_batch
+                end = self.nopad_max_len_in_batch - 1
             else:
                 start = (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1)
                 end = self.nopad_max_len_in_batch - 1
@@ -181,7 +181,7 @@ class InferBatch:
                 if self.prefix_slora_expanded and self.prefix_slora_prefix_len > 0:
                     start = self.nopad_max_len_in_batch - self.nopad_b_seq_len[idx]
                     start += self.prefix_slora_prefix_len
-                    end = self.nopad_max_len_in_batch
+                    end = self.nopad_max_len_in_batch - 1
                 else:
                     start = (self.nopad_max_len_in_batch - 1) - (self.nopad_b_seq_len[idx] - 1)
                     end = self.nopad_max_len_in_batch - 1

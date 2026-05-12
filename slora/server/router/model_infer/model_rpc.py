@@ -138,6 +138,12 @@ class ModelRpcServer(rpyc.Service):
             #         total_num += 1 if adapter.is_on_gpu() else 0
             # print(f"total {total_num} on gpu")
 
+    @torch.no_grad()
+    def exposed_prefix_slora_prepare_batch(self, adapter_dirs, extra_token_num=0):
+        if self.prefix_slora_cache is None:
+            return []
+        return self.prefix_slora_cache.prepare_many(adapter_dirs, extra_token_num)
+
 
     @torch.no_grad()
     def exposed_offload_adapters(self, reserve_dirs=None, prefetch=False):
@@ -461,6 +467,7 @@ class ModelRpcClient:
                 return _func
             self._init_model = async_wrap(self.model.init_model)
             self._load_adapters = rpyc.async_(self.model.load_adapters)
+            self._prefix_slora_prepare_batch = async_wrap(self.model.prefix_slora_prepare_batch)
             self._offload_adapters = rpyc.async_(self.model.offload_adapters)
             self._unmerge_adapter = rpyc.async_(self.model.unmerge_adapter)
             self._merge_adapter = rpyc.async_(self.model.merge_adapter)
@@ -474,6 +481,7 @@ class ModelRpcClient:
         else:
             self._init_model = self.model.exposed_init_model
             self._load_adapters = self.model.exposed_load_adapters
+            self._prefix_slora_prepare_batch = self.model.exposed_prefix_slora_prepare_batch
             self._offload_adapters = self.model.exposed_offload_adapters
             self._merge_adapter = self.model.exposed_merge_adapter
             self._unmerge_adapter = self.model.exposed_unmerge_adapter
@@ -501,6 +509,14 @@ class ModelRpcClient:
 
     async def load_adapters(self, reqs, prefetch=False):
         self._load_adapters(reqs, prefetch=prefetch)
+
+
+    async def prefix_slora_prepare_batch(self, adapter_dirs, extra_token_num=0):
+        ans = self._prefix_slora_prepare_batch(adapter_dirs, extra_token_num)
+        if self.use_rpc:
+            return await ans
+        else:
+            return ans
 
 
     async def offload_adapters(self, reserved_reqs=None, prefetch=False):

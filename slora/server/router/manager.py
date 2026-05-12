@@ -199,6 +199,9 @@ class RouterManager:
                 self.stats_tool.count_prompt_tokens(new_batch)
                 self.running_batch = new_batch
 
+                if self.input_params.enable_prefix_slora:
+                    await self._prefix_slora_prepare_batch(new_batch)
+
                 if not self.input_params.no_lora:
                     # load adapters
                     ret = []
@@ -247,6 +250,9 @@ class RouterManager:
             if new_mini_batch is not None:
                 self.stats_tool.count_prompt_tokens(new_mini_batch)
 
+                if self.input_params.enable_prefix_slora:
+                    await self._prefix_slora_prepare_batch(new_mini_batch)
+
                 if not self.input_params.no_lora:
                     ret = []
                     for tp_rank in range(self.world_size):
@@ -270,6 +276,23 @@ class RouterManager:
         await asyncio.gather(*rets)
         return
 
+    async def _prefix_slora_prepare_batch(self, batch: Batch):
+        adapter_dirs = list(batch.adapter_dirs)
+        # Prefill will allocate query KV after adapter loading and prefix swap-in.
+        # Inactive prefix KVs may still occupy unified paging, so evict enough of
+        # them before loading adapters to cover all immediate allocations.
+        extra_token_num = batch.input_tokens()
+        if not self.input_params.no_lora:
+            for adapter_dir in set(adapter_dirs):
+                if adapter_dir is not None:
+                    extra_token_num += self.lora_ranks[adapter_dir] * 4
+        rets = [
+            self.model_rpcs[tp_rank].prefix_slora_prepare_batch(adapter_dirs, extra_token_num)
+            for tp_rank in range(self.world_size)
+        ]
+        await asyncio.gather(*rets)
+        return
+
     async def _prefill_batch(self, batch, minibatch=True):
         await self._init_batch(batch)
         rets = [self.model_rpcs[tp_rank].prefill_batch(batch.batch_id) for tp_rank in range(self.world_size)]
@@ -286,6 +309,8 @@ class RouterManager:
 
     async def _decode_batch(self, batch:Batch):
         self.req_queue.update_counter(batch)
+        if self.input_params.enable_prefix_slora:
+            await self._prefix_slora_prepare_decode(batch)
         rets = [self.model_rpcs[tp_rank].decode_batch(batch.batch_id) for tp_rank in range(self.world_size)]
         ans = await asyncio.gather(*rets)
         if self.world_size != 1:
@@ -296,6 +321,15 @@ class RouterManager:
         has_new_finished_req = batch.mark_finished_req(self.eos_id)
         self._send_to_detokenization_proc(batch, req_to_out_token_id)
         await self._handle_finish_req(batch, has_new_finished_req)
+        return
+
+    async def _prefix_slora_prepare_decode(self, batch: Batch):
+        adapter_dirs = list(batch.adapter_dirs)
+        rets = [
+            self.model_rpcs[tp_rank].prefix_slora_prepare_batch(adapter_dirs, len(batch.reqs))
+            for tp_rank in range(self.world_size)
+        ]
+        await asyncio.gather(*rets)
         return
 
     async def _filter_batch(self, batch: Batch):

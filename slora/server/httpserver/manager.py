@@ -47,7 +47,10 @@ class HttpServerManager:
 
     async def generate(self, adapter_dir, prompt, sampling_params, request_id):
 
-        prompt_ids = self.tokenizer.encode(prompt)
+        if isinstance(prompt, list):
+            prompt_ids = [int(token_id) for token_id in prompt]
+        else:
+            prompt_ids = self.tokenizer.encode(prompt)
         query_tokens = len(prompt_ids)
         prompt_tokens = query_tokens
         if self.enable_prefix_slora:

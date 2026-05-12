@@ -12,9 +12,15 @@ if __name__ == "__main__":
     parser.add_argument("--backend", type=str, default="slora",
                         choices=["slora", "vllm", "lightllm", "vllm-packed"])
     parser.add_argument("--model-setting", type=str, default="S1")
+    parser.add_argument("--model-dir", type=str, default=None)
+    parser.add_argument("--adapter-base", type=str, default=None)
 
     parser.add_argument("--num-adapter", type=int)
     parser.add_argument("--num-token", type=int)
+    parser.add_argument("--max-req-input-len", type=int, default=None)
+    parser.add_argument("--max-req-total-len", type=int, default=None)
+    parser.add_argument("--batch-max-tokens", type=int, default=None)
+    parser.add_argument("--running-max-req-size", type=int, default=None)
 
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--no-lora-compute", action="store_true")
@@ -25,14 +31,15 @@ if __name__ == "__main__":
     parser.add_argument("--enable-abort", action="store_true")
     parser.add_argument("--enable-prefix-slora", action="store_true")
     parser.add_argument("--prefix-slora-shared-prefix-len", type=int, default=0)
+    parser.add_argument("--prefix-slora-shared-prefix-ratio", type=float, default=None)
     parser.add_argument("--prefix-slora-gpu-prefix-num", type=int, default=0)
     parser.add_argument("--prefix-slora-cpu-prefix-num", type=int, default=None)
     parser.add_argument("--vllm-mem-ratio", type=float, default=0.95)
     parser.add_argument("--print-only", action="store_true")
     args = parser.parse_args()
 
-    base_model = BASE_MODEL[args.model_setting]
-    adapter_dirs = LORA_DIR[args.model_setting]
+    base_model = args.model_dir or BASE_MODEL[args.model_setting]
+    adapter_dirs = [args.adapter_base] if args.adapter_base else LORA_DIR[args.model_setting]
 
     if args.device == "a10g":
         if args.num_adapter is None: args.num_adapter = 200
@@ -51,6 +58,14 @@ if __name__ == "__main__":
         cmd = f"python -m slora.server.api_server --max_total_token_num {args.num_token}"
         cmd += f" --model_dir {base_model}"
         cmd += f" --tokenizer_mode auto"
+        if args.max_req_input_len is not None:
+            cmd += f" --max_req_input_len {args.max_req_input_len}"
+        if args.max_req_total_len is not None:
+            cmd += f" --max_req_total_len {args.max_req_total_len}"
+        if args.batch_max_tokens is not None:
+            cmd += f" --batch_max_tokens {args.batch_max_tokens}"
+        if args.running_max_req_size is not None:
+            cmd += f" --running_max_req_size {args.running_max_req_size}"
 
         expanded_adapter_dirs = []
         i = 0
@@ -74,10 +89,10 @@ if __name__ == "__main__":
             cmd += f" --batch-num-adapters {args.batch_num_adapters}"
         if args.enable_prefix_slora:
             cmd += " --enable-prefix-slora"
-            cmd += f" --prefix-slora-shared-prefix-len {args.prefix_slora_shared_prefix_len}"
-            cmd += f" --prefix-slora-gpu-prefix-num {args.prefix_slora_gpu_prefix_num}"
-            if args.prefix_slora_cpu_prefix_num is not None:
-                cmd += f" --prefix-slora-cpu-prefix-num {args.prefix_slora_cpu_prefix_num}"
+            if args.prefix_slora_shared_prefix_len > 0:
+                cmd += f" --prefix-slora-shared-prefix-len {args.prefix_slora_shared_prefix_len}"
+            if args.prefix_slora_shared_prefix_ratio is not None:
+                cmd += f" --prefix-slora-shared-prefix-ratio {args.prefix_slora_shared_prefix_ratio}"
         if args.no_lora_compute:
             cmd += " --no-lora-compute"
         if args.prefetch:

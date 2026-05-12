@@ -17,10 +17,8 @@ class PrefixSLoraReqQueue:
         cpu_prefix_num: int,
     ) -> None:
         self.shared_prefix_len = shared_prefix_len
-        self.gpu_lora_dirs = set(adapter_dirs[:gpu_prefix_num])
-        self.cpu_lora_dirs = set(adapter_dirs[gpu_prefix_num:gpu_prefix_num + cpu_prefix_num])
-        self.hot_reserved_tokens = gpu_prefix_num * shared_prefix_len
-        self.max_total_tokens = max_total_tokens - self.hot_reserved_tokens
+        self.adapter_dirs = set(adapter_dirs)
+        self.max_total_tokens = max_total_tokens
         assert self.max_total_tokens > 0
         assert batch_max_tokens is not None
         self.batch_max_tokens = batch_max_tokens
@@ -31,15 +29,11 @@ class PrefixSLoraReqQueue:
         self.waiting_req_list.append(req)
         return
 
-    def _is_cold_prefix_req(self, req):
-        return req.adapter_dir in self.cpu_lora_dirs
-
     def _init_cache_list(self, current_batch: Batch, lora_ranks):
         self.cache_len_list = []
         self.adapters = set()
         self.adapter_size = 0
-        self.cold_prefixes = set()
-        self.cold_prefix_size = 0
+        self.prefixes = set()
         if current_batch is None:
             return
 
@@ -51,9 +45,8 @@ class PrefixSLoraReqQueue:
             if req.adapter_dir not in self.adapters:
                 self.adapter_size += lora_ranks[req.adapter_dir] * 4
                 self.adapters.add(req.adapter_dir)
-            if self._is_cold_prefix_req(req) and req.adapter_dir not in self.cold_prefixes:
-                self.cold_prefixes.add(req.adapter_dir)
-                self.cold_prefix_size += self.shared_prefix_len
+            if req.adapter_dir is not None:
+                self.prefixes.add(req.adapter_dir)
 
     def _can_add_new_req(self, req, lora_ranks):
         self.cache_len_list.append((req.input_len + 1, req.max_output_len - 1))
@@ -61,9 +54,8 @@ class PrefixSLoraReqQueue:
         if req.adapter_dir not in self.adapters:
             self.adapter_size += lora_ranks[req.adapter_dir] * 4
             self.adapters.add(req.adapter_dir)
-        if self._is_cold_prefix_req(req) and req.adapter_dir not in self.cold_prefixes:
-            self.cold_prefixes.add(req.adapter_dir)
-            self.cold_prefix_size += self.shared_prefix_len
+        if req.adapter_dir is not None:
+            self.prefixes.add(req.adapter_dir)
 
         left_out_len_array = np.array([e[1] for e in self.cache_len_list])
         has_run_len_array = np.array([e[0] for e in self.cache_len_list])
@@ -71,9 +63,10 @@ class PrefixSLoraReqQueue:
         size_array = np.arange(1, len(self.cache_len_list) + 1, 1)
 
         need_max_token_num = (left_out_len_array * size_array + cum_run_len_array).max()
+        prefix_size = len(self.prefixes) * self.shared_prefix_len
         if (
             need_max_token_num
-            < self.max_total_tokens - self.adapter_size - self.cold_prefix_size
+            < self.max_total_tokens - self.adapter_size - prefix_size
             and len(self.cache_len_list) <= self.running_max_req_size
         ):
             return True

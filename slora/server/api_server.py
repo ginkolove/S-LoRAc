@@ -370,6 +370,7 @@ def main():
     parser.add_argument("--enable-abort", action="store_true")
     parser.add_argument("--enable-prefix-slora", action="store_true")
     parser.add_argument("--prefix-slora-shared-prefix-len", type=int, default=0)
+    parser.add_argument("--prefix-slora-shared-prefix-ratio", type=float, default=None)
     parser.add_argument("--prefix-slora-gpu-prefix-num", type=int, default=0)
     parser.add_argument("--prefix-slora-cpu-prefix-num", type=int, default=None)
 
@@ -387,22 +388,22 @@ def main():
 
     assert args.max_req_input_len < args.max_req_total_len
     if args.enable_prefix_slora:
-        assert args.prefix_slora_shared_prefix_len > 0, (
-            "prefix-slora-shared-prefix-len must be > 0 when --enable-prefix-slora is set"
-        )
-        assert args.prefix_slora_gpu_prefix_num >= 0
-        if args.prefix_slora_cpu_prefix_num is None:
-            args.prefix_slora_cpu_prefix_num = max(
-                0, len(args.lora_dirs) - args.prefix_slora_gpu_prefix_num
+        if args.prefix_slora_shared_prefix_len <= 0 and args.prefix_slora_shared_prefix_ratio is not None:
+            assert 0 < args.prefix_slora_shared_prefix_ratio < 1, (
+                "prefix-slora-shared-prefix-ratio must be in (0, 1)"
             )
-        assert args.prefix_slora_cpu_prefix_num >= 0
-        assert (
-            args.prefix_slora_gpu_prefix_num + args.prefix_slora_cpu_prefix_num
-            <= len(args.lora_dirs)
-        ), (
-            "prefix-slora-gpu-prefix-num + prefix-slora-cpu-prefix-num "
-            "must be <= number of lora dirs"
+            args.prefix_slora_shared_prefix_len = int(
+                args.max_req_input_len * args.prefix_slora_shared_prefix_ratio
+            )
+        assert args.prefix_slora_shared_prefix_len > 0, (
+            "prefix-slora-shared-prefix-len must be > 0 when --enable-prefix-slora is set; "
+            "or pass --prefix-slora-shared-prefix-ratio"
         )
+        assert args.prefix_slora_shared_prefix_len < args.max_req_input_len, (
+            "prefix-slora-shared-prefix-len must be smaller than max_req_input_len"
+        )
+        args.prefix_slora_gpu_prefix_num = 0
+        args.prefix_slora_cpu_prefix_num = len(args.lora_dirs)
     setting["max_req_total_len"] = args.max_req_total_len
     setting["nccl_port"] = args.nccl_port
 
