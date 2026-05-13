@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 import triton
@@ -65,7 +67,6 @@ def _prefix_context_attention_kernel(
     sm_scale,
     B_Start_Loc,
     B_Seqlen,
-    TMP,
     Out,
     stride_qbs,
     stride_qh,
@@ -87,9 +88,6 @@ def _prefix_context_attention_kernel(
     stride_obs,
     stride_oh,
     stride_od,
-    stride_tmp_b,
-    stride_tmp_h,
-    stride_tmp_s,
     kv_group_num,
     PREFIX_LEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -109,13 +107,14 @@ def _prefix_context_attention_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
 
-    q_ptrs = (
+    q = tl.load(
         Q
         + (cur_start + offs_m[:, None]) * stride_qbs
         + cur_head * stride_qh
-        + offs_d[None, :] * stride_qd
+        + offs_d[None, :] * stride_qd,
+        mask=offs_m[:, None] < cur_seq_len,
+        other=0.0,
     )
-    q = tl.load(q_ptrs, mask=offs_m[:, None] < cur_seq_len, other=0.0)
 
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -140,6 +139,7 @@ def _prefix_context_attention_kernel(
         valid_query_key = (~is_prefix) & (query_key_pos < cur_seq_len)
         valid_key = valid_prefix | valid_query_key
 
+        # Direct full-prefix KV path: no MiniKV reconstruction here.
         prefix_k = tl.load(
             MEM_K
             + prefix_locs[None, :] * stride_mkbs
@@ -156,41 +156,33 @@ def _prefix_context_attention_kernel(
             mask=valid_query_key[None, :],
             other=0.0,
         )
+        k = tl.where(is_prefix[None, :], prefix_k, query_k)
 
-        qk_prefix = tl.dot(q, prefix_k)
-        qk_query = tl.dot(q, query_k)
-        qk = tl.where(is_prefix[None, :], qk_prefix, qk_query)
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, k)
         qk *= sm_scale
 
         causal = is_prefix[None, :] | (offs_m[:, None] >= query_key_pos[None, :])
         qk = tl.where(
-            valid_key[None, :] & causal,
+            (offs_m[:, None] < cur_seq_len) & valid_key[None, :] & causal,
             qk,
             float("-inf"),
         )
 
-        tmp_ptrs = TMP + cur_batch * stride_tmp_b + cur_head * stride_tmp_h + offs_m * stride_tmp_s
-        tmp_m_i_ptrs = tmp_ptrs
-        tmp_m_ij_ptrs = tmp_ptrs + BLOCK_M * stride_tmp_s
-
         m_ij = tl.max(qk, 1)
-        tl.store(tmp_m_i_ptrs, m_i)
-        tl.store(tmp_m_ij_ptrs, m_ij)
-        m_i_prev = tl.load(tmp_m_i_ptrs)
-        m_ij = tl.load(tmp_m_ij_ptrs)
-
-        p = tl.exp(qk - m_ij[:, None])
+        valid_row = m_ij != float("-inf")
+        m_ij_safe = tl.where(valid_row, m_ij, 0.0)
+        p = tl.exp(qk - m_ij_safe[:, None])
         l_ij = tl.sum(p, 1)
-        m_i_new = tl.maximum(m_i_prev, m_ij)
-        alpha = tl.exp(m_i_prev - m_i_new)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
         beta = tl.exp(m_ij - m_i_new)
         l_i_new = alpha * l_i + beta * l_ij
+        l_i_new_safe = tl.where(valid_row, l_i_new, 1.0)
 
-        p_scale = beta / l_i_new
+        p_scale = tl.where(valid_row, beta / l_i_new_safe, 0.0)
         p = p * p_scale[:, None]
-        acc_scale = l_i / l_i_new * alpha
-        tl.store(tmp_ptrs, acc_scale)
-        acc_scale = tl.load(tmp_ptrs)
+        acc_scale = tl.where(valid_row, l_i / l_i_new_safe * alpha, 1.0)
         acc = acc * acc_scale[:, None]
 
         prefix_v = tl.load(
@@ -209,20 +201,21 @@ def _prefix_context_attention_kernel(
             mask=valid_query_key[:, None],
             other=0.0,
         )
-        prefix_p = tl.where(is_prefix[None, :], p, 0.0).to(prefix_v.dtype)
-        query_p = tl.where(is_prefix[None, :], 0.0, p).to(query_v.dtype)
-        acc += tl.dot(prefix_p, prefix_v)
-        acc += tl.dot(query_p, query_v)
-        l_i = l_i_new
-        m_i = m_i_new
+        v = tl.where(is_prefix[:, None], prefix_v, query_v)
 
-    out_ptrs = (
+        p = p.to(v.dtype)
+        acc += tl.dot(p, v)
+        l_i = tl.where(valid_row, l_i_new, l_i)
+        m_i = tl.where(valid_row, m_i_new, m_i)
+
+    tl.store(
         Out
         + (cur_start + offs_m[:, None]) * stride_obs
         + cur_head * stride_oh
-        + offs_d[None, :] * stride_od
+        + offs_d[None, :] * stride_od,
+        acc,
+        mask=offs_m[:, None] < cur_seq_len,
     )
-    tl.store(out_ptrs, acc, mask=offs_m[:, None] < cur_seq_len)
 
 
 @torch.no_grad()
@@ -240,12 +233,7 @@ def context_attention_fwd_with_prefix(
     mem_value_buffer,
     attention_fwd=None,
 ):
-    """Run query prefill attention over shared prefix KV plus query KV.
-
-    Prefix KV lives in the unified memory pool and is addressed by
-    prefix_b_loc. Query K/V are the query-only prefill tensors, so requests
-    sharing the same adapter also share the same prefix slots.
-    """
+    """Run prefill attention over cached full-prefix KV plus query KV."""
 
     if prefix_len <= 0:
         if attention_fwd is None:
@@ -261,19 +249,20 @@ def context_attention_fwd_with_prefix(
     assert prefix_b_loc is not None
     assert prefix_b_loc.shape[1] >= prefix_len
 
-    _context_attention_torch_with_prefix(
-        q,
-        k,
-        v,
-        o,
-        b_start_loc,
-        b_seq_len,
-        prefix_b_loc,
-        prefix_len,
-        mem_key_buffer,
-        mem_value_buffer,
-    )
-    return
+    if os.environ.get("PREFIX_SLORA_ATTENTION_BACKEND", "triton").lower() == "torch":
+        _context_attention_torch_with_prefix(
+            q,
+            k,
+            v,
+            o,
+            b_start_loc,
+            b_seq_len,
+            prefix_b_loc,
+            prefix_len,
+            mem_key_buffer,
+            mem_value_buffer,
+        )
+        return
 
     block = 128
     sm_scale = 1.0 / (head_dim ** 0.5)
@@ -281,11 +270,6 @@ def context_attention_fwd_with_prefix(
     kv_group_num = q.shape[1] // k.shape[1]
     grid = (batch_size, q_head_num, triton.cdiv(max_input_len, block))
     num_warps = 4 if head_dim <= 64 else 8
-    tmp = torch.empty(
-        (batch_size, q_head_num, max_input_len + 256),
-        dtype=torch.float32,
-        device=q.device,
-    )
 
     _prefix_context_attention_kernel[grid](
         q,
@@ -297,7 +281,6 @@ def context_attention_fwd_with_prefix(
         sm_scale,
         b_start_loc,
         b_seq_len,
-        tmp,
         o,
         q.stride(0),
         q.stride(1),
@@ -319,9 +302,6 @@ def context_attention_fwd_with_prefix(
         o.stride(0),
         o.stride(1),
         o.stride(2),
-        tmp.stride(0),
-        tmp.stride(1),
-        tmp.stride(2),
         kv_group_num=kv_group_num,
         PREFIX_LEN=prefix_len,
         BLOCK_M=block,
