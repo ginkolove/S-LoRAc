@@ -31,6 +31,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-abort", action="store_true")
     parser.add_argument("--enable-lowra", action="store_true")
     parser.add_argument("--lowra-shared-prefix-len", type=int, default=0)
+    parser.add_argument("--lowra-wait-slo-ms", type=float, default=0.0)
     parser.add_argument("--vllm-mem-ratio", type=float, default=0.95)
     parser.add_argument("--print-only", action="store_true")
     args = parser.parse_args()
@@ -95,6 +96,8 @@ if __name__ == "__main__":
         if args.enable_lowra:
             cmd += " --enable-lowra"
             cmd += f" --lowra-shared-prefix-len {args.lowra_shared_prefix_len}"
+            if args.lowra_wait_slo_ms > 0:
+                cmd += f" --lowra-wait-slo-ms {args.lowra_wait_slo_ms}"
 
     elif args.backend == "lightllm":
         cmd = f"python -m lightllm.server.api_server" \

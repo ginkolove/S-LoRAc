@@ -36,7 +36,8 @@ def get_scheduler(input_params, adapter_dirs):
         return LowRAPrefixAwareReqQueue(input_params.max_total_token_num, input_params.batch_max_tokens,
                                         input_params.running_max_req_size,
                                         input_params.lowra_shared_prefix_len,
-                                        input_params.lowra_window_n)
+                                        input_params.lowra_window_n,
+                                        input_params.lowra_wait_slo_ms)
     if input_params.scheduler == "vtc_fair":
         return VTCReqQueue(input_params.max_total_token_num, input_params.batch_max_tokens,
                            input_params.running_max_req_size, adapter_dirs, input_params.fair_weights)
@@ -497,6 +498,7 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
                                fair_weights=args.fair_weights,
                                enable_lowra=args.enable_lowra,
                                lowra_shared_prefix_len=args.lowra_shared_prefix_len,
+                               lowra_wait_slo_ms=args.lowra_wait_slo_ms,
                               )
 
     try:

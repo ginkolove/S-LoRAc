@@ -1,4 +1,5 @@
 import uuid
+import time
 from collections import OrderedDict
 
 from ..io_struct import Batch
@@ -15,10 +16,12 @@ class LowRAPrefixAwareReqQueue(ReqQueue):
         running_max_req_size,
         prefix_len,
         window_n,
+        wait_slo_ms=0.0,
     ) -> None:
         super().__init__(max_total_tokens, batch_max_tokens, running_max_req_size)
         self.prefix_len = int(prefix_len)
         self.window_size = max(1, int(window_n) - 2)
+        self.wait_slo_s = max(0.0, float(wait_slo_ms) / 1000.0)
         self.prefix_cache_state = {
             "cached_lora_dirs": set(),
             "active_lora_dirs": set(),
@@ -142,9 +145,12 @@ class LowRAPrefixAwareReqQueue(ReqQueue):
         ]
         return self._attach_lowra_plan(Batch(uuid.uuid4().hex, reqs), evict_prefixes)
 
-    def _cluster_waiting_groups(self):
+    def _cluster_waiting_groups(self, exclude_ids=None):
+        exclude_ids = exclude_ids or set()
         groups = OrderedDict()
         for idx, req in self._non_aborted_waiting_with_order():
+            if req.request_id in exclude_ids:
+                continue
             if req.adapter_dir not in groups:
                 groups[req.adapter_dir] = {
                     "lora_dir": req.adapter_dir,
@@ -162,37 +168,104 @@ class LowRAPrefixAwareReqQueue(ReqQueue):
         ))
         return clustered
 
+    def _urgent_waiting_reqs(self, now):
+        if self.wait_slo_s <= 0:
+            return []
+        urgent = []
+        for idx, req in self._non_aborted_waiting_with_order():
+            arrival_time = getattr(req, "arrival_time", now)
+            if now - arrival_time >= self.wait_slo_s:
+                urgent.append((arrival_time + self.wait_slo_s, idx, req))
+        urgent.sort(key=lambda item: (item[0], item[1]))
+        return [req for _, _, req in urgent]
+
+    def _try_select_req(self, selected, req, current_batch, lora_ranks, evict_plan):
+        trial = selected + [req]
+        plan = self._eviction_plan_for_candidate(
+            trial, current_batch, lora_ranks, evict_plan
+        )
+        if plan is None:
+            return None
+        return trial, plan
+
+    def _try_select_group_fifo(self, selected, reqs, current_batch, lora_ranks, evict_plan):
+        full_trial = selected + reqs
+        full_plan = self._eviction_plan_for_candidate(
+            full_trial, current_batch, lora_ranks, evict_plan
+        )
+        if full_plan is not None:
+            return full_trial, full_plan
+
+        cur_selected = selected
+        cur_plan = evict_plan
+        progressed = False
+        for req in reqs:
+            result = self._try_select_req(
+                cur_selected, req, current_batch, lora_ranks, cur_plan
+            )
+            if result is None:
+                break
+            cur_selected, cur_plan = result
+            progressed = True
+        if not progressed:
+            return None
+        return cur_selected, cur_plan
+
+    def _same_lora_followers(self, lora_dir, exclude_ids):
+        return [
+            req
+            for _, req in self._non_aborted_waiting_with_order()
+            if req.request_id not in exclude_ids and req.adapter_dir == lora_dir
+        ]
+
+    def _select_slo_urgent_prefix(self, current_batch, lora_ranks):
+        selected = []
+        evict_plan = []
+        selected_ids = set()
+        for req in self._urgent_waiting_reqs(time.time()):
+            if req.request_id in selected_ids:
+                continue
+            result = self._try_select_req(
+                selected, req, current_batch, lora_ranks, evict_plan
+            )
+            if result is None:
+                continue
+            selected, evict_plan = result
+            selected_ids.add(req.request_id)
+
+            same_lora_reqs = self._same_lora_followers(req.adapter_dir, selected_ids)
+            if not same_lora_reqs:
+                continue
+            result = self._try_select_group_fifo(
+                selected, same_lora_reqs, current_batch, lora_ranks, evict_plan
+            )
+            if result is None:
+                continue
+            selected, evict_plan = result
+            selected_ids = {req.request_id for req in selected}
+        return selected, evict_plan
+
     def generate_new_batch(self, current_batch: Batch, lora_ranks: dict[str, int]):
         if current_batch is not None and len(current_batch.reqs) >= self.running_max_req_size:
             return None
 
-        clustered_groups = self._cluster_waiting_groups()
+        selected, evict_plan = self._select_slo_urgent_prefix(current_batch, lora_ranks)
+        selected_ids = {req.request_id for req in selected}
+
+        clustered_groups = self._cluster_waiting_groups(exclude_ids=selected_ids)
         if not clustered_groups:
             self.waiting_req_list = [req for req in self.waiting_req_list if not req.aborted]
+            if selected:
+                return self._make_batch(selected, evict_plan)
             return None
 
-        selected = []
-        evict_plan = []
         for group in clustered_groups:
             group_reqs = group["reqs"]
-            full_trial = selected + group_reqs
-            full_plan = self._eviction_plan_for_candidate(
-                full_trial, current_batch, lora_ranks, evict_plan
+            result = self._try_select_group_fifo(
+                selected, group_reqs, current_batch, lora_ranks, evict_plan
             )
-            if full_plan is not None:
-                selected = full_trial
-                evict_plan = full_plan
-                continue
-
-            for req in group_reqs:
-                trial = selected + [req]
-                partial_plan = self._eviction_plan_for_candidate(
-                    trial, current_batch, lora_ranks, evict_plan
-                )
-                if partial_plan is None:
-                    break
-                selected = trial
-                evict_plan = partial_plan
+            if result is not None:
+                selected, evict_plan = result
 
         if not selected:
             return None

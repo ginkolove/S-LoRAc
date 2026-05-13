@@ -432,6 +432,8 @@ def main():
     parser.add_argument("--no-lora", action="store_true")
     parser.add_argument("--enable-lowra", action="store_true")
     parser.add_argument("--lowra-shared-prefix-len", type=int, default=0)
+    parser.add_argument("--lowra-wait-slo-ms", type=float, default=0.0,
+                        help="LowRA waiting-queue SLO in milliseconds. 0 disables deadline promotion.")
     ''' end of slora arguments '''
 
     args = parser.parse_args()

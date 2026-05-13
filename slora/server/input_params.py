@@ -52,6 +52,7 @@ class InputParams:
         # LowRA
         enable_lowra=False,
         lowra_shared_prefix_len=0,
+        lowra_wait_slo_ms=0.0,
     ) -> None:
         self.max_req_total_len = max_req_total_len
         self.max_total_token_num = max_total_token_num
@@ -84,5 +85,6 @@ class InputParams:
         self.fair_weights = fair_weights
         self.enable_lowra = enable_lowra
         self.lowra_shared_prefix_len = lowra_shared_prefix_len
+        self.lowra_wait_slo_ms = lowra_wait_slo_ms
         return
  
