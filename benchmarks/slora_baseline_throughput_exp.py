@@ -210,7 +210,8 @@ def summarize_results(
         default=warmup,
     )
     drain_measure_time = max(1e-9, drain_measure_end - warmup)
-    steady_end = steady_end_override if steady_end_override is not None else duration - cooldown
+    steady_end = steady_end_override if steady_end_override is not None else drain_measure_end
+    steady_end = min(steady_end, benchmark_time, drain_measure_end)
     steady_end = max(warmup, steady_end)
     steady_time = max(1e-9, steady_end - warmup)
     steady_completed = [
@@ -252,6 +253,9 @@ def summarize_results(
         "output_tokens_per_s_measured": len(measured) * output_len / measure_time,
         "input_tokens_per_s_measured": len(measured) * input_len / measure_time,
         "logical_tokens_per_s_measured": len(measured) * (input_len + output_len) / measure_time,
+        "output_tokens_per_s_steady": len(steady_completed) * output_len / steady_time,
+        "input_tokens_per_s_steady": len(steady_completed) * input_len / steady_time,
+        "logical_tokens_per_s_steady": len(steady_completed) * (input_len + output_len) / steady_time,
         "latency_mean": float(np.mean(latencies)) if latencies else None,
         "latency_p50": percentile(latencies, 50),
         "latency_p95": percentile(latencies, 95),

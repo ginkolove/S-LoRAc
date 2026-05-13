@@ -127,6 +127,8 @@ def main():
 
     measured = summary["measured_requests"]
     measure_time = summary["measure_time"]
+    steady_completed = summary["steady_completed_requests"]
+    steady_time = summary["steady_time"]
     summary["shared_prefix_len"] = prefix_len
     summary["query_len"] = query_len
     summary["logical_input_len"] = args.input_len
@@ -134,6 +136,11 @@ def main():
     summary["logical_input_tokens_per_s_measured"] = measured * args.input_len / measure_time
     summary["logical_tokens_per_s_measured"] = (
         measured * (args.input_len + args.output_len) / measure_time
+    )
+    summary["sent_query_tokens_per_s_steady"] = steady_completed * query_len / steady_time
+    summary["logical_input_tokens_per_s_steady"] = steady_completed * args.input_len / steady_time
+    summary["logical_tokens_per_s_steady"] = (
+        steady_completed * (args.input_len + args.output_len) / steady_time
     )
 
     record = {"config": config, "result": summary}

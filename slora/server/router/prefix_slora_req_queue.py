@@ -81,18 +81,13 @@ class PrefixSLoraReqQueue:
 
         self._init_cache_list(current_batch, lora_ranks)
         can_run_list = []
-        new_batch_total_tokens = 0
         aborted_count = 0
         for req in self.waiting_req_list:
             if req.aborted:
                 aborted_count += 1
                 continue
-            if (
-                self._can_add_new_req(req, lora_ranks)
-                and new_batch_total_tokens + req.input_len <= self.batch_max_tokens
-            ):
+            if self._can_add_new_req(req, lora_ranks):
                 can_run_list.append(req)
-                new_batch_total_tokens += req.input_len
             else:
                 break
 
@@ -104,15 +99,10 @@ class PrefixSLoraReqQueue:
 
     def next_batch(self):
         next_batch = []
-        new_batch_total_tokens = 0
         for req in self.waiting_req_list:
             if req.aborted:
                 continue
-            if new_batch_total_tokens + req.input_len <= self.batch_max_tokens:
-                next_batch.append(req)
-                new_batch_total_tokens += req.input_len
-            else:
-                break
+            next_batch.append(req)
         if len(next_batch) > 0:
             return Batch(uuid.uuid4().hex, next_batch)
         return None
