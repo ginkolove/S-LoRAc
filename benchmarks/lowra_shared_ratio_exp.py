@@ -328,7 +328,7 @@ def parse_args():
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--max-context-len", type=int, default=4096)
     parser.add_argument("--shared-prefix-ratio", type=float, required=True,
-                        choices=[0.25, 0.5, 0.75, 0.875])
+                        help="Shared prefix ratio in (0, 1).")
     parser.add_argument("--prompt-token-id", type=int, default=100)
     parser.add_argument("--output", type=str, default="lowra_shared_ratio_results.jsonl")
     parser.add_argument("--dump-per-request", type=str, default=None)
@@ -339,6 +339,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not 0 < args.shared_prefix_ratio < 1:
+        raise ValueError("--shared-prefix-ratio must be in (0, 1)")
     prefix_len = int(args.input_len * args.shared_prefix_ratio)
     query_len = args.input_len - prefix_len
     logical_len = prefix_len + query_len + args.output_len
