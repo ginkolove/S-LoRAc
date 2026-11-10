@@ -8,23 +8,73 @@ def suffix_cumsum(tensor, dim=-1, dtype=torch.int32):
 
 
 class MemoryAllocator:
-    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num):
+    def __init__(self, tot_size, cache_size, dtype, head_num, head_dim, layer_num,
+                 dynamic_layer_workspace=False, device="cuda"):
         assert tot_size >= cache_size
+        if layer_num <= 0:
+            raise ValueError("invalid layer count")
+        self.device = device
+        self.dynamic_layer_workspace = bool(dynamic_layer_workspace)
+        self.budget_size = int(tot_size)
         self.dtype = dtype
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
         self.cell_size = head_num * head_dim
 
-        self.tot_size = tot_size
-        self.cache_size = cache_size
+        self.tot_size = int(tot_size)
+        self.cache_size = int(cache_size)
+        if self.cache_size <= 0:
+            raise ValueError("no KV budget")
 
         self.reset_all_pool()
 
 
     def get_memory_size(self):
-        dsize = 2 if self.dtype == torch.float16 else None
+        dsize = torch.empty((), dtype=self.dtype).element_size()
         return 2 * self.layer_num * self.tot_size * self.cell_size * dsize
+
+    def alloc_layer_workspace(self, token_count):
+        if not self.dynamic_layer_workspace:
+            raise RuntimeError("dynamic layer workspace is not enabled")
+        if token_count <= 0 or self._workspace_indices is not None:
+            raise ValueError("workspace needs positive tokens and exclusive ownership")
+        page_count = (token_count + self.layer_num - 1) // self.layer_num
+        indices = self.alloc(page_count)
+        try:
+            # Each reserved Unified Paging slot has storage in every layer. Flatten
+            # those layer slices into one scratch address space, without copying KV.
+            offsets = torch.arange(self.layer_num, device=self.device, dtype=torch.long)
+            locations = (offsets[:, None] * self.tot_size + indices[None, :]).reshape(-1)[:token_count]
+        except Exception:
+            self.free(indices)
+            raise
+        self._workspace_indices = indices
+        self.layer_workspace_tokens = int(token_count)
+        self.workspace_token_equiv = page_count
+        self.peak_workspace_tokens = max(self.peak_workspace_tokens, token_count)
+        self.peak_workspace_token_equiv = max(self.peak_workspace_token_equiv, page_count)
+        return locations
+
+    def alloc_layer_storage(self, token_count):
+        """Reserve persistent single-layer cells in ordinary full-layer slots."""
+        if not self.dynamic_layer_workspace or token_count <= 0:
+            raise ValueError("layer storage requires positive tokens and flattened pool backing")
+        indices = self.alloc((token_count + self.layer_num - 1) // self.layer_num)
+        try:
+            offsets = torch.arange(self.layer_num, device=self.device, dtype=torch.long)
+            locations = (offsets[:, None] * self.tot_size + indices[None, :]).reshape(-1)[:token_count]
+            return indices, locations
+        except Exception:
+            self.free(indices)
+            raise
+
+    def free_layer_workspace(self):
+        if self._workspace_indices is not None:
+            self.free(self._workspace_indices)
+            self._workspace_indices = None
+        self.layer_workspace_tokens = 0
+        self.workspace_token_equiv = 0
   
 
     def alloc(self, need_size):
@@ -199,6 +249,11 @@ class MemoryAllocator:
         return
     
     def free_all(self):
+        self._workspace_indices = None
+        self.layer_workspace_tokens = 0
+        self.workspace_token_equiv = 0
+        self.peak_workspace_tokens = 0
+        self.peak_workspace_token_equiv = 0
         self.mem_state[:] = 1
         self.can_use_mem_size = self.tot_size
         # self.can_use_mem_size_prefix = self.cache_size
@@ -220,18 +275,34 @@ class MemoryAllocator:
 
 
     def reset_all_pool(self):
-        self.mem_state = torch.ones((self.tot_size,), dtype=torch.bool, device="cuda")
-        self._mem_cum_sum = torch.empty((self.tot_size,), dtype=torch.int32, device="cuda")
-        self.indexes = torch.arange(0, self.tot_size, dtype=torch.long, device="cuda")
+        self._workspace_indices = None
+        self.layer_workspace_tokens = 0
+        self.workspace_token_equiv = 0
+        self.peak_workspace_tokens = 0
+        self.peak_workspace_token_equiv = 0
+        self.mem_state = torch.ones((self.tot_size,), dtype=torch.bool, device=self.device)
+        self._mem_cum_sum = torch.empty((self.tot_size,), dtype=torch.int32, device=self.device)
+        self.indexes = torch.arange(0, self.tot_size, dtype=torch.long, device=self.device)
         self.can_use_mem_size = self.tot_size
         # self.can_use_mem_size_prefix = self.cache_size
         # self.can_use_mem_size_suffix = self.tot_size - self.cache_size
-        self.key_buffer = [torch.empty((self.tot_size, self.head_num, self.head_dim),
-                                       dtype=self.dtype, device="cuda")
-                           for _ in range(self.layer_num)]
-        self.value_buffer = [torch.empty((self.tot_size, self.head_num, self.head_dim),
-                                       dtype=self.dtype, device="cuda")
-                           for _ in range(self.layer_num)]
+        if self.dynamic_layer_workspace:
+            shape = (self.layer_num, self.tot_size, self.head_num, self.head_dim)
+            keys = torch.empty(shape, dtype=self.dtype, device=self.device)
+            values = torch.empty(shape, dtype=self.dtype, device=self.device)
+            self.key_buffer = list(keys.unbind(0))
+            self.value_buffer = list(values.unbind(0))
+            self.prefix_workspace_k = keys.view(-1, self.head_num, self.head_dim)
+            self.prefix_workspace_v = values.view(-1, self.head_num, self.head_dim)
+        else:
+            self.key_buffer = [torch.empty((self.tot_size, self.head_num, self.head_dim),
+                                           dtype=self.dtype, device=self.device)
+                               for _ in range(self.layer_num)]
+            self.value_buffer = [torch.empty((self.tot_size, self.head_num, self.head_dim),
+                                           dtype=self.dtype, device=self.device)
+                                 for _ in range(self.layer_num)]
+            self.prefix_workspace_k = None
+            self.prefix_workspace_v = None
  
 
     def reset_all_cache(self):

@@ -27,7 +27,8 @@ class TpPartBaseModel:
     infer_state_class = InferStateInfo
 
     def __init__(self, tp_rank, world_size, weight_dir,
-                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[], dummy=False):
+                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[], dummy=False,
+                 dynamic_layer_workspace=False):
         self.tp_rank_ = tp_rank
         self.world_size_ = world_size
         self.weight_dir_ = weight_dir
@@ -36,6 +37,7 @@ class TpPartBaseModel:
         self.load_way = load_way
         self.mode = mode
         self.dummy = dummy
+        self.dynamic_layer_workspace = dynamic_layer_workspace
 
         self._init_config()
         self._verify_must()

@@ -32,9 +32,11 @@ class LlamaTpPartModel(TpPartBaseModel):
     memory_manager_class = MemoryAllocator
 
     def __init__(self, tp_rank, world_size, weight_dir, 
-                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[], dummy=False):
+                 max_total_token_num, mem_adapter_size, load_way="HF", mode=[], dummy=False,
+                 dynamic_layer_workspace=False):
         super().__init__(tp_rank, world_size, weight_dir,
-                         max_total_token_num, mem_adapter_size, load_way, mode, dummy=dummy)
+                         max_total_token_num, mem_adapter_size, load_way, mode, dummy=dummy,
+                         dynamic_layer_workspace=dynamic_layer_workspace)
         return
     
     def _init_config(self):
@@ -59,7 +61,9 @@ class LlamaTpPartModel(TpPartBaseModel):
                                                      dtype=torch.float16,
                                                      head_num=self.config["num_attention_heads"] // self.world_size_,
                                                      head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
-                                                     layer_num=self.config["num_hidden_layers"])
+                                                     layer_num=self.config["num_hidden_layers"],
+                                                     **({"dynamic_layer_workspace": True}
+                                                        if self.dynamic_layer_workspace else {}))
 
     def _init_custom(self):
         """
@@ -129,4 +133,3 @@ class LlamaTpPartModel(TpPartBaseModel):
             self._cos_cached[seq_loc_index:seq_loc_index + 1, :] = torch.cos(freqs).to(torch.float16).cuda()
             self._sin_cached[seq_loc_index:seq_loc_index + 1, :] = torch.sin(freqs).to(torch.float16).cuda()
         return
-

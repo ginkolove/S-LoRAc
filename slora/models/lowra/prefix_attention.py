@@ -10,6 +10,7 @@ def _prefix_context_attention_kernel(
     K,
     V,
     PREFIX_B_LOC,
+    PREFIX_REQUEST_IDS,
     MEM_K,
     MEM_V,
     sm_scale,
@@ -41,8 +42,12 @@ def _prefix_context_attention_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    INDIRECT_PREFIX: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
+    prefix_row = cur_batch
+    if INDIRECT_PREFIX:
+        prefix_row = tl.load(PREFIX_REQUEST_IDS + cur_batch)
     cur_head = tl.program_id(1)
     start_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
@@ -78,7 +83,7 @@ def _prefix_context_attention_kernel(
         safe_query_key_pos = tl.maximum(query_key_pos, 0)
 
         prefix_locs = tl.load(
-            PREFIX_B_LOC + cur_batch * stride_pbs + key_pos * stride_pp,
+            PREFIX_B_LOC + prefix_row * stride_pbs + key_pos * stride_pp,
             mask=is_prefix,
             other=-1,
         )
@@ -177,12 +182,13 @@ def context_attention_fwd_with_prefix(
     mem_key_buffer,
     mem_value_buffer,
     attention_fwd=None,
+    prefix_request_ids=None,
 ):
     """Run prefill attention over cached prefix KV plus query KV.
 
     q/k/v/o are query-only flattened tensors. Prefix KV stays in the dynamic
-    pool and is addressed through prefix_b_loc, so requests with the same LoRA
-    share the same prefix slots instead of materializing per-request copies.
+    pool. With prefix_request_ids, prefix_b_loc has one row per unique LoRA;
+    otherwise it is the legacy request-level table.
     """
 
     if prefix_len <= 0:
@@ -199,6 +205,11 @@ def context_attention_fwd_with_prefix(
     block = 128
     sm_scale = 1.0 / (head_dim ** 0.5)
     batch_size, q_head_num = b_seq_len.shape[0], q.shape[1]
+    if prefix_b_loc.ndim != 2 or prefix_b_loc.shape[1] != prefix_len:
+        raise ValueError("invalid prefix address table")
+    if prefix_request_ids is not None and (
+            prefix_request_ids.shape != (batch_size,) or prefix_request_ids.stride(0) != 1):
+        raise ValueError("invalid request-to-prefix mapping")
     kv_group_num = q.shape[1] // k.shape[1]
     grid = (batch_size, q_head_num, triton.cdiv(max_input_len, block))
     num_warps = 4 if head_dim <= 64 else 8
@@ -208,6 +219,7 @@ def context_attention_fwd_with_prefix(
         k,
         v,
         prefix_b_loc,
+        prefix_request_ids if prefix_request_ids is not None else prefix_b_loc,
         mem_key_buffer,
         mem_value_buffer,
         sm_scale,
@@ -239,6 +251,7 @@ def context_attention_fwd_with_prefix(
         BLOCK_M=block,
         BLOCK_DMODEL=head_dim,
         BLOCK_N=block,
+        INDIRECT_PREFIX=prefix_request_ids is not None,
         num_warps=num_warps,
         num_stages=1,
     )

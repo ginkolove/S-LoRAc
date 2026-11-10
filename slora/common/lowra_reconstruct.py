@@ -18,6 +18,8 @@ def _lowra_reconstruct_kernel(
     R_TOTAL: tl.constexpr,
     E: tl.constexpr,
     MAX_RANK: tl.constexpr,
+    B_PACKED: tl.constexpr,
+    ADD_BASE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_R: tl.constexpr,
@@ -42,16 +44,16 @@ def _lowra_reconstruct_kernel(
             mask=(p_offsets[:, None] < P) & (r[None, :] < rank_len),
             other=0.0,
         )
-        b_rows = tl.load(
-            B_LOCS + lora_pid * MAX_RANK + r,
-            mask=r < rank_len,
-            other=0,
-        )
-        b = tl.load(
-            B_BUFFER + b_rows[:, None] * E + e_offsets[None, :],
-            mask=(r[:, None] < rank_len) & (e_offsets[None, :] < E),
-            other=0.0,
-        )
+        if B_PACKED:
+            # S-LoRA stores HF B[E,rank] row-major across rank physical slots.
+            flat = e_offsets[None, :] * rank_len + r[:, None]
+            valid = (r[:, None] < rank_len) & (e_offsets[None, :] < E)
+            b_rows = tl.load(B_LOCS + lora_pid * MAX_RANK + flat // E, mask=valid, other=0)
+            b = tl.load(B_BUFFER + b_rows * E + flat % E, mask=valid, other=0.0)
+        else:
+            b_rows = tl.load(B_LOCS + lora_pid * MAX_RANK + r, mask=r < rank_len, other=0)
+            b = tl.load(B_BUFFER + b_rows[:, None] * E + e_offsets[None, :],
+                        mask=(r[:, None] < rank_len) & (e_offsets[None, :] < E), other=0.0)
         acc += tl.dot(mini, b)
 
     base = tl.load(
@@ -59,7 +61,7 @@ def _lowra_reconstruct_kernel(
         mask=(p_offsets[:, None] < P) & (e_offsets[None, :] < E),
         other=0.0,
     )
-    out = base + acc * scaling
+    out = base + acc * scaling if ADD_BASE else acc * scaling
 
     out_rows = tl.load(
         PREFIX_LOCS + lora_pid * P + p_offsets,
@@ -84,6 +86,8 @@ def lowra_reconstruct_batched(
     rank_starts,
     rank_lens,
     scalings,
+    b_packed=False,
+    add_base=True,
 ):
     if prefix_locs.shape[0] == 0:
         return
@@ -115,6 +119,8 @@ def lowra_reconstruct_batched(
         R_TOTAL=R_TOTAL,
         E=E,
         MAX_RANK=max_rank,
+        B_PACKED=b_packed,
+        ADD_BASE=add_base,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_R=block_r,

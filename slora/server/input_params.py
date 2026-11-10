@@ -1,3 +1,6 @@
+from slora.common.prefix_modes import FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, normalize_prefix_mode
+
+
 class ServeParams:
 
     def __init__(
@@ -53,8 +56,19 @@ class InputParams:
         enable_lowra=False,
         lowra_shared_prefix_len=0,
         lowra_wait_slo_ms=0.0,
+        lowra_prefix_mode=FULL_REPREFILL,
+        lowra_workspace_loras=None,
+        nccl_port=28765,
+        lowra_retain_layers=0,
+        lowra_retain_top_k=None,
+        lowra_pin_hot_adapters=0,
+        lowra_reconstruction_kernel="auto",
+        lowra_reconstruction_workers=None,
+        schedule_interval=1,
+        max_active_loras=None,
     ) -> None:
         self.max_req_total_len = max_req_total_len
+        self.nccl_port = int(nccl_port)
         self.max_total_token_num = max_total_token_num
         self.lowra_original_total_token_num = max_total_token_num
         self.lowra_window_n = 1
@@ -68,6 +82,15 @@ class InputParams:
         self.prefetch = prefetch
         self.prefetch_size = prefetch_size
         self.scheduler = scheduler
+        if schedule_interval <= 0 or (max_active_loras is not None and max_active_loras <= 0):
+            raise ValueError("online scheduling interval and adapter limit must be positive")
+        if scheduler == "online" and (prefetch or no_mem_pool or bmm or pool_size_lora
+                                      or enable_abort or batch_num_adapters is not None
+                                      or no_lora_compute or no_lora_swap or no_kernel):
+            raise ValueError("online scheduling requires unified paging, on-demand adapters, "
+                             "and no legacy prefetch/abort/clustering/debug overrides")
+        self.schedule_interval = int(schedule_interval)
+        self.max_active_loras = max_active_loras
         self.profile = profile
         self.batch_num_adapters = batch_num_adapters
         self.enable_abort = enable_abort
@@ -86,5 +109,22 @@ class InputParams:
         self.enable_lowra = enable_lowra
         self.lowra_shared_prefix_len = lowra_shared_prefix_len
         self.lowra_wait_slo_ms = lowra_wait_slo_ms
+        self.lowra_prefix_mode = normalize_prefix_mode(lowra_prefix_mode)
+        self.lowra_workspace_loras = lowra_workspace_loras
+        self.lowra_retain_layers = int(lowra_retain_layers)
+        self.lowra_retain_top_k = lowra_retain_top_k
+        self.lowra_pin_hot_adapters = int(lowra_pin_hot_adapters)
+        if lowra_reconstruction_kernel not in ("auto", "bounded"):
+            raise ValueError("unknown LowRA reconstruction kernel")
+        if lowra_reconstruction_kernel == "bounded" and (
+                not enable_lowra or self.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED)):
+            raise ValueError("bounded reconstruction requires a LowRA layer mode")
+        if lowra_reconstruction_workers is not None and (
+                lowra_reconstruction_kernel != "bounded"
+                or not isinstance(lowra_reconstruction_workers, int) or lowra_reconstruction_workers <= 0):
+            raise ValueError("reconstruction workers require bounded and a positive integer")
+        self.lowra_reconstruction_kernel = lowra_reconstruction_kernel
+        self.lowra_reconstruction_workers = lowra_reconstruction_workers
+        self.lowra_layer_num = 1
         return
  

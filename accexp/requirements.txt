@@ -1,0 +1,3 @@
+# Additional scoring dependencies; keep the existing model stack.
+rouge-score==0.1.2
+scipy==1.16.3

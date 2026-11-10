@@ -17,9 +17,10 @@ class Llama2TpPartModel(LlamaTpPartModel):
 
     def __init__(self, tp_rank, world_size, weight_dir,
                  max_total_token_num, mem_adapter_size, load_way="HF", mode=[],
-                 dummy=False):
+                 dummy=False, dynamic_layer_workspace=False):
         super().__init__(tp_rank, world_size, weight_dir,
-                         max_total_token_num, mem_adapter_size, load_way, mode, dummy=dummy)
+                         max_total_token_num, mem_adapter_size, load_way, mode, dummy=dummy,
+                         dynamic_layer_workspace=dynamic_layer_workspace)
     
 
     def _init_config(self):
@@ -40,7 +41,9 @@ class Llama2TpPartModel(LlamaTpPartModel):
                                                      dtype=torch.float16,
                                                      head_num=self.config["num_key_value_heads"] // self.world_size_,
                                                      head_dim=self.config["hidden_size"] // self.config["num_attention_heads"],
-                                                     layer_num=self.config["num_hidden_layers"])
+                                                     layer_num=self.config["num_hidden_layers"],
+                                                     **({"dynamic_layer_workspace": True}
+                                                        if self.dynamic_layer_workspace else {}))
         return
     
     def _init_some_value(self):

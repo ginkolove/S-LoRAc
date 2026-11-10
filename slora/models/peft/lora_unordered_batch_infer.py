@@ -9,6 +9,8 @@ from slora.models.llama2.triton_kernel.context_flashattention_nopad import conte
 from slora.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
 from slora.models.peft.triton_kernel.lora.lora_prefill import lora_get_qkvo_fwd_shrink, lora_get_qkvo_fwd_expand
 from slora.models.lowra.prefix_attention import context_attention_fwd_with_prefix
+from slora.models.lowra.decode_attention import token_attention_fwd_with_prefix
+from slora.common.lowra_layer_runtime import profile_interval, run_profiled
 from slora.server.router.model_infer.naive_infer_adapter import NaiveInferAdapter
 from slora.utils.infer_utils import mark_cost_time
 from slora.utils.infer_utils import calculate_time, mark_start, mark_end
@@ -57,11 +59,15 @@ class LoraUnorderedBatchInfer:
             no_lora_compute=False,
             no_lora_copy=False,
             lowra_prefix_b_loc=None,
-            lowra_prefix_len=0):
+            lowra_prefix_len=0,
+            lowra_frame=None,
+            prefill_mem_index=None,
+            return_logits=True):
 
         # Notice that batch_lora only support decoding
         assert len(b_loc) == len(b_start_loc) == len(b_seq_len)
         self.delta = []
+        self.lowra_frame = lowra_frame
 
         self.max_b_seq_len = torch.max(b_seq_len).item()
 
@@ -75,7 +81,8 @@ class LoraUnorderedBatchInfer:
             return self._prefill(batch_size, total_token_num, max_len_in_batch,
                                  input_ids,
                                  b_loc, b_start_loc, b_seq_len, no_lora_compute,
-                                 lowra_prefix_b_loc, lowra_prefix_len)
+                                 lowra_prefix_b_loc, lowra_prefix_len,
+                                 prefill_mem_index, return_logits)
         else:
             for _ in range(3):
                 self.delta.append(torch.zeros((len(b_seq_len), self.max_lora_dim), dtype=torch.float16, device="cuda"))
@@ -88,10 +95,12 @@ class LoraUnorderedBatchInfer:
     def _prefill(self, batch_size, total_token_num, max_len_in_batch,
                  input_ids,
                  b_loc, b_start_loc, b_seq_len, no_lora_compute=False,
-                 lowra_prefix_b_loc=None, lowra_prefix_len=0):
+                 lowra_prefix_b_loc=None, lowra_prefix_len=0,
+                 prefill_mem_index=None, return_logits=True):
 
         infer_state = self.base_model.infer_state_class()
         infer_state.is_prefill = True
+        infer_state.lowra_async_execution = self.lowra_frame is not None
         infer_state.batch_size = batch_size
         infer_state.total_token_num = total_token_num
         infer_state.max_len_in_batch = max_len_in_batch
@@ -115,7 +124,10 @@ class LoraUnorderedBatchInfer:
         infer_state.lowra_prefix_b_loc = lowra_prefix_b_loc
         infer_state.lowra_prefix_len = lowra_prefix_len
         infer_state.mem_manager = self.base_model.mem_manager
-        infer_state.prefill_mem_index = self.base_model.mem_manager.alloc(infer_state.total_token_num)
+        if prefill_mem_index is not None and prefill_mem_index.numel() != total_token_num:
+            raise ValueError("preallocated prefix indices must match the prefill token count")
+        infer_state.prefill_mem_index = (self.base_model.mem_manager.alloc(infer_state.total_token_num)
+                                        if prefill_mem_index is None else prefill_mem_index)
         infer_state.prefill_key_buffer = torch.empty(
                 (infer_state.total_token_num, self.base_model.tp_k_head_num_, self.base_model.head_dim_),
                 dtype=torch.float16, device="cuda")
@@ -124,7 +136,7 @@ class LoraUnorderedBatchInfer:
                 dtype=torch.float16, device="cuda")
         init_bloc(b_loc, b_seq_len, max_len_in_batch, infer_state.prefill_mem_index)
         
-        predict_logics = self._context_forward(input_ids, infer_state, no_lora_compute)
+        predict_logics = self._context_forward(input_ids, infer_state, no_lora_compute, return_logits)
         return predict_logics
 
 
@@ -133,6 +145,7 @@ class LoraUnorderedBatchInfer:
                 b_loc, b_start_loc, b_seq_len, no_lora_compute=False, no_lora_copy=False):
         infer_state = self.base_model.infer_state_class()
         infer_state.is_prefill = False
+        infer_state.lowra_async_execution = self.lowra_frame is not None
         infer_state.batch_size = batch_size
         infer_state.total_token_num = total_token_num
         infer_state.max_len_in_batch = max_len_in_batch
@@ -165,17 +178,29 @@ class LoraUnorderedBatchInfer:
 
         infer_state.init_some_extra_state(self.base_model, batch_size, total_token_num, max_len_in_batch,
                                           input_ids, b_loc, b_start_loc, b_seq_len, False)
+        if self.lowra_frame is not None:
+            prefix_len = (self.lowra_frame.prefix_len if hasattr(self.lowra_frame, "prefix_len")
+                          else self.lowra_frame.runtime.static_store.prefix_len)
+            position_ids = b_seq_len.long() - 1 + prefix_len
+            infer_state.position_cos = self.base_model._cos_cached[position_ids]
+            infer_state.position_sin = self.base_model._sin_cached[position_ids]
         predict_logics = self._token_forward(input_ids, infer_state, no_lora_compute, no_lora_copy)
         return predict_logics
 
 
     @final
-    def _context_forward(self, input_ids, infer_state, no_lora_compute=False):
+    def _context_forward(self, input_ids, infer_state, no_lora_compute=False, return_logits=True):
         cuda_input_ids = input_ids
         input_embs = self.base_model.pre_infer.context_forward(
                 cuda_input_ids, infer_state, self.base_model.pre_post_weight)
-        for i in range(self.base_model.layers_num):
-            input_embs = self._lora_context_forward(i, input_embs, infer_state, no_lora_compute)
+        try:
+            for i in range(self.base_model.layers_num):
+                input_embs = self._lora_context_forward(i, input_embs, infer_state, no_lora_compute)
+        finally:
+            if self.lowra_frame is not None:
+                self.lowra_frame.finish()
+        if not return_logits:
+            return None
         predict_logics = self.base_model.post_infer.token_forward(
                 input_embs, infer_state, self.base_model.pre_post_weight, return_logics=True)
         return predict_logics
@@ -186,8 +211,12 @@ class LoraUnorderedBatchInfer:
         cuda_input_ids = input_ids
         input_embs = self.base_model.pre_infer.token_forward(
                 cuda_input_ids, infer_state, self.base_model.pre_post_weight)
-        for i in range(self.base_model.layers_num):
-            input_embs = self._lora_token_forward(i, input_embs, infer_state, no_lora_compute, no_lora_copy)
+        try:
+            for i in range(self.base_model.layers_num):
+                input_embs = self._lora_token_forward(i, input_embs, infer_state, no_lora_compute, no_lora_copy)
+        finally:
+            if self.lowra_frame is not None:
+                self.lowra_frame.finish()
         predict_logics = self.base_model.post_infer.token_forward(
                 input_embs, infer_state, self.base_model.pre_post_weight, return_logics=True)
         return predict_logics
@@ -195,21 +224,33 @@ class LoraUnorderedBatchInfer:
 
     @final
     def _lora_context_forward(self, layer_id, input_embs, infer_state, no_lora_compute=False):
-        self._lora_context_attention(layer_id, input_embs, infer_state, no_lora_compute)
+        frame = self.lowra_frame
+        profiler = frame.runtime.profiler if frame is not None else None
+        if frame is not None:
+            frame.before_layer(layer_id)
+        with profile_interval(profiler, "attention_sublayer", layer_id):
+            self._lora_context_attention(layer_id, input_embs, infer_state, no_lora_compute)
         layer_weight = self.base_model.trans_layers_weight[layer_id]
         layer_infer = self.base_model.layers_infer[layer_id]
-        layer_infer._context_ffn(input_embs, infer_state, layer_weight)
+        with profile_interval(profiler, "ffn", layer_id):
+            layer_infer._context_ffn(input_embs, infer_state, layer_weight)
         return input_embs
 
 
     @final
     # @calculate_time(show=True, min_cost_ms=0)
     def _lora_token_forward(self, layer_id, input_embs, infer_state, no_lora_compute=False, no_lora_copy=False):
-        self._lora_token_attention(layer_id, input_embs, infer_state, no_lora_compute, no_lora_copy)
+        frame = self.lowra_frame
+        profiler = frame.runtime.profiler if frame is not None else None
+        if frame is not None:
+            frame.before_layer(layer_id)
+        with profile_interval(profiler, "attention_sublayer", layer_id):
+            self._lora_token_attention(layer_id, input_embs, infer_state, no_lora_compute, no_lora_copy)
         layer_weight = self.base_model.trans_layers_weight[layer_id]
         layer_infer = self.base_model.layers_infer[layer_id]
         # mark_start("token_ffn")
-        layer_infer._token_ffn(input_embs, infer_state, layer_weight)
+        with profile_interval(profiler, "ffn", layer_id):
+            layer_infer._token_ffn(input_embs, infer_state, layer_weight)
         # mark_end("token_ffn")
         return input_embs
 
@@ -228,12 +269,19 @@ class LoraUnorderedBatchInfer:
         input1 = None
         layer_infer._post_cache_kv(cache_k, cache_v, infer_state, layer_weight)
         # compute attention
+        if self.lowra_frame is not None:
+            self.lowra_frame.before_attention(layer_id)
         if getattr(infer_state, "lowra_prefix_len", 0) > 0:
             o = torch.empty_like(q)
             attention_fwd = context_attention_fwd
             if layer_infer.tp_q_head_num_ != layer_infer.tp_k_head_num_:
                 attention_fwd = context_attention_fwd_gqa
-            context_attention_fwd_with_prefix(
+            prefix_k, prefix_v = (
+                self.lowra_frame.buffers(layer_id) if self.lowra_frame is not None else
+                (infer_state.mem_manager.key_buffer[layer_id], infer_state.mem_manager.value_buffer[layer_id])
+            )
+            run_profiled(self.lowra_frame.runtime.profiler if self.lowra_frame is not None else None,
+                "attention_kernel", layer_id, context_attention_fwd_with_prefix,
                 q.view(-1, layer_infer.tp_q_head_num_, base_model.head_dim_),
                 cache_k.view(-1, layer_infer.tp_k_head_num_, base_model.head_dim_),
                 cache_v.view(-1, layer_infer.tp_v_head_num_, base_model.head_dim_),
@@ -241,14 +289,21 @@ class LoraUnorderedBatchInfer:
                 infer_state.b_start_loc,
                 infer_state.b_seq_len,
                 infer_state.max_len_in_batch,
-                infer_state.lowra_prefix_b_loc,
+                (self.lowra_frame.prefix_index_table(layer_id) if self.lowra_frame is not None
+                 else infer_state.lowra_prefix_b_loc),
                 infer_state.lowra_prefix_len,
-                infer_state.mem_manager.key_buffer[layer_id],
-                infer_state.mem_manager.value_buffer[layer_id],
+                prefix_k,
+                prefix_v,
                 attention_fwd,
+                prefix_request_ids=(self.lowra_frame.prefix_request_ids
+                                    if self.lowra_frame is not None else None),
             )
         else:
             o = layer_infer._context_attention_kernel(q, cache_k, cache_v, infer_state, layer_weight)
+        # The attention output is independent of prefix KV. Fence its last read
+        # before reusing the workspace, overlapping reconstruction with O and FFN.
+        if self.lowra_frame is not None:
+            self.lowra_frame.after_attention(layer_id)
         q = None
         o = self._lora_get_o(layer_id, o, infer_state, no_lora_compute)
         # if self.world_size_ > 1:
@@ -272,7 +327,23 @@ class LoraUnorderedBatchInfer:
         input1 = None
         layer_infer._post_cache_kv(cache_k, cache_v, infer_state, layer_weight)
         # compute attention
-        o = layer_infer._token_attention_kernel(q, infer_state, layer_weight)
+        if self.lowra_frame is not None:
+            self.lowra_frame.before_attention(layer_id)
+        if self.lowra_frame is not None:
+            prefix_k, prefix_v = self.lowra_frame.buffers(layer_id)
+            o = run_profiled(self.lowra_frame.runtime.profiler,
+                "attention_kernel", layer_id, token_attention_fwd_with_prefix,
+                q.view(-1, layer_infer.tp_q_head_num_, self.base_model.head_dim_),
+                prefix_k, prefix_v, infer_state.mem_manager.key_buffer[layer_id],
+                infer_state.mem_manager.value_buffer[layer_id], self.lowra_frame.prefix_index_table(layer_id),
+                infer_state.b_loc, infer_state.b_seq_len, infer_state.max_len_in_batch,
+                prefix_request_ids=self.lowra_frame.prefix_request_ids,
+            ).view_as(q)
+        else:
+            o = layer_infer._token_attention_kernel(q, infer_state, layer_weight)
+        # Both score and value-reduction kernels have been submitted at this point.
+        if self.lowra_frame is not None:
+            self.lowra_frame.after_attention(layer_id)
         q = None
         o = self._batch_lora_get_o(layer_id, o, infer_state, no_lora_compute)
         # if self.world_size_ > 1:

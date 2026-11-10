@@ -2,6 +2,7 @@ import uvloop
 import asyncio
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 import os
+import json
 import pickle
 import time
 import torch
@@ -28,16 +29,39 @@ from slora.server.router.cluster_req_queue import ClusterReqQueue
 from slora.server.router.vtc_req_queue import VTCReqQueue
 from slora.server.router.pets_req_queue import PETSReqQueue
 from slora.server.router.peft_req_queue import PEFTReqQueue
-from slora.server.router.lowra_req_queue import LowRAPrefixAwareReqQueue
+from slora.server.router.lowra_fifo_req_queue import LowRAFIFOReqQueue
+from slora.server.router.full_reprefill_req_queue import FullReprefillReqQueue
+from slora.server.router.online_req_queue import OnlineReqQueue
+from slora.common.full_reprefill import FULL_REPREFILL_MODES, FULL_PREFIX_CACHE_MODES
+from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, normalize_prefix_mode
+from slora.common.service_cycles import ServiceCycleRecorder
 
 
 def get_scheduler(input_params, adapter_dirs):
+    if getattr(input_params, "scheduler", "slora") == "online":
+        return OnlineReqQueue(
+            input_params.max_total_token_num, input_params.batch_max_tokens,
+            input_params.running_max_req_size,
+            prefix_len=input_params.lowra_shared_prefix_len if input_params.enable_lowra else 0,
+            prefix_mode=input_params.lowra_prefix_mode, layer_num=input_params.lowra_layer_num,
+            retain_layers=input_params.lowra_retain_layers,
+            retain_top_k=input_params.lowra_retain_top_k,
+            pinned_lora_dirs=adapter_dirs[:input_params.lowra_pin_hot_adapters],
+            max_active_loras=input_params.max_active_loras,
+            workspace_lora_limit=input_params.lowra_workspace_loras)
     if input_params.enable_lowra:
-        return LowRAPrefixAwareReqQueue(input_params.max_total_token_num, input_params.batch_max_tokens,
-                                        input_params.running_max_req_size,
-                                        input_params.lowra_shared_prefix_len,
-                                        input_params.lowra_window_n,
-                                        input_params.lowra_wait_slo_ms)
+        prefix_mode = normalize_prefix_mode(input_params.lowra_prefix_mode)
+        if prefix_mode in FULL_PREFIX_CACHE_MODES:
+            return FullReprefillReqQueue(input_params.max_total_token_num,
+                                        input_params.batch_max_tokens, input_params.running_max_req_size,
+                                        input_params.lowra_shared_prefix_len)
+        return LowRAFIFOReqQueue(input_params.max_total_token_num,
+                                input_params.batch_max_tokens, input_params.running_max_req_size,
+                                input_params.lowra_shared_prefix_len, prefix_mode,
+                                input_params.lowra_layer_num, input_params.lowra_workspace_loras,
+                                getattr(input_params, "lowra_retain_layers", 0),
+                                getattr(input_params, "lowra_retain_top_k", None),
+                                adapter_dirs[:getattr(input_params, "lowra_pin_hot_adapters", 0)])
     if input_params.scheduler == "vtc_fair":
         return VTCReqQueue(input_params.max_total_token_num, input_params.batch_max_tokens,
                            input_params.running_max_req_size, adapter_dirs, input_params.fair_weights)
@@ -72,6 +96,27 @@ class RouterManager:
         self.load_way = load_way
         self.mode = mode
         self.input_params = input_params
+        if input_params.scheduler == "online" and mode:
+            raise ValueError("online scheduling currently requires the FP16 Unified Paging path")
+        self.input_params.lowra_prefix_mode = normalize_prefix_mode(
+            getattr(input_params, "lowra_prefix_mode", FULL_REPREFILL))
+        retain_layers = getattr(input_params, "lowra_retain_layers", 0)
+        retain_top_k = getattr(input_params, "lowra_retain_top_k", None)
+        pin_count = getattr(input_params, "lowra_pin_hot_adapters", 0)
+        if pin_count < 0 or pin_count > len(adapter_dirs):
+            raise ValueError("--lowra-pin-hot-adapters must be between zero and the configured adapter count")
+        if pin_count and (not input_params.enable_lowra or input_params.lowra_prefix_mode not in
+                          (FULL_RECONSTRUCT, LAYER_RETAINED) or retain_top_k is not None):
+            raise ValueError("pinned hot prefixes require a MiniKV cache mode and no dynamic top-K")
+        if pin_count and input_params.lowra_prefix_mode == LAYER_RETAINED and retain_layers <= 0:
+            raise ValueError("pinned layer retention requires positive --lowra-retain-layers")
+        if retain_top_k is not None and (retain_top_k < 0 or input_params.lowra_prefix_mode != LAYER_RETAINED):
+            raise ValueError("--lowra-retain-top-k requires minikv-layer_retained and a nonnegative count")
+        if retain_layers < 0 or (retain_layers and input_params.lowra_prefix_mode != LAYER_RETAINED):
+            raise ValueError("--lowra-retain-layers requires minikv-layer_retained and a nonnegative count")
+
+        if input_params.enable_lowra and (input_params.lowra_shared_prefix_len <= 0 or not adapter_dirs):
+            raise ValueError("LowRA requires a positive shared prefix length and at least one adapter")
 
         if self.input_params.prefetch:
             self.prefetch_stream = torch.cuda.Stream()
@@ -85,8 +130,12 @@ class RouterManager:
             self.lora_ranks[lora_dir] = config["r"]
         self.lora_ranks[None] = 0
 
-        if self.input_params.enable_lowra and self.input_params.lowra_shared_prefix_len > 0:
+        if (self.input_params.enable_lowra and self.input_params.lowra_shared_prefix_len > 0
+                and self.input_params.lowra_prefix_mode not in FULL_REPREFILL_MODES):
             model_cfg = get_model_config(weightdir, dummy=input_params.dummy)
+            self.input_params.lowra_layer_num = int(model_cfg["num_hidden_layers"])
+            if retain_layers > self.input_params.lowra_layer_num:
+                raise ValueError("--lowra-retain-layers exceeds the model layer count")
             static_tokens = LowRAStaticPrefixStore.token_equivalent_static_size_from_config(
                 self.input_params.lowra_shared_prefix_len,
                 [self.lora_ranks[lora_dir] for lora_dir in adapter_dirs],
@@ -107,16 +156,53 @@ class RouterManager:
         else:
             self.input_params.lowra_static_token_num = 0
         if self.input_params.enable_lowra:
+            if self.input_params.pool_size_lora:
+                raise ValueError("LowRA profiling counts adapters in the total budget; use --pool-size-lora 0")
             model_cfg = get_model_config(weightdir, dummy=input_params.dummy)
             max_sequence_length = model_cfg.get("max_sequence_length", model_cfg.get("max_position_embeddings", self.input_params.max_req_total_len))
             self.input_params.lowra_window_n = max(1, self.input_params.lowra_original_total_token_num // int(max_sequence_length))
+            if self.input_params.scheduler not in ("slora", "online") or self.input_params.lowra_wait_slo_ms > 0:
+                raise ValueError("LowRA layer profiling uses the default S-LoRA FIFO scheduler, without SLO")
+            if self.input_params.prefetch:
+                raise ValueError("disable adapter prefetch when profiling layer reconstruction")
+            if self.input_params.lowra_prefix_mode in FULL_REPREFILL_MODES:
+                print("Full-reprefill: no static region; full prefixes, adapters and request KV "
+                      "share the original Unified Paging pool")
+            elif self.input_params.lowra_prefix_mode == FULL_RECONSTRUCT:
+                print("minikv-full_reconstruct: static BaseKV/MiniKV; complete prefix cache, adapters "
+                      "and request KV share Unified Paging; no single-layer workspace")
+            elif self.input_params.lowra_prefix_mode == LAYER_RETAINED:
+                print("minikv-layer_retained: keep first %s layers for %s; "
+                      "other prefixes/layers overwrite one workspace; both charge Unified Paging" %
+                      (retain_layers, "fixed first %s configured LoRAs until reset" % pin_count if pin_count
+                       else "all active LoRAs" if retain_top_k is None
+                       else "top %s LoRAs by active request count" % retain_top_k))
+            else:
+                requested_limit = self.input_params.lowra_workspace_loras
+                if requested_limit is not None and requested_limit <= 0:
+                    raise ValueError("workspace LoRA limit must be positive")
+                print("LowRA single-layer prefix workspace: allocated on demand from Unified Paging; "
+                      "no startup reservation")
+            if pin_count:
+                print("Pinned hot prefix adapters (lazy build, protected until reset): %s" % adapter_dirs[:pin_count])
 
         self.req_queue = get_scheduler(input_params, adapter_dirs)
+        if input_params.scheduler == "online":
+            print("Online FCFS: output lengths are not used for admission; "
+                  "decode-step memory checks with preempt/recompute; admission interval=%s" %
+                  input_params.schedule_interval, flush=True)
 
         self.running_batch: Batch = None
         self.eos_id = eos_id
         self.has_wait_tokens = 0
         self.max_wait_tokens = 10
+        self.online_preemptions = 0
+        self.online_recomputed_tokens = 0
+        self.online_rejections = 0
+        self.runtime_stats_file = None
+        self.runtime_stats_interval = 1.0
+        self.runtime_stats_last_time = 0.0
+        self.service_cycles = None
         
         context = zmq.asyncio.Context(2)
         self.recv_from_httpserver = context.socket(zmq.PULL)
@@ -194,12 +280,17 @@ class RouterManager:
             if req.request_id == request_id:
                 req.has_generate_finished = True
                 req.aborted = True
+                if self.service_cycles is not None:
+                    self.service_cycles.complete(request_id, aborted=True)
         return
 
     async def loop_for_fwd(self,):
         counter_count = 0
         while True:
             await self._step()
+            if self.service_cycles is not None:
+                self.service_cycles.observe_waiting(len(self.req_queue.waiting_req_list))
+            await self._record_runtime_stats()
             counter_count += 1
             if self.running_batch is not None:
                 if counter_count % 50 == 0:
@@ -210,18 +301,58 @@ class RouterManager:
             if self.running_batch is None:
                 await asyncio.sleep(0.01)  # 10ms
 
+    async def _record_runtime_stats(self):
+        if self.runtime_stats_file is None:
+            return
+        now = time.monotonic()
+        if now - self.runtime_stats_last_time < self.runtime_stats_interval:
+            return
+        self.runtime_stats_last_time = now
+        ranks = await asyncio.gather(*[rpc.lowra_runtime_stats() for rpc in self.model_rpcs])
+        if self.world_size != 1:
+            ranks = [obtain(rank) for rank in ranks]
+        running = self.running_batch.reqs if self.running_batch else []
+        waiting = [req for req in self.req_queue.waiting_req_list if not req.aborted]
+        row = dict(monotonic_time=time.monotonic(), wall_time=time.time(),
+                   scheduler=self.input_params.scheduler,
+                   online_preemptions=self.online_preemptions,
+                   online_recomputed_tokens=self.online_recomputed_tokens,
+                   online_rejections=self.online_rejections,
+                   prefix_mode=self.input_params.lowra_prefix_mode,
+                   running_batch_size=len(running),
+                   running_unique_loras=len({req.adapter_dir for req in running}),
+                   waiting_queue_size=len(waiting),
+                   oldest_wait_seconds=max([time.time() - req.arrival_time for req in waiting], default=0.0),
+                   total_budget_tokens=self.input_params.lowra_original_total_token_num,
+                   static_token_equivalent=self.input_params.lowra_static_token_num,
+                   running_max_req_size=self.input_params.running_max_req_size,
+                   batch_max_tokens=self.input_params.batch_max_tokens,
+                   last_prefill_query_tokens=getattr(self, "last_prefill_query_tokens", 0),
+                   last_prefill_tokens=getattr(self, "last_prefill_tokens", 0),
+                   last_admission_tokens=getattr(self, "last_admission_tokens", 0),
+                   last_prefix_reconstruct_tokens=getattr(self, "last_prefix_reconstruct_tokens", 0),
+                   last_prefill_batch_size=getattr(self, "last_prefill_batch_size", 0),
+                   per_rank=ranks)
+        self.runtime_stats_file.write(json.dumps(row) + "\n")
+        self.runtime_stats_file.flush()
+
     async def _step(self):
         """
         事件处理循环
         """
+        if self.input_params.scheduler == "online":
+            return await self._step_online()
         # 删除所有已经 finished 的 req
         if self.running_batch is None:
+            cycle_start = time.monotonic()
             await self._sync_lowra_prefix_cache_state()
             new_batch = self.req_queue.generate_new_batch(self.running_batch, self.lora_ranks)
             if self.input_params.enable_abort and len(self.req_queue.abort_req_list) > 0:
                 self.send_to_detokenization.send_pyobj(BatchAbortReq(self.req_queue.abort_req_list))
                 self.req_queue.reset_abort_list()
             if new_batch is not None:
+                if self.service_cycles is not None:
+                    self.service_cycles.begin(cycle_start)
                 self.stats_tool.count_prompt_tokens(new_batch)
                 self.running_batch = new_batch
 
@@ -291,8 +422,108 @@ class RouterManager:
                 await self._decode_batch(self.running_batch)
                 await self._filter_runing_batch()
         
+    async def _step_online(self):
+        # Aborts must release state even before another token can be generated.
+        self.req_queue.waiting_req_list = [req for req in self.req_queue.waiting_req_list if not req.aborted]
+        if self.running_batch and any(req.aborted for req in self.running_batch.reqs):
+            await self._handle_finish_req(self.running_batch, True)
+            await self._filter_runing_batch()
+
+        await self._sync_lowra_prefix_cache_state()
+        preempted = False
+        while self.running_batch is not None:
+            plan = self.req_queue.plan(self.running_batch.reqs, [], self.lora_ranks)
+            if plan.fits:
+                await self._evict_online_prefixes(plan.evictions)
+                break
+            # No allocation happens until a feasible decode plan exists.
+            victim = self.running_batch.reqs[-1]
+            if len(self.running_batch.reqs) == 1:
+                # Even after all unpinned idle prefixes are reclaimed, this
+                # request cannot advance. Reject rather than loop or crash.
+                self._reject_online_request(victim, "request KV exceeds the dynamic pool capacity")
+                await self._handle_finish_req(self.running_batch, True)
+                await self._filter_runing_batch()
+            else:
+                await self._preempt_online_request(victim)
+                preempted = True
+            await self._sync_lowra_prefix_cache_state()
+
+        interval = self.input_params.schedule_interval
+        if not preempted and (self.running_batch is None or self.has_wait_tokens >= interval):
+            new_batch = self.req_queue.generate_new_batch(self.running_batch, self.lora_ranks)
+            while new_batch is None and self.running_batch is None and self.req_queue.waiting_req_list:
+                victim = self.req_queue.waiting_req_list.pop(0)
+                self._reject_online_request(victim, "known prompt/history cannot fit online admission budgets")
+                new_batch = self.req_queue.generate_new_batch(None, self.lora_ranks)
+            if new_batch is not None:
+                if self.service_cycles is not None and self.service_cycles.current is None:
+                    self.service_cycles.begin()
+                await self._evict_lowra_prefixes_for_batch(new_batch)
+                running_dirs = self.running_batch.adapter_dirs if self.running_batch else set()
+                if not self.input_params.no_lora:
+                    await asyncio.gather(*[rpc.offload_adapters(running_dirs | new_batch.adapter_dirs)
+                                           for rpc in self.model_rpcs])
+                    await asyncio.gather(*[rpc.load_adapters(new_batch.adapter_dirs) for rpc in self.model_rpcs])
+                self.online_recomputed_tokens += sum(
+                    req.input_len + len(req.output_ids) for req in new_batch.reqs if req.preemptions)
+                self.stats_tool.count_prompt_tokens(new_batch)
+                await self._prefill_batch(new_batch, minibatch=True)
+                if self.running_batch is None:
+                    self.running_batch = new_batch
+                elif not new_batch.is_clear():
+                    await self._merge_batch(self.running_batch, new_batch)
+                    self.running_batch.merge(new_batch)
+                await self._filter_runing_batch()
+                if self.running_batch is not None and not self.input_params.no_lora:
+                    await asyncio.gather(*[rpc.offload_adapters(self.running_batch.adapter_dirs)
+                                           for rpc in self.model_rpcs])
+                self.has_wait_tokens = 0
+                return
+        if self.running_batch is not None:
+            self.stats_tool.count_output_tokens(self.running_batch)
+            await self._decode_batch(self.running_batch)
+            await self._filter_runing_batch()
+            self.has_wait_tokens += 1
+        elif self.service_cycles is not None and self.service_cycles.current is not None:
+            self.service_cycles.finish(len(self.req_queue.waiting_req_list))
+
+    async def _evict_online_prefixes(self, directories):
+        if directories:
+            await asyncio.gather(*[rpc.evict_lowra_prefixes(directories) for rpc in self.model_rpcs])
+            await self._sync_lowra_prefix_cache_state()
+
+    def _reject_online_request(self, req, reason):
+        req.aborted = req.has_generate_finished = True
+        self.online_rejections += 1
+        print("online admission rejected %s: %s" % (req.request_id, reason), flush=True)
+        self.send_to_detokenization.send_pyobj(BatchAbortReq([req.request_id]))
+        if self.service_cycles is not None:
+            self.service_cycles.complete(req.request_id, aborted=True)
+
+    async def _preempt_online_request(self, req):
+        batch = self.running_batch
+        survivors = [r for r in batch.reqs if r.request_id != req.request_id]
+        # Reuse the existing filter/remove lifecycle to free private KV and
+        # release precisely one prefix reference, without marking completion.
+        if survivors:
+            await asyncio.gather(*[rpc.filter_batch(batch.batch_id, [r.request_id for r in survivors])
+                                   for rpc in self.model_rpcs])
+            batch.reqs = survivors
+            batch.id_to_reqs = {r.request_id: r for r in survivors}
+            batch.adapter_dirs = {r.adapter_dir for r in survivors}
+        else:
+            await self._remove_batch(batch)
+            self.running_batch = None
+        if not self.input_params.no_lora:
+            await asyncio.gather(*[rpc.offload_adapters({r.adapter_dir for r in survivors})
+                                   for rpc in self.model_rpcs])
+        req.preemptions += 1
+        self.online_preemptions += 1
+        self.req_queue.waiting_req_list.insert(0, req)
+
     async def _sync_lowra_prefix_cache_state(self):
-        if not self.input_params.enable_lowra or not hasattr(self.req_queue, "update_prefix_cache_state"):
+        if not hasattr(self.req_queue, "update_prefix_cache_state"):
             return
         if not hasattr(self, "model_rpcs"):
             return
@@ -300,7 +531,7 @@ class RouterManager:
             self.model_rpcs[tp_rank].lowra_prefix_cache_state()
             for tp_rank in range(self.world_size)
         ])
-        self.req_queue.update_prefix_cache_state(states[0])
+        self.req_queue.update_prefix_cache_state(obtain(states[0]) if self.world_size != 1 else states[0])
 
     async def _evict_lowra_prefixes_for_batch(self, batch):
         evict_lora_dirs = getattr(batch, "lowra_evict_prefix_lora_dirs", [])
@@ -336,6 +567,9 @@ class RouterManager:
                 for tp_rank in range(self.world_size)
             ])
             await self._sync_lowra_prefix_cache_state()
+            if self.service_cycles is not None:
+                self.service_cycles.reset()
+            self.online_preemptions = self.online_recomputed_tokens = self.online_rejections = 0
             self.send_to_detokenization.send_pyobj(
                 LowRAResetAck(request_id, True, "LowRA runtime reset complete", {"per_rank": stats_list})
             )
@@ -351,6 +585,17 @@ class RouterManager:
         return
 
     async def _prefill_batch(self, batch, minibatch=True):
+        if self.service_cycles is not None:
+            self.service_cycles.admit((req.request_id for req in batch.reqs),
+                                      len(self.req_queue.waiting_req_list))
+        self.last_prefill_query_tokens = batch.input_tokens()
+        self.last_prefill_tokens = getattr(batch, "prefill_token_num", batch.input_tokens())
+        self.last_admission_tokens = self.last_prefill_tokens
+        self.last_prefix_reconstruct_tokens = 0
+        if self.input_params.lowra_prefix_mode == FULL_RECONSTRUCT:
+            self.last_prefix_reconstruct_tokens = getattr(batch, "prefix_prefill_tokens", 0)
+            self.last_prefill_tokens = batch.input_tokens()
+        self.last_prefill_batch_size = len(batch.reqs)
         await self._init_batch(batch)
         rets = [self.model_rpcs[tp_rank].prefill_batch(batch.batch_id) for tp_rank in range(self.world_size)]
         ans = await asyncio.gather(*rets)
@@ -396,6 +641,10 @@ class RouterManager:
 
     async def _handle_finish_req(self, batch: Batch, has_new_finished_req, minibatch=False):
         if has_new_finished_req:
+            if self.service_cycles is not None:
+                for req in batch.reqs:
+                    if req.has_generate_finished:
+                        self.service_cycles.complete(req.request_id, req.aborted)
             batch.filter_finished()
 
             # unmerge adapter from base model
@@ -426,10 +675,16 @@ class RouterManager:
                     ret.append(self.model_rpcs[tp_rank].offload_adapters())
                 await asyncio.gather(*ret)
 
+            if self.service_cycles is not None and not (
+                    self.input_params.scheduler == "online" and any(
+                        req.preemptions and not req.aborted for req in self.req_queue.waiting_req_list)):
+                self.service_cycles.finish(len(self.req_queue.waiting_req_list))
             self.running_batch = None
             return
     
     def _add_token_id_to_req(self, batch: Batch, req_ans):
+        if self.service_cycles is not None:
+            self.service_cycles.tokens(len(req_ans))
         for req_id, (new_token_id, new_gen_metadata) in req_ans.items():
             req = batch.id_to_reqs[req_id]
             req.output_ids.append(new_token_id)
@@ -465,10 +720,13 @@ class RouterManager:
                 assert False, f"Error Req Inf {recv_req}"
 
     def clean_up(self):
-        for model_rpc in self.model_rpcs:
-            model_rpc.rpc_server_process.kill()
-        for model_rpc in self.model_rpcs:
-            model_rpc.rpc_server_process.join()
+        processes = [rpc.rpc_server_process for rpc in getattr(self, "model_rpcs", [])
+                     if rpc.rpc_server_process is not None]
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+        for process in processes:
+            process.join()
         return
 
 
@@ -484,6 +742,8 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
                                prefetch=args.prefetch,
                                prefetch_size=args.prefetch_size,
                                scheduler=args.scheduler,
+                               schedule_interval=args.schedule_interval,
+                               max_active_loras=args.max_active_loras,
                                profile=args.profile,
                                batch_num_adapters=args.batch_num_adapters,
                                enable_abort=args.enable_abort,
@@ -499,9 +759,20 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
                                enable_lowra=args.enable_lowra,
                                lowra_shared_prefix_len=args.lowra_shared_prefix_len,
                                lowra_wait_slo_ms=args.lowra_wait_slo_ms,
+                               lowra_prefix_mode=args.lowra_prefix_mode,
+                               lowra_reconstruction_kernel=args.lowra_reconstruction_kernel,
+                               lowra_reconstruction_workers=args.lowra_reconstruction_workers,
+                               lowra_workspace_loras=args.lowra_workspace_loras,
+                               lowra_retain_layers=args.lowra_retain_layers,
+                               lowra_retain_top_k=args.lowra_retain_top_k,
+                               lowra_pin_hot_adapters=args.lowra_pin_hot_adapters,
+                               nccl_port=args.nccl_port,
                               )
 
     try:
+        if args.model_seed is not None:
+            from slora.utils.infer_utils import set_random_seed
+            set_random_seed(args.model_seed)
         router = RouterManager(
             args.model_dir,
             args.lora_dirs,
@@ -518,6 +789,13 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
         )
     
         asyncio.run(router.wait_to_model_ready())
+        if args.lowra_runtime_stats_path:
+            directory = os.path.dirname(os.path.abspath(args.lowra_runtime_stats_path))
+            os.makedirs(directory, exist_ok=True)
+            router.runtime_stats_file = open(args.lowra_runtime_stats_path, "a", buffering=1)
+            router.runtime_stats_interval = args.lowra_runtime_stats_interval
+            cycle_path = os.path.splitext(args.lowra_runtime_stats_path)[0] + ".cycles.jsonl"
+            router.service_cycles = ServiceCycleRecorder(open(cycle_path, "a", buffering=1))
         if input_params.profile:
             asyncio.run(router.profile_prefill())
         if input_params.scheduler == "pets" and input_params.profile:

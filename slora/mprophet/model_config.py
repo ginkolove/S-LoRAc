@@ -59,6 +59,12 @@ class ModelConfig:
                 self.n_head=40
                 self.hidden_size=5120
                 self.ffn_embed_dim=13824
+            elif "llama-30b" in name.lower() and "llama-30b-m" not in name.lower():
+                self.max_seq_len=2048
+                self.num_hidden_layers=60
+                self.n_head=52
+                self.hidden_size=6656
+                self.ffn_embed_dim=17920
             elif "llama-30b-m" in name.lower():
                 # Parameters are modified to fit the requirements of custom kernels.
                 # Not the official parameters.
@@ -119,6 +125,8 @@ def get_config_json(name):
         config = {"architectures": ["LLaMAForCausalLM"], "bos_token_id": 0, "eos_token_id": 1, "hidden_act": "silu", "hidden_size": 4096, "intermediate_size": 11008, "initializer_range": 0.02, "max_sequence_length": 2048, "model_type": "llama", "num_attention_heads": 32, "num_hidden_layers": 32, "pad_token_id": -1, "rms_norm_eps": 1e-06, "torch_dtype": "float16", "transformers_version": "4.27.0.dev0", "use_cache": True, "vocab_size": 32000}
     elif "llama-13b" in name.lower():
         config = {"architectures": ["LLaMAForCausalLM"], "bos_token_id": 0, "eos_token_id": 1, "hidden_act": "silu", "hidden_size": 5120, "intermediate_size": 13824, "initializer_range": 0.02, "max_sequence_length": 2048, "model_type": "llama", "num_attention_heads": 40, "num_hidden_layers": 40, "pad_token_id": -1, "rms_norm_eps": 1e-06, "torch_dtype": "float16", "transformers_version": "4.27.0.dev0", "use_cache": True, "vocab_size": 32000}
+    elif "llama-30b" in name.lower() and "llama-30b-m" not in name.lower():
+        config = {"architectures": ["LLaMAForCausalLM"], "bos_token_id": 1, "eos_token_id": 2, "hidden_act": "silu", "hidden_size": 6656, "intermediate_size": 17920, "initializer_range": 0.02, "max_sequence_length": 2048, "model_type": "llama", "num_attention_heads": 52, "num_hidden_layers": 60, "pad_token_id": 0, "rms_norm_eps": 1e-06, "torch_dtype": "float16", "transformers_version": "4.28.0.dev0", "use_cache": True, "vocab_size": 32000}
     elif "llama-30b-m" in name.lower():
         # Parameters are modified to fit the requirements of custom kernels.
         # Not the official parameters.

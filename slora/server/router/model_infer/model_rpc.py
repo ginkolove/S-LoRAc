@@ -23,7 +23,14 @@ from slora.models.peft.lora_single_batch_infer import LoraPEFTBatchInfer
 from slora.models.bmm.lora_bmm_infer import LoraBmmInfer
 from slora.server.router.model_infer.infer_adapter import InferAdapter
 from slora.server.router.model_infer.naive_infer_adapter import NaiveInferAdapter
-from slora.common.lowra_static import LowRAPrefixKVCache, LowRAStaticPrefixStore
+from slora.common.lowra_static import LowRAStaticPrefixStore
+from slora.common.lowra_layer_runtime import LowRALayerRuntime, profile_interval
+from slora.common.full_reprefill import (
+    FULL_REPREFILL_MODES, FULL_PREFIX_CACHE_MODES, FullPrefixKVCache, FullReprefillRuntime,
+)
+from slora.common.full_reconstruct import FullReconstructPrefixKVCache, FullReconstructRuntime
+from slora.common.lowra_retained import RetainedPrefixKVCache, RetainedLayerRuntime
+from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, normalize_prefix_mode
 from slora.utils.infer_utils import set_random_seed
 from slora.utils.infer_utils import calculate_time, mark_start, mark_end
 from slora.utils.model_utils import get_model_config
@@ -47,8 +54,11 @@ class ModelRpcServer(rpyc.Service):
         self.load_way = load_way
         self.mode = mode
         self.input_params = input_params
+        self.input_params.lowra_prefix_mode = normalize_prefix_mode(
+            getattr(input_params, "lowra_prefix_mode", FULL_REPREFILL))
         self.prefetch_stream = prefetch_stream
         self.lowra_prefix_cache = None
+        self.lowra_runtime = None
 
         if input_params.enable_lowra and (
             input_params.bmm or input_params.no_kernel or input_params.no_lora or input_params.scheduler == "peft"
@@ -57,10 +67,23 @@ class ModelRpcServer(rpyc.Service):
 
         self.cache = {}
 
-        dist.init_process_group('nccl', init_method=f'tcp://127.0.0.1:{setting["nccl_port"]}', rank=rank_id, world_size=world_size)
+        # Spawned workers must restore the length used by InferBatch's location table.
+        max_req_total_len = int(input_params.max_req_total_len)
+        if max_req_total_len <= 0:
+            raise ValueError("max_req_total_len must be positive")
+        setting["max_req_total_len"] = max_req_total_len
+
+        # Spawned workers re-import module globals, so carry the port in RPC config.
+        nccl_port = getattr(input_params, "nccl_port", setting["nccl_port"])
+        dist.init_process_group('nccl', init_method=f'tcp://127.0.0.1:{nccl_port}', rank=rank_id, world_size=world_size)
         torch.cuda.set_device(rank_id)
 
         model_cfg = get_model_config(weight_dir, dummy=input_params.dummy)
+        if input_params.enable_lowra:
+            if mode or input_params.no_lora_compute or input_params.no_lora_swap:
+                raise ValueError("LowRA profiling requires FP16 unified paging with real adapter computation")
+            if model_cfg.get("num_key_value_heads", model_cfg["num_attention_heads"]) != model_cfg["num_attention_heads"]:
+                raise ValueError("the current S-LoRA adapter packing supports MHA models only")
 
         try:
             self.model_type = model_cfg["model_type"]
@@ -70,14 +93,18 @@ class ModelRpcServer(rpyc.Service):
                                                     max_total_token_num,
                                                     mem_adapter_size=input_params.pool_size_lora,
                                                     load_way=load_way, mode=mode,
-                                                    dummy=input_params.dummy)
+                                                    dummy=input_params.dummy,
+                                                    dynamic_layer_workspace=(input_params.enable_lowra
+                                                                             and input_params.lowra_prefix_mode not in FULL_PREFIX_CACHE_MODES))
                     
                 else:
                     self.model = LlamaTpPartModel(rank_id, world_size, weight_dir,
                                                     max_total_token_num,
                                                     mem_adapter_size=input_params.pool_size_lora,
                                                     load_way=load_way, mode=mode,
-                                                    dummy=input_params.dummy)
+                                                    dummy=input_params.dummy,
+                                                    dynamic_layer_workspace=(input_params.enable_lowra
+                                                                             and input_params.lowra_prefix_mode not in FULL_PREFIX_CACHE_MODES))
             else:
                 raise Exception(f"can not support {self.model_type} now")
         except Exception as e:
@@ -112,6 +139,16 @@ class ModelRpcServer(rpyc.Service):
         ''' finish init adapters '''
 
         if input_params.enable_lowra and input_params.lowra_shared_prefix_len > 0:
+            if input_params.lowra_prefix_mode in FULL_REPREFILL_MODES:
+                self.lowra_prefix_cache = FullPrefixKVCache(
+                    input_params.lowra_shared_prefix_len, self.model.mem_manager)
+                self.lowra_runtime = FullReprefillRuntime(
+                    input_params.lowra_shared_prefix_len, self.model.mem_manager,
+                    self.lowra_prefix_cache)
+                print("Full-reprefill initialized: prefix_len=%s, static_token_equiv=0" %
+                      input_params.lowra_shared_prefix_len)
+                set_random_seed(2147483647)
+                return
             lora_rank_map = {
                 adapter.lora_dir: adapter.r
                 for adapter in self.adapters
@@ -126,7 +163,37 @@ class ModelRpcServer(rpyc.Service):
                 tp_v_head_num=self.model.tp_v_head_num_,
                 head_dim=self.model.head_dim_,
             )
-            self.lowra_prefix_cache = LowRAPrefixKVCache(static_store, self.model.mem_manager)
+            static_store.bind_key_rope(
+                self.model._cos_cached[:static_store.prefix_len],
+                self.model._sin_cached[:static_store.prefix_len])
+            if input_params.lowra_prefix_mode == FULL_RECONSTRUCT:
+                self.lowra_prefix_cache = FullReconstructPrefixKVCache(
+                    static_store.prefix_len, self.model.mem_manager,
+                    pinned_lora_dirs=list(lora_rank_map)[:getattr(input_params, "lowra_pin_hot_adapters", 0)])
+                self.lowra_runtime = FullReconstructRuntime(
+                    static_store, self.model.mem_manager, self.lowra_prefix_cache)
+            elif input_params.lowra_prefix_mode == LAYER_RETAINED:
+                self.lowra_prefix_cache = RetainedPrefixKVCache(
+                    static_store.prefix_len, input_params.lowra_retain_layers, self.model.mem_manager,
+                    retain_top_k=getattr(input_params, "lowra_retain_top_k", None),
+                    pinned_lora_dirs=list(lora_rank_map)[:getattr(input_params, "lowra_pin_hot_adapters", 0)])
+                self.lowra_runtime = RetainedLayerRuntime(
+                    static_store, self.model.mem_manager, self.lowra_prefix_cache,
+                    workspace_lora_limit=input_params.lowra_workspace_loras,
+                    reconstruction_kernel=getattr(input_params, "lowra_reconstruction_kernel", "auto"),
+                    reconstruction_workers=getattr(input_params, "lowra_reconstruction_workers", None))
+                print("LowRA reconstruction: mode=%s kernel=%s workers=%s" % (
+                    input_params.lowra_prefix_mode, self.lowra_runtime.reconstruction_kernel,
+                    self.lowra_runtime.reconstruction_workers or "12*SMs (when bounded)"), flush=True)
+            else:
+                self.lowra_runtime = LowRALayerRuntime(static_store, self.model.mem_manager,
+                                                      input_params.lowra_prefix_mode,
+                                                      workspace_lora_limit=input_params.lowra_workspace_loras,
+                                                      reconstruction_kernel=getattr(input_params, "lowra_reconstruction_kernel", "auto"),
+                                                      reconstruction_workers=getattr(input_params, "lowra_reconstruction_workers", None))
+                print("LowRA reconstruction: mode=%s kernel=%s workers=%s" % (
+                    input_params.lowra_prefix_mode, self.lowra_runtime.reconstruction_kernel,
+                    self.lowra_runtime.prefetch_workers or "12*SMs (when bounded)"), flush=True)
             print(
                 f"LowRA static store initialized: prefix_len={static_store.prefix_len}, "
                 f"total_rank={static_store.total_rank}, "
@@ -177,6 +244,10 @@ class ModelRpcServer(rpyc.Service):
             return
         self.lowra_prefix_cache.evict_many(lora_dirs)
 
+    def exposed_lowra_runtime_stats(self):
+        from slora.common.lowra_runtime_stats import snapshot
+        return snapshot(self)
+
     def exposed_reset_lowra_runtime(self):
         stats = {
             "free_slots_before": self.model.mem_manager.can_use_mem_size,
@@ -191,6 +262,8 @@ class ModelRpcServer(rpyc.Service):
         self.model.mem_manager.free_all()
         if self.lowra_prefix_cache is not None:
             stats["prefix_cache_after"] = self.lowra_prefix_cache.state_dict()
+            self.lowra_prefix_cache.reset_access_stats()
+        torch.cuda.reset_peak_memory_stats()
         stats["free_slots_after"] = self.model.mem_manager.can_use_mem_size
         return stats
 
@@ -205,25 +278,42 @@ class ModelRpcServer(rpyc.Service):
         else:
             assert False, "error dtype"
         batch_data = InferBatch.init_batch(batch_id, reqs, dtype, torch.cuda.current_device(), self.model.mem_manager, self.model.vocab_size)
+        if self.lowra_runtime is not None:
+            batch_data.lowra_prefix_len = (self.lowra_runtime.prefix_len
+                                           if isinstance(self.lowra_runtime, FullReprefillRuntime)
+                                           else self.lowra_runtime.static_store.prefix_len)
         if self.lowra_prefix_cache is not None:
-            batch_data.lowra_prefix_indices_by_dir = self.lowra_prefix_cache.acquire_many(
-                batch_data.adapter_dirs,
-                infer_adapter=self.infer_adapter,
-            )
-            batch_data.lowra_prefix_len = self.lowra_prefix_cache.static_store.prefix_len
-            prefix_len = self.lowra_prefix_cache.static_store.prefix_len
-            batch_data.lowra_prefix_b_loc = torch.empty(
-                (len(batch_data), prefix_len),
-                dtype=torch.long,
-                device="cuda",
-            )
-            for i, adapter_dir in enumerate(batch_data.adapter_dirs):
-                if adapter_dir is None:
-                    batch_data.lowra_prefix_b_loc[i].fill_(-1)
-                else:
-                    batch_data.lowra_prefix_b_loc[i] = batch_data.lowra_prefix_indices_by_dir[adapter_dir]
+            if isinstance(self.lowra_runtime, FullReconstructRuntime):
+                self.lowra_runtime.acquire_many(reqs, self.infer_adapter)
+            elif isinstance(self.lowra_prefix_cache, FullPrefixKVCache):
+                self.lowra_prefix_cache.acquire_many(reqs, self._prefill_full_prefixes)
+            else:
+                self.lowra_prefix_cache.acquire_many(
+                    batch_data.adapter_dirs,
+                    infer_adapter=self.infer_adapter,
+                )
         self.cache[batch_id] = batch_data
         return
+
+    @torch.no_grad()
+    def _prefill_full_prefixes(self, lora_dirs, prefix_ids, prefix_indices):
+        requests = [dict(request_id="prefix-%s" % index, adapter_dir=directory,
+                         input_id=list(prefix_ids), sampling_param={})
+                    for index, directory in enumerate(lora_dirs)]
+        prefix_batch = InferBatch.init_batch(
+            "full-prefix-build", requests, torch.float16, torch.cuda.current_device(),
+            self.model.mem_manager, self.model.vocab_size)
+        adapters = [self.adapters[self.adapter_id[directory]] for directory in lora_dirs]
+        engine = LoraUnorderedBatchInfer(self.model, adapters, infer_adapter=self.infer_adapter)
+        # Cache owns these slots from the start; prefill must not allocate a second copy.
+        with profile_interval(self.lowra_runtime.profiler, "prefix_prefill", -1):
+            engine.forward(
+                batch_size=len(prefix_batch), total_token_num=prefix_batch.nopad_total_token_num,
+                max_len_in_batch=prefix_batch.nopad_max_len_in_batch, input_ids=prefix_batch.input_ids,
+                b_loc=prefix_batch.nopad_b_loc, b_start_loc=prefix_batch.nopad_b_start_loc,
+                b_seq_len=prefix_batch.nopad_b_seq_len, is_prefill=True,
+                prefill_mem_index=torch.cat([prefix_indices[directory] for directory in lora_dirs]),
+                return_logits=False)
     
     # @calculate_time(show=True, min_cost_ms=300)
     # @calculate_time(show=True, min_cost_ms=0)
@@ -247,24 +337,6 @@ class ModelRpcServer(rpyc.Service):
                 req["adapter_dir"] for req in batch.requests if req["request_id"] not in keep_ids
             )
         filter_batch = batch.filter(req_id_list)
-        if self.lowra_prefix_cache is not None:
-            filter_batch.lowra_prefix_indices_by_dir = {
-                lora_dir: entry.prefix_indices
-                for lora_dir, entry in self.lowra_prefix_cache.entries.items()
-                if lora_dir in filter_batch.adapter_dirs
-            }
-            filter_batch.lowra_prefix_len = self.lowra_prefix_cache.static_store.prefix_len
-            prefix_len = self.lowra_prefix_cache.static_store.prefix_len
-            filter_batch.lowra_prefix_b_loc = torch.empty(
-                (len(filter_batch), prefix_len),
-                dtype=torch.long,
-                device="cuda",
-            )
-            for i, adapter_dir in enumerate(filter_batch.adapter_dirs):
-                if adapter_dir is None:
-                    filter_batch.lowra_prefix_b_loc[i].fill_(-1)
-                else:
-                    filter_batch.lowra_prefix_b_loc[i] = filter_batch.lowra_prefix_indices_by_dir[adapter_dir]
         del batch
         self.cache[batch_id] = filter_batch
         return
@@ -274,22 +346,6 @@ class ModelRpcServer(rpyc.Service):
         batch1 = self.cache.pop(batch_id1)
         batch2 = self.cache.pop(batch_id2)
         m_batch = InferBatch.merge(batch1, batch2)
-        if self.lowra_prefix_cache is not None:
-            m_batch.lowra_prefix_indices_by_dir = {}
-            for batch in (batch1, batch2):
-                m_batch.lowra_prefix_indices_by_dir.update(getattr(batch, "lowra_prefix_indices_by_dir", {}))
-            m_batch.lowra_prefix_len = self.lowra_prefix_cache.static_store.prefix_len
-            prefix_len = self.lowra_prefix_cache.static_store.prefix_len
-            m_batch.lowra_prefix_b_loc = torch.empty(
-                (len(m_batch), prefix_len),
-                dtype=torch.long,
-                device="cuda",
-            )
-            for i, adapter_dir in enumerate(m_batch.adapter_dirs):
-                if adapter_dir is None:
-                    m_batch.lowra_prefix_b_loc[i].fill_(-1)
-                else:
-                    m_batch.lowra_prefix_b_loc[i] = m_batch.lowra_prefix_indices_by_dir[adapter_dir]
         del batch1
         del batch2
         self.cache[batch_id1] = m_batch
@@ -349,12 +405,25 @@ class ModelRpcServer(rpyc.Service):
             else:
                 engine = LoraUnorderedBatchInfer(self.model, adapters, infer_adapter=self.infer_adapter)
             kwargs["no_lora_compute"] = self.input_params.no_lora_compute
-            if is_prefill and self.lowra_prefix_cache is not None and isinstance(engine, LoraUnorderedBatchInfer):
-                kwargs["lowra_prefix_b_loc"] = batch.lowra_prefix_b_loc
-                kwargs["lowra_prefix_len"] = batch.lowra_prefix_len
+            if self.lowra_runtime is not None:
+                prefix_by_dir = ({directory: entry.prefix_indices
+                                  for directory, entry in self.lowra_prefix_cache.entries.items()}
+                                 if self.lowra_prefix_cache is not None else None)
+                frame = self.lowra_runtime.prepare(
+                    batch.adapter_dirs, self.infer_adapter, prefix_by_dir,
+                    reserve_tokens=batch.nopad_total_token_num if is_prefill else len(batch))
+                kwargs["lowra_frame"] = frame
+                if is_prefill:
+                    kwargs["lowra_prefix_b_loc"] = frame.prefix_index_table(0)
+                    kwargs["lowra_prefix_len"] = batch.lowra_prefix_len
             # kwargs["no_lora_copy"] = self.input_params.no_lora_copy 
 
-        logits = engine.forward(**kwargs)
+        try:
+            logits = engine.forward(**kwargs)
+        finally:
+            frame = kwargs.get("lowra_frame")
+            if frame is not None:
+                frame.finish()
         next_token_ids, next_token_probs = sample(logits, batch)
         next_token_ids = next_token_ids.detach().cpu().numpy()
         next_token_logprobs = torch.log(next_token_probs).detach().cpu().numpy()
@@ -373,8 +442,7 @@ class ModelRpcServer(rpyc.Service):
                 'logprob': float(next_token_logprob),
             }
             output_dict[r['request_id']] = (int(next_token_id), metadata)
-        if is_prefill and self.lowra_prefix_cache is not None:
-            self._expand_batch_for_lowra_prefix(batch)
+        # b_loc always owns private query/decode KV only; prefix addresses are per-forward.
 
         batch.input_ids = torch.tensor(new_input_ids, dtype=torch.long).cuda()
         batch.nopad_b_start_loc = batch.nopad_b_start_loc + torch.arange(0, len(batch), dtype=torch.int32, device="cuda")
@@ -383,36 +451,6 @@ class ModelRpcServer(rpyc.Service):
         batch.nopad_b_seq_len += 1
         self.cache[batch.batch_id] = batch
         return output_dict
-
-    @torch.no_grad()
-    def _expand_batch_for_lowra_prefix(self, batch: InferBatch):
-        prefix_len = batch.lowra_prefix_len
-        if prefix_len <= 0:
-            return
-
-        query_b_seq_len = batch.nopad_b_seq_len.clone()
-        query_max_len = batch.nopad_max_len_in_batch
-        full_b_seq_len = query_b_seq_len + prefix_len
-        full_max_len = query_max_len + prefix_len
-
-        new_b_loc = torch.empty_like(batch.nopad_b_loc)
-        new_b_start_loc = torch.zeros_like(batch.nopad_b_start_loc)
-        new_b_start_loc[1:] = torch.cumsum(full_b_seq_len, dim=0, dtype=torch.int32)[:-1]
-
-        for i in range(len(batch)):
-            query_len = int(query_b_seq_len[i].item())
-            seq_start = full_max_len - int(full_b_seq_len[i].item())
-            old_query_start = query_max_len - query_len
-            new_b_loc[i, seq_start: seq_start + prefix_len] = batch.lowra_prefix_b_loc[i]
-            new_b_loc[i, seq_start + prefix_len: seq_start + prefix_len + query_len] = (
-                batch.nopad_b_loc[i, old_query_start: old_query_start + query_len]
-            )
-
-        batch.nopad_b_loc = new_b_loc
-        batch.nopad_b_start_loc = new_b_start_loc
-        batch.nopad_b_seq_len = full_b_seq_len
-        batch.nopad_total_token_num += len(batch) * prefix_len
-        batch.nopad_max_len_in_batch = full_max_len
 
     def _profile_adapter_prefill(self, adapter, batch_size, max_input_len):
         engine = LoraUnorderedBatchInfer(self.model, [adapter]*batch_size, infer_adapter=self.infer_adapter)
@@ -542,8 +580,8 @@ class ModelRpcClient:
                     return ans.value
                 return _func
             self._init_model = async_wrap(self.model.init_model)
-            self._load_adapters = rpyc.async_(self.model.load_adapters)
-            self._offload_adapters = rpyc.async_(self.model.offload_adapters)
+            self._load_adapters = async_wrap(self.model.load_adapters)
+            self._offload_adapters = async_wrap(self.model.offload_adapters)
             self._unmerge_adapter = rpyc.async_(self.model.unmerge_adapter)
             self._merge_adapter = rpyc.async_(self.model.merge_adapter)
             self._add_batch = async_wrap(self.model.add_batch)
@@ -556,6 +594,7 @@ class ModelRpcClient:
             self._lowra_prefix_cache_state = async_wrap(self.model.lowra_prefix_cache_state)
             self._evict_lowra_prefixes = async_wrap(self.model.evict_lowra_prefixes)
             self._reset_lowra_runtime = async_wrap(self.model.reset_lowra_runtime)
+            self._lowra_runtime_stats = async_wrap(self.model.lowra_runtime_stats)
         else:
             self._init_model = self.model.exposed_init_model
             self._load_adapters = self.model.exposed_load_adapters
@@ -572,6 +611,7 @@ class ModelRpcClient:
             self._lowra_prefix_cache_state = self.model.exposed_lowra_prefix_cache_state
             self._evict_lowra_prefixes = self.model.exposed_evict_lowra_prefixes
             self._reset_lowra_runtime = self.model.exposed_reset_lowra_runtime
+            self._lowra_runtime_stats = self.model.exposed_lowra_runtime_stats
         return
 
     async def init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
@@ -588,11 +628,15 @@ class ModelRpcClient:
 
 
     async def load_adapters(self, reqs, prefetch=False):
-        self._load_adapters(reqs, prefetch=prefetch)
+        ans = self._load_adapters(reqs, prefetch=prefetch)
+        if self.use_rpc:
+            await ans
 
 
     async def offload_adapters(self, reserved_reqs=None, prefetch=False):
-        self._offload_adapters(reserved_reqs, prefetch=prefetch)
+        ans = self._offload_adapters(reserved_reqs, prefetch=prefetch)
+        if self.use_rpc:
+            await ans
     
     async def unmerge_adapter(self):
         self._unmerge_adapter()
@@ -672,6 +716,10 @@ class ModelRpcClient:
             return await ans
         else:
             return ans
+
+    async def lowra_runtime_stats(self):
+        ans = self._lowra_runtime_stats()
+        return await ans if self.use_rpc else ans
 
 
 def _init_env(port):

@@ -53,6 +53,15 @@ class LoRAConfig:
                     "v_proj",
                     "o_proj",
                     ]
+        elif "dummy-lora-30b-rank" in name:
+            self.base_model = None
+            self.rank = int(re.search(r'rank-(\d+)', name).group(1))
+            self.target_modules = [
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    ]
         else:
             raise NotImplementedError
 
@@ -126,6 +135,26 @@ def get_lora_config_json(name):
                  }
     elif "dummy-lora-13b-rank-" in name:
         config = {"base_model_name_or_path": "meta-llama/Llama-2-13b-hf",
+                  "bias": "none",
+                  "enable_lora": None,
+                  "fan_in_fan_out": False,
+                  "inference_mode": True,
+                  "lora_alpha": 16,
+                  "lora_dropout": 0.1,
+                  "merge_weights": False,
+                  "modules_to_save": None,
+                  "peft_type": "LORA",
+                  "r": int(re.search(r'rank-(\d+)', name).group(1)),
+                  "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj"
+                  ],
+                  "task_type": "CAUSAL_LM"
+                 }
+    elif "dummy-lora-30b-rank-" in name:
+        config = {"base_model_name_or_path": "huggyllama/llama-30b",
                   "bias": "none",
                   "enable_lora": None,
                   "fan_in_fan_out": False,

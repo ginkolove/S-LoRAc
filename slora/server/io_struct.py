@@ -15,21 +15,27 @@ class Req:
         self.lowra_shared_prefix_len = int(lowra_lengths.get("shared_prefix_len", 0))
         self.lowra_query_len = int(lowra_lengths.get("query_len", self.input_len))
         self.lowra_decode_len = int(lowra_lengths.get("decode_len", self.max_output_len))
+        self.prefix_input_ids = lowra_lengths.get("prefix_input_ids")
         self.sample_params = sample_params
         self.output_ids = []
         self.output_metadata_list = []
         self.has_generate_finished = False
         self.aborted = False
         self.arrival_time = time.time()
+        self.preemptions = 0
 
     def to_rpc_obj(self):
         return {"adapter_dir": self.adapter_dir,
                 "request_id": self.request_id,
-                "input_id": self.prompt_ids,
+                # Recompute uses the immutable prompt plus already emitted tokens.
+                # Always copy: single-rank RPC shares Python objects with the router.
+                "input_id": list(self.prompt_ids) + list(self.output_ids),
+                "generated_ids": list(self.output_ids),
                 "output_len": self.max_output_len,
                 "lowra_shared_prefix_len": self.lowra_shared_prefix_len,
                 "lowra_query_len": self.lowra_query_len,
                 "lowra_decode_len": self.lowra_decode_len,
+                "prefix_input_ids": self.prefix_input_ids,
                 "sampling_param": self.sample_params.to_dict() }
 
     def to_req_detokenization_state(self):

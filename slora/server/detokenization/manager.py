@@ -60,6 +60,8 @@ class DeTokenizationManager:
                             continue
                         req_out:ReqDetokenizationState = self.req_id_to_out[req_id]
                         req_out.output_ids.append(new_token_id)
+                        new_gen_metadata = dict(new_gen_metadata,
+                                                count_output_tokens=len(req_out.output_ids))
                         req_out.gen_metadata.update(new_gen_metadata)
                         out_text = decode_token(self.tokenizer, req_out, new_token_id, skip_special_tokens=True)
                         if out_text.endswith(u'\ufffd'):

@@ -10,3 +10,5 @@ dist
 *.json
 *.jsonl
 *.pdf
+/benchmarks/results/
+/try/results/

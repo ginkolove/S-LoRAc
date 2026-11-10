@@ -184,7 +184,7 @@ class InferAdapter:
 
     # @calculate_time(show=True, min_cost_ms=0)
     def offload_adapters(self, reserve_adapter_dirs):
-        if len(reserve_adapter_dirs) == len(self.adapter_dirs):
+        if set(self.adapter_dirs).issubset(reserve_adapter_dirs):
             print(f"offload 0 adapters, {len(self.adapter_dirs)} remains")
             return
         if len(reserve_adapter_dirs) == 0:

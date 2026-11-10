@@ -55,6 +55,7 @@ from .api_models import (
 
 from slora.mprophet.measure import ModelProphet
 from slora.mprophet.lora_stats import LoRAProphet
+from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, normalize_prefix_mode
 
 
 GB = 1024 ** 3
@@ -212,6 +213,8 @@ async def generate_stream(request: Request) -> Response:
                 },
                 "generated_text": None,
                 "finished": finished,
+                "count_output_tokens": metadata.get("count_output_tokens"),
+                "prompt_tokens": metadata.get("prompt_tokens"),
                 "details": None
             }
 
@@ -399,6 +402,10 @@ def main():
                         help="the max value for req_input_len + req_output_len")
     parser.add_argument("--nccl_port", type=int, default=28765,
                         help="the nccl_port to build a distributed environment for PyTorch")
+    parser.add_argument("--internal-port-start", type=int, default=10000,
+                        help="Start of internal ZMQ/RPC port search; separate concurrent servers.")
+    parser.add_argument("--model-seed", type=int, default=None,
+                        help="Optional deterministic seed before dummy model/adapter initialization.")
     parser.add_argument("--mode", type=str, default=[], nargs='+',
                         help="Model mode: [int8kv] [int8weight | int4weight]")
     parser.add_argument("--trust_remote_code", action='store_true',
@@ -418,6 +425,10 @@ def main():
     parser.add_argument("--prefetch", action="store_true")
     parser.add_argument("--prefetch-size", type=int, default=0)
     parser.add_argument("--scheduler", type=str, default="slora")
+    parser.add_argument("--schedule-interval", type=int, default=1,
+                        help="online: try admitting waiting requests after this many decode steps.")
+    parser.add_argument("--max-active-loras", type=int, default=None,
+                        help="online: cap distinct running adapters; skip incompatible waiting requests.")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--batch-num-adapters", type=int, default=None)
     parser.add_argument("--enable-abort", action="store_true")
@@ -432,11 +443,40 @@ def main():
     parser.add_argument("--no-lora", action="store_true")
     parser.add_argument("--enable-lowra", action="store_true")
     parser.add_argument("--lowra-shared-prefix-len", type=int, default=0)
+    parser.add_argument("--lowra-prefix-mode", type=normalize_prefix_mode, choices=PREFIX_MODES,
+                        default=FULL_REPREFILL, help="full-reprefill: prefix prefill + LRU; minikv-full_reconstruct: complete MiniKV reconstruction + LRU; minikv-layer_serial: per-forward layer reconstruction; minikv-layer_retained: retain first K layers per active adapter and reconstruct the rest. Legacy names are accepted.")
+    parser.add_argument("--lowra-workspace-loras", type=int, default=None,
+                        help="Optional active unique-LoRA limit for layer modes; no memory is preallocated.")
+    parser.add_argument("--lowra-reconstruction-kernel", choices=("auto", "bounded"), default="auto",
+                        help="bounded: use the same optimized kernel in serial, prefetch and retained layer modes.")
+    parser.add_argument("--lowra-reconstruction-workers", type=int, default=None,
+                        help="Worker blocks for bounded reconstruction; default is 12 times device SM count.")
+    parser.add_argument("--lowra-retain-top-k", type=int, default=None,
+                        help="Retain only the top K active adapters by request count; omitted means all.")
+    parser.add_argument("--lowra-pin-hot-adapters", type=int, default=0,
+                        help="Keep the first N configured adapters' prefix KV until runtime reset, after first use.")
+    parser.add_argument("--lowra-retain-layers", type=int, default=0,
+                        help="minikv-layer_retained: keep the first K layers per active adapter; 0..model layers.")
+    parser.add_argument("--lowra-runtime-stats-path", type=str, default=None,
+                        help="Optional low-frequency JSONL runtime snapshots, without CUDA profiling.")
+    parser.add_argument("--lowra-runtime-stats-interval", type=float, default=1.0)
     parser.add_argument("--lowra-wait-slo-ms", type=float, default=0.0,
                         help="LowRA waiting-queue SLO in milliseconds. 0 disables deadline promotion.")
     ''' end of slora arguments '''
 
     args = parser.parse_args()
+    if args.lowra_reconstruction_kernel == "bounded" and (
+            not args.enable_lowra or args.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED)):
+        parser.error("bounded reconstruction requires enable-lowra and a layer mode")
+    if args.lowra_reconstruction_workers is not None and (
+            args.lowra_reconstruction_kernel != "bounded" or args.lowra_reconstruction_workers <= 0):
+        parser.error("lowra-reconstruction-workers requires bounded and a positive integer")
+    if not 1024 <= args.internal_port_start <= 65530:
+        parser.error("internal-port-start must be between 1024 and 65530")
+    if args.lowra_runtime_stats_interval <= 0:
+        parser.error("lowra-runtime-stats-interval must be positive")
+    if args.lowra_runtime_stats_path and not args.enable_lowra:
+        parser.error("lowra-runtime-stats-path requires enable-lowra")
 
     assert args.max_req_input_len < args.max_req_total_len
     setting["max_req_total_len"] = args.max_req_total_len
@@ -452,7 +492,8 @@ def main():
         ), "batch_max_tokens must >= max_req_total_len"
 
     can_use_ports = alloc_can_use_network_port(
-        num=3 + args.tp, used_nccl_port=args.nccl_port
+        num=3 + args.tp, used_nccl_port=args.nccl_port,
+        port_start=args.internal_port_start, used_ports=(args.port,)
     )
     router_port, detokenization_port, httpserver_port = can_use_ports[0:3]
     model_rpc_ports = can_use_ports[3:]
@@ -470,6 +511,8 @@ def main():
         dummy=args.dummy,
         enable_lowra=args.enable_lowra,
         lowra_shared_prefix_len=args.lowra_shared_prefix_len,
+        lowra_prefix_mode=args.lowra_prefix_mode,
+        scheduler=args.scheduler,
     )
     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)

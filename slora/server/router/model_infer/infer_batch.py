@@ -57,6 +57,8 @@ class InferBatch:
     mem_manager: MemoryManager
 
     adapter_dirs: List[str]
+    lowra_prefix_len: int = 0
+    lowra_private_only: bool = True
 
     @classmethod
     @torch.no_grad()
@@ -83,15 +85,16 @@ class InferBatch:
             # request id -> idx in list mapping
             requests_idx_mapping[r['request_id']] = i
 
-            tokenized_input = r['input_id']
+            tokenized_input = list(r['input_id'])
 
             input_length = len(tokenized_input)
             input_lengths.append(input_length)
             all_input_ids.append(tokenized_input)
-            out_token_id_counts.append(collections.defaultdict(int))
+            out_token_id_counts.append(collections.defaultdict(
+                int, collections.Counter(r.get("generated_ids", ()))))
 
             # postprocessor
-            sampling_param = r["sampling_param"]
+            sampling_param = dict(r["sampling_param"])
             sampling_param["vocab_size"] = vocab_size
             sampling_param_list.append(InferSamplingParams(**sampling_param))
             
@@ -144,7 +147,7 @@ class InferBatch:
         start = self.nopad_max_len_in_batch - seq_len
         end = self.nopad_max_len_in_batch - 1
         prefix_len = int(getattr(self, "lowra_prefix_len", 0))
-        if prefix_len > 0:
+        if prefix_len > 0 and not self.lowra_private_only:
             start += prefix_len
         if start >= end:
             return self.nopad_b_loc[idx, 0:0]
@@ -236,6 +239,8 @@ class InferBatch:
             sampling_param_list=[self.sampling_param_list[_i] for _i in indices],
             mem_manager=self.mem_manager,
             adapter_dirs=adapter_dirs,
+            lowra_prefix_len=self.lowra_prefix_len,
+            lowra_private_only=self.lowra_private_only,
         )
 
 
@@ -304,6 +309,8 @@ class InferBatch:
             sampling_param_list=sampling_param_list,
             mem_manager=batches[0].mem_manager,
             adapter_dirs=adapter_dirs,
+            lowra_prefix_len=max(batch1.lowra_prefix_len, batch2.lowra_prefix_len),
+            lowra_private_only=batch1.lowra_private_only and batch2.lowra_private_only,
         )
 
     def __len__(self):

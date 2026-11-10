@@ -2,8 +2,11 @@ import argparse
 import os
 import psutil
 import sys
+from pathlib import Path
 
 from exp_suite import BASE_MODEL, LORA_DIR
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, normalize_prefix_mode
 
 
 if __name__ == "__main__":
@@ -21,6 +24,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-req-total-len", type=int, default=None)
     parser.add_argument("--batch-max-tokens", type=int, default=None)
     parser.add_argument("--running-max-req-size", type=int, default=None)
+    parser.add_argument("--scheduler", default="slora")
+    parser.add_argument("--schedule-interval", type=int, default=1)
+    parser.add_argument("--max-active-loras", type=int, default=None)
 
     parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--no-lora-compute", action="store_true")
@@ -31,6 +37,14 @@ if __name__ == "__main__":
     parser.add_argument("--enable-abort", action="store_true")
     parser.add_argument("--enable-lowra", action="store_true")
     parser.add_argument("--lowra-shared-prefix-len", type=int, default=0)
+    parser.add_argument("--lowra-prefix-mode", type=normalize_prefix_mode,
+                        choices=PREFIX_MODES, default=FULL_REPREFILL)
+    parser.add_argument("--lowra-workspace-loras", type=int, default=None)
+    parser.add_argument("--lowra-reconstruction-kernel", choices=("auto", "bounded"), default="auto")
+    parser.add_argument("--lowra-reconstruction-workers", type=int, default=None)
+    parser.add_argument("--lowra-retain-layers", type=int, default=0)
+    parser.add_argument("--lowra-retain-top-k", type=int, default=None)
+    parser.add_argument("--lowra-pin-hot-adapters", type=int, default=0)
     parser.add_argument("--lowra-wait-slo-ms", type=float, default=0.0)
     parser.add_argument("--vllm-mem-ratio", type=float, default=0.95)
     parser.add_argument("--print-only", action="store_true")
@@ -56,6 +70,9 @@ if __name__ == "__main__":
         cmd = f"python -m slora.server.api_server --max_total_token_num {args.num_token}"
         cmd += f" --model_dir {base_model}"
         cmd += f" --tokenizer_mode auto"
+        cmd += f" --scheduler {args.scheduler} --schedule-interval {args.schedule_interval}"
+        if args.max_active_loras is not None:
+            cmd += f" --max-active-loras {args.max_active_loras}"
 
         loaded_adapters = 0
         num_iter = args.num_adapter // len(adapter_dirs) + 1
@@ -96,6 +113,17 @@ if __name__ == "__main__":
         if args.enable_lowra:
             cmd += " --enable-lowra"
             cmd += f" --lowra-shared-prefix-len {args.lowra_shared_prefix_len}"
+            cmd += f" --lowra-prefix-mode {args.lowra_prefix_mode}"
+            cmd += f" --lowra-reconstruction-kernel {args.lowra_reconstruction_kernel}"
+            if args.lowra_reconstruction_workers is not None:
+                cmd += f" --lowra-reconstruction-workers {args.lowra_reconstruction_workers}"
+            cmd += f" --lowra-retain-layers {args.lowra_retain_layers}"
+            if args.lowra_retain_top_k is not None:
+                cmd += f" --lowra-retain-top-k {args.lowra_retain_top_k}"
+            if args.lowra_pin_hot_adapters:
+                cmd += f" --lowra-pin-hot-adapters {args.lowra_pin_hot_adapters}"
+            if args.lowra_workspace_loras is not None:
+                cmd += f" --lowra-workspace-loras {args.lowra_workspace_loras}"
             if args.lowra_wait_slo_ms > 0:
                 cmd += f" --lowra-wait-slo-ms {args.lowra_wait_slo_ms}"
 

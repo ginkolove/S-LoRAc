@@ -6,6 +6,7 @@ from typing import Union
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 from ..tokenizer import get_tokenizer
+from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, normalize_prefix_mode
 from ..io_struct import BatchStrOut, AbortReq, BatchAbortReq, LowRAResetReq, LowRAResetAck
 
 
@@ -23,6 +24,8 @@ class HttpServerManager:
         dummy=False,
         enable_lowra=False,
         lowra_shared_prefix_len=0,
+        lowra_prefix_mode=FULL_REPREFILL,
+        scheduler="slora",
     ):
         context = zmq.asyncio.Context(2)
         self.send_to_router = context.socket(zmq.PUSH)
@@ -42,10 +45,15 @@ class HttpServerManager:
         self.reset_req_id_to_result = {}
 
         self.total_token_num = total_token_num
+        self.scheduler = scheduler
         self.max_req_input_len = max_req_input_len
         self.max_req_total_len = max_req_total_len
         self.enable_lowra = enable_lowra
         self.lowra_shared_prefix_len = lowra_shared_prefix_len
+        prefix_mode = normalize_prefix_mode(lowra_prefix_mode)
+        self.full_reprefill = prefix_mode == FULL_REPREFILL
+        self.full_reconstruct = prefix_mode == FULL_RECONSTRUCT
+        self.shared_prefix_ids = None
 
     async def generate(self, adapter_dir, prompt, sampling_params, request_id, lowra_lengths=None):
 
@@ -55,6 +63,11 @@ class HttpServerManager:
             prompt_ids = self.tokenizer.encode(prompt)
         explicit_lowra_lengths = lowra_lengths is not None
         lowra_lengths = dict(lowra_lengths or {})
+        prefix_ids = None
+        if self.enable_lowra and getattr(self, "full_reconstruct", False) and adapter_dir is None:
+            raise ValueError("full reconstruction requires a LoRA for every request")
+        if self.enable_lowra and self.full_reprefill and adapter_dir is None:
+            raise ValueError("full reprefill requires a LoRA for every request")
         if self.enable_lowra and adapter_dir is not None:
             if "shared_prefix_len" not in lowra_lengths:
                 lowra_lengths["shared_prefix_len"] = self.lowra_shared_prefix_len
@@ -64,6 +77,16 @@ class HttpServerManager:
                 )
         if self.enable_lowra and adapter_dir is not None:
             shared_prefix_len = lowra_lengths["shared_prefix_len"]
+            if getattr(self, "full_reconstruct", False):
+                lowra_lengths.setdefault("query_len", len(prompt_ids))
+            if self.full_reprefill:
+                query_len = int(lowra_lengths.get("query_len", len(prompt_ids) - shared_prefix_len))
+                if query_len <= 0 or len(prompt_ids) != shared_prefix_len + query_len:
+                    raise ValueError("full reprefill requires full [shared prefix + query] token input")
+                prefix_ids = tuple(prompt_ids[:shared_prefix_len])
+                if self.shared_prefix_ids is not None and prefix_ids != self.shared_prefix_ids:
+                    raise ValueError("all full-mode requests must use the same shared prefix")
+                lowra_lengths["prefix_input_ids"] = list(prefix_ids)
             explicit_query_len = "query_len" in lowra_lengths
             if explicit_query_len:
                 query_len = int(lowra_lengths["query_len"])
@@ -87,9 +110,14 @@ class HttpServerManager:
                     f"LowRA decode_len metadata {lowra_lengths['decode_len']} != max_new_tokens {sampling_params.max_new_tokens}"
                 )
         prompt_tokens = len(prompt_ids)
-        if prompt_tokens > self.max_req_input_len:
+        logical_input_tokens = prompt_tokens
+        if self.enable_lowra and self.full_reprefill and adapter_dir is not None:
+            logical_input_tokens += lowra_lengths["shared_prefix_len"]
+        elif self.enable_lowra and getattr(self, "full_reconstruct", False) and adapter_dir is not None:
+            logical_input_tokens += lowra_lengths["shared_prefix_len"]
+        if logical_input_tokens > self.max_req_input_len:
             raise ValueError(
-                f"the input prompt token len {prompt_tokens} is too long > {self.max_req_input_len}"
+                f"the input prompt token len {logical_input_tokens} is too long > {self.max_req_input_len}"
             )
         req_total_len = prompt_tokens + sampling_params.max_new_tokens
         if self.enable_lowra and adapter_dir is not None:
@@ -102,12 +130,14 @@ class HttpServerManager:
             raise ValueError(
                 f"the req token total len is too long > max_req_total_len:{self.max_req_total_len}"
             )
-        if req_total_len + 1 > self.total_token_num:
+        if getattr(self, "scheduler", "slora") != "online" and req_total_len + 1 > self.total_token_num:
             raise ValueError(
                 f"the req token total len + 1 is too long > max_total_token_num:{self.total_token_num}"
             )
         
         sampling_params.stop_sentences_to_token_ids(self.tokenizer)
+        if prefix_ids is not None:
+            self.shared_prefix_ids = prefix_ids
 
         self.send_to_router.send_pyobj((adapter_dir, prompt_ids, sampling_params, request_id, lowra_lengths))
         event = asyncio.Event()
@@ -125,7 +155,7 @@ class HttpServerManager:
             out_str, metadata, finished, _ = self.req_id_to_out_inf[request_id]
             if len(metadata) != 0:
                 self.req_id_to_out_inf[request_id] = ("", {}, finished, event)
-                metadata["prompt_tokens"] = prompt_tokens
+                metadata["prompt_tokens"] = logical_input_tokens
                 yield out_str, metadata, finished
             if finished:
                 try:
@@ -154,10 +184,13 @@ class HttpServerManager:
             return {"ok": False, "message": "Timed out waiting for LowRA runtime reset", "stats": {}}
         finally:
             self.reset_req_id_to_event.pop(request_id, None)
-        return self.reset_req_id_to_result.pop(
+        result = self.reset_req_id_to_result.pop(
             request_id,
             {"ok": False, "message": "LowRA runtime reset returned no result", "stats": {}},
         )
+        if result["ok"] and self.full_reprefill:
+            self.shared_prefix_ids = None
+        return result
 
     async def handle_loop(self):
         while True:

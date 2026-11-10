@@ -4,7 +4,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
-from slora.common.lowra_reconstruct import lowra_reconstruct_batched
+from slora.common.lowra_layer_runtime import (
+    prepare_reconstruction_metadata, reconstruct_prefix_layer, profile_interval,
+)
 
 
 @dataclass
@@ -54,6 +56,8 @@ class LowRAStaticPrefixStore:
         self.kv_embed_dim_k = self.tp_k_head_num * self.head_dim
         self.kv_embed_dim_v = self.tp_v_head_num * self.head_dim
         self.total_rank = sum(self.lora_ranks.values())
+        self.key_rope_cos = None
+        self.key_rope_sin = None
 
         self.rank_ranges: List[Tuple[int, int]] = []
         rank_cursor = 0
@@ -103,6 +107,16 @@ class LowRAStaticPrefixStore:
         mini_v_tokens = int(math.ceil(prefix_len * rank_sum / kv_embed_dim_v)) if rank_sum > 0 else 0
         return full_base_tokens + max(mini_k_tokens, mini_v_tokens)
 
+    def bind_key_rope(self, cos, sin):
+        """Bind prefix positions for raw MiniK and already-rotated BaseK sources."""
+        expected = (self.prefix_len, self.head_dim // 2)
+        if cos.shape != expected or sin.shape != expected:
+            raise ValueError("prefix key RoPE tables do not match the source dimensions")
+        if any(t.device != self.base_k[0].device or t.dtype != self.base_k[0].dtype
+               or not t.is_contiguous() for t in (cos, sin)):
+            raise ValueError("prefix key RoPE must match BaseK device/dtype and be contiguous")
+        self.key_rope_cos, self.key_rope_sin = cos, sin
+
     @classmethod
     def token_equivalent_static_size_from_config(
         cls,
@@ -150,6 +164,17 @@ class LowRAPrefixKVCache:
         self.static_store = static_store
         self.mem_manager = mem_manager
         self.entries: Dict[str, LowRAPrefixCacheEntry] = {}
+        self.profiler = None
+        self.reset_access_stats()
+
+    def reset_access_stats(self):
+        self.batch_unique_hits = 0
+        self.batch_unique_misses = 0
+        self.evictions = 0
+
+    def access_stats(self):
+        return dict(batch_unique_hits=self.batch_unique_hits,
+                    batch_unique_misses=self.batch_unique_misses, evictions=self.evictions)
 
     def acquire_many(self, lora_dirs: Iterable[Optional[str]], infer_adapter=None) -> Dict[str, torch.Tensor]:
         counts: Dict[str, int] = {}
@@ -160,11 +185,16 @@ class LowRAPrefixKVCache:
 
         prefix_indices_by_dir = {}
         misses = []
+        self.batch_unique_hits += sum(directory in self.entries for directory in counts)
+        self.batch_unique_misses += sum(directory not in self.entries for directory in counts)
+        # Protect all batch hits before allocating misses, regardless of request order.
+        for lora_dir, count in counts.items():
+            if lora_dir in self.entries:
+                self.entries[lora_dir].ref_count += count
+                self.entries[lora_dir].adapter_heat += 1
         for lora_dir, count in counts.items():
             if lora_dir in self.entries:
                 entry = self.entries[lora_dir]
-                entry.ref_count += count
-                entry.adapter_heat += 1
             else:
                 if infer_adapter is None:
                     raise RuntimeError(
@@ -188,6 +218,7 @@ class LowRAPrefixKVCache:
 
     def acquire(self, lora_dir: str, infer_adapter=None, ref_delta: int = 1) -> LowRAPrefixCacheEntry:
         if lora_dir in self.entries:
+            self.batch_unique_hits += 1
             entry = self.entries[lora_dir]
             entry.ref_count += ref_delta
             entry.adapter_heat += 1
@@ -196,6 +227,7 @@ class LowRAPrefixKVCache:
         if infer_adapter is None:
             raise RuntimeError(f"LowRA prefix cache miss for {lora_dir}, but no InferAdapter was provided")
 
+        self.batch_unique_misses += 1
         prefix_indices = self._alloc_prefix_indices()
         entry = LowRAPrefixCacheEntry(
             lora_dir=lora_dir,
@@ -233,6 +265,7 @@ class LowRAPrefixKVCache:
             return False
         self.mem_manager.free(entry.prefix_indices)
         del self.entries[lora_dir]
+        self.evictions += 1
         return True
 
     def evict_many(self, lora_dirs: Iterable[str]):
@@ -281,58 +314,10 @@ class LowRAPrefixKVCache:
     @torch.no_grad()
     def _reconstruct_many_into_dynamic_pool(self, lora_dirs: List[str], infer_adapter):
         static = self.static_store
-        max_rank = max(static.get_lora_rank_range_by_dir(lora_dir)[1] -
-                       static.get_lora_rank_range_by_dir(lora_dir)[0]
-                       for lora_dir in lora_dirs)
-        prefix_locs = torch.empty(
-            (len(lora_dirs), static.prefix_len),
-            dtype=torch.long,
-            device="cuda",
-        )
-        k_b_locs = torch.empty((len(lora_dirs), max_rank), dtype=torch.long, device="cuda")
-        v_b_locs = torch.empty((len(lora_dirs), max_rank), dtype=torch.long, device="cuda")
-        rank_starts = torch.empty((len(lora_dirs),), dtype=torch.long, device="cuda")
-        rank_lens = torch.empty((len(lora_dirs),), dtype=torch.long, device="cuda")
-        scalings = torch.empty((len(lora_dirs),), dtype=torch.float16, device="cuda")
-
-        for batch_idx, lora_dir in enumerate(lora_dirs):
-            view = static.get_static_prefix_view_by_dir(lora_dir)
-            rank = view.rank_end - view.rank_start
-            adapter_idx = infer_adapter.idx_map[lora_dir]
-            adapter_start = int(infer_adapter.a_start[adapter_idx].item())
-            adapter_len = int(infer_adapter.a_len[adapter_idx].item())
-            adapter_locs = infer_adapter.a_loc[adapter_start: adapter_start + adapter_len]
-
-            prefix_locs[batch_idx] = self.entries[lora_dir].prefix_indices
-            k_b_locs[batch_idx, :rank] = adapter_locs[rank: 2 * rank]
-            v_b_locs[batch_idx, :rank] = adapter_locs[2 * rank: 3 * rank]
-            if rank < max_rank:
-                k_b_locs[batch_idx, rank:].fill_(0)
-                v_b_locs[batch_idx, rank:].fill_(0)
-            rank_starts[batch_idx] = view.rank_start
-            rank_lens[batch_idx] = rank
-            scalings[batch_idx] = infer_adapter.a_scaling[adapter_idx]
-
+        prefix_locs = torch.stack([self.entries[directory].prefix_indices for directory in lora_dirs])
+        metadata = prepare_reconstruction_metadata(static, lora_dirs, infer_adapter, prefix_locs)
         for layer_id in range(static.layer_num):
-            lowra_reconstruct_batched(
-                static.base_k[layer_id].view(static.prefix_len, static.kv_embed_dim_k),
-                static.mini_k[layer_id],
-                infer_adapter.mem_manager.value_buffer[layer_id].view(-1, static.kv_embed_dim_k),
-                self.mem_manager.key_buffer[layer_id].view(-1, static.kv_embed_dim_k),
-                prefix_locs,
-                k_b_locs,
-                rank_starts,
-                rank_lens,
-                scalings,
-            )
-            lowra_reconstruct_batched(
-                static.base_v[layer_id].view(static.prefix_len, static.kv_embed_dim_v),
-                static.mini_v[layer_id],
-                infer_adapter.mem_manager.value_buffer[layer_id].view(-1, static.kv_embed_dim_v),
-                self.mem_manager.value_buffer[layer_id].view(-1, static.kv_embed_dim_v),
-                prefix_locs,
-                v_b_locs,
-                rank_starts,
-                rank_lens,
-                scalings,
-            )
+            with profile_interval(self.profiler, "reconstruct", layer_id):
+                reconstruct_prefix_layer(static, infer_adapter, metadata, layer_id,
+                                         self.mem_manager.key_buffer[layer_id],
+                                         self.mem_manager.value_buffer[layer_id])
