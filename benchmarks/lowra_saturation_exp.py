@@ -326,7 +326,51 @@ def telemetry_summary(path, origin, args, result):
     for field in ("persistent_used_slots", "private_kv_slots", "prefix_slots", "adapter_slots"):
         values = [row["per_rank"][0][field] for row in window]
         summary[field] = dict(distribution(values), maximum=max(values, default=0))
+    for field in ("online_preemptions", "online_preempted_requests", "online_recomputed_tokens", "online_rejections"):
+        summary[field] = point[-1].get(field)
     return summary
+
+
+def preemption_summary(path, origin, results, benchmark_time):
+    if not path.exists():
+        return dict(available=False)
+    identifiers = {result.req_id for result in results}
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows = [row for row in rows if row["monotonic_time"] >= origin]
+    preemptions = [row for row in rows if row["event"] == "preempt" and row["req_id"] in identifiers]
+    resumes = [row for row in rows if row["event"] == "resume_prefill"
+               and all(req["req_id"] in identifiers for req in row["requests"])]
+    counts = Counter(row["req_id"] for row in preemptions)
+    prefill_seconds = sum(row["prefill_wall_seconds"] for row in resumes)
+    groups = {}
+    for name, affected in (("preempted", True), ("not_preempted", False)):
+        selected = [result for result in results if (result.req_id in counts) == affected]
+        successful = [result for result in selected if result.success]
+        groups[name] = dict(
+            requests=len(selected), completed_requests=len(successful),
+            latency_seconds=distribution([result.end_time - result.start_time for result in successful]),
+            ttft_seconds=distribution([result.first_token_time - result.start_time for result in successful
+                                       if result.first_token_time is not None]))
+    return dict(
+        available=True, preemption_events=len(preemptions), preempted_requests=len(counts),
+        preempted_request_fraction=len(counts) / len(results) if results else 0.0,
+        preemptions_per_request=dict(counts),
+        resumed_request_events=sum(len(row["requests"]) for row in resumes),
+        recomputed_tokens=sum(req["input_tokens"] + req["generated_tokens"]
+                              for row in resumes for req in row["requests"]),
+        recomputed_tokens_scope="rpc_input_plus_generated_history_at_resume; "
+                                "excludes_shared_prefix_in_minikv_modes",
+        preemption_release_wall_seconds=sum(row["release_wall_seconds"] for row in preemptions),
+        resume_prefill_batches=len(resumes),
+        mixed_resume_prefill_batches=sum(row["new_requests"] > 0 for row in resumes),
+        resume_batch_prefill_wall_seconds=prefill_seconds,
+        resume_only_batch_prefill_wall_seconds=sum(row["prefill_wall_seconds"] for row in resumes
+                                                  if row["new_requests"] == 0),
+        resume_batch_prefill_fraction_of_run=prefill_seconds / benchmark_time if benchmark_time else 0.0,
+        timing_scope="whole_resume_batch_init_forward_cleanup_excludes_adapter_load_and_queue_wait; "
+                     "includes_new_requests_if_mixed_and_next_token_work; not_causal_throughput_loss",
+        latency_comparison_scope="observational_groups_not_a_matched_causal_comparison",
+        request_groups=groups)
 
 
 def server_command(args, stats_path):
@@ -549,6 +593,8 @@ async def run_suite(args):
                         # Ensure the final peak/cache snapshot is captured before reset.
                         await asyncio.sleep(args.stats_interval + 0.1)
                         runtime = telemetry_summary(stats_path, origin, args, result)
+                        preemption = preemption_summary(
+                            stats_path.with_suffix(".preemptions.jsonl"), origin, results, result["benchmark_time"])
                         if args.measure_saturation:
                             cycles_path = stats_path.with_suffix(".cycles.jsonl")
                             cycles = [json.loads(line) for line in cycles_path.read_text().splitlines()
@@ -570,13 +616,15 @@ async def run_suite(args):
                                      request_rate=rate, seed=seed,
                                      trace_path=str(trace_path), trace_sha256=trace_hash,
                                      adapter_counts=dict(Counter(req["adapter_dir"] for req in requests)),
-                                     benchmark_origin_monotonic=origin, result=result, runtime=runtime)
+                                     benchmark_origin_monotonic=origin, result=result, runtime=runtime,
+                                     preemption=preemption)
                         write_json(output / (label + ".json"), point)
                         points.append(point)
                         write_json(output / "summary.json", suite_summary(points, args))
                         print("%s: steady=%.6f req/s total=%.6f req/s valid=%s backlog=%s" %
                               (label, result["completed_req_per_s_steady"], result["completed_req_per_s_total"],
                                result["valid"], runtime.get("backlogged_window")), flush=True)
+                        print("Preemption diagnostics: %s" % json.dumps(preemption), flush=True)
                         if args.measure_saturation:
                             print("Saturation cycles: %s" % json.dumps(result["saturation"]), flush=True)
                         if not result["valid"]:

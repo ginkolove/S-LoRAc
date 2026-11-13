@@ -197,8 +197,10 @@ class RouterManager:
         self.has_wait_tokens = 0
         self.max_wait_tokens = 10
         self.online_preemptions = 0
+        self.online_preempted_request_ids = set()
         self.online_recomputed_tokens = 0
         self.online_rejections = 0
+        self.preemption_stats_file = None
         self.runtime_stats_file = None
         self.runtime_stats_interval = 1.0
         self.runtime_stats_last_time = 0.0
@@ -316,6 +318,7 @@ class RouterManager:
         row = dict(monotonic_time=time.monotonic(), wall_time=time.time(),
                    scheduler=self.input_params.scheduler,
                    online_preemptions=self.online_preemptions,
+                   online_preempted_requests=len(self.online_preempted_request_ids),
                    online_recomputed_tokens=self.online_recomputed_tokens,
                    online_rejections=self.online_rejections,
                    prefix_mode=self.input_params.lowra_prefix_mode,
@@ -467,8 +470,19 @@ class RouterManager:
                     await asyncio.gather(*[rpc.load_adapters(new_batch.adapter_dirs) for rpc in self.model_rpcs])
                 self.online_recomputed_tokens += sum(
                     req.input_len + len(req.output_ids) for req in new_batch.reqs if req.preemptions)
+                resumed = [dict(req_id=req.request_id, input_tokens=req.input_len,
+                                generated_tokens=len(req.output_ids), preemptions=req.preemptions)
+                           for req in new_batch.reqs if req.preemptions]
+                prefill_size = len(new_batch.reqs)
                 self.stats_tool.count_prompt_tokens(new_batch)
+                prefill_start = time.monotonic()
                 await self._prefill_batch(new_batch, minibatch=True)
+                if resumed:
+                    # This is the entire resumed/mixed batch, not isolated recompute cost.
+                    self._record_preemption_event(
+                        "resume_prefill", requests=resumed, batch_size=prefill_size,
+                        new_requests=prefill_size - len(resumed),
+                        prefill_wall_seconds=time.monotonic() - prefill_start)
                 if self.running_batch is None:
                     self.running_batch = new_batch
                 elif not new_batch.is_clear():
@@ -502,6 +516,7 @@ class RouterManager:
             self.service_cycles.complete(req.request_id, aborted=True)
 
     async def _preempt_online_request(self, req):
+        release_start = time.monotonic()
         batch = self.running_batch
         survivors = [r for r in batch.reqs if r.request_id != req.request_id]
         # Reuse the existing filter/remove lifecycle to free private KV and
@@ -520,7 +535,19 @@ class RouterManager:
                                    for rpc in self.model_rpcs])
         req.preemptions += 1
         self.online_preemptions += 1
+        self.online_preempted_request_ids.add(req.request_id)
         self.req_queue.waiting_req_list.insert(0, req)
+        self._record_preemption_event(
+            "preempt", req_id=req.request_id, adapter_dir=req.adapter_dir,
+            preemptions=req.preemptions, input_tokens=req.input_len,
+            generated_tokens=len(req.output_ids),
+            release_wall_seconds=time.monotonic() - release_start)
+
+    def _record_preemption_event(self, event, **fields):
+        if self.preemption_stats_file is not None:
+            row = dict(event=event, monotonic_time=time.monotonic(), **fields)
+            self.preemption_stats_file.write(json.dumps(row) + "\n")
+            self.preemption_stats_file.flush()
 
     async def _sync_lowra_prefix_cache_state(self):
         if not hasattr(self.req_queue, "update_prefix_cache_state"):
@@ -570,6 +597,7 @@ class RouterManager:
             if self.service_cycles is not None:
                 self.service_cycles.reset()
             self.online_preemptions = self.online_recomputed_tokens = self.online_rejections = 0
+            self.online_preempted_request_ids.clear()
             self.send_to_detokenization.send_pyobj(
                 LowRAResetAck(request_id, True, "LowRA runtime reset complete", {"per_rank": stats_list})
             )
@@ -796,6 +824,8 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
             router.runtime_stats_interval = args.lowra_runtime_stats_interval
             cycle_path = os.path.splitext(args.lowra_runtime_stats_path)[0] + ".cycles.jsonl"
             router.service_cycles = ServiceCycleRecorder(open(cycle_path, "a", buffering=1))
+            preemption_path = os.path.splitext(args.lowra_runtime_stats_path)[0] + ".preemptions.jsonl"
+            router.preemption_stats_file = open(preemption_path, "a", buffering=1)
         if input_params.profile:
             asyncio.run(router.profile_prefill())
         if input_params.scheduler == "pets" and input_params.profile:

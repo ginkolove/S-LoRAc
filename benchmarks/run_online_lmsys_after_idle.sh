@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
-# Wait for both GPUs, then run the two prefix modes on each model's own GPU.
+# Run each model on its GPU, optionally waiting for both GPUs to become idle.
 set -euo pipefail
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-  printf 'Usage: bash %s OUTPUT_DIR [--dry-run]\n' "$0" >&2
+if [ "$#" -lt 1 ]; then
+  printf 'Usage: bash %s OUTPUT_DIR [--dry-run] [--no-wait]\n' "$0" >&2
   exit 2
 fi
+OUTPUT_ARG="$1"
+shift
 DRY_RUN=0
-if [ "$#" -eq 2 ]; then
-  if [ "$2" != --dry-run ]; then
-    printf 'Unknown option: %s\n' "$2" >&2
-    exit 2
-  fi
-  DRY_RUN=1
-fi
+NO_WAIT=0
+for OPTION in "$@"; do
+  case "$OPTION" in
+    --dry-run) DRY_RUN=1 ;;
+    --no-wait) NO_WAIT=1 ;;
+    *) printf 'Unknown option: %s\n' "$OPTION" >&2; exit 2 ;;
+  esac
+done
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$(realpath -m "$1")"
+OUT="$(realpath -m "$OUTPUT_ARG")"
 PYTHON="${SLORA_PYTHON:-/home/qlh/anaconda3/envs/slora/bin/python}"
+TRACE_PYTHON="${SLORA_TRACE_PYTHON:-$PYTHON}"
 cd "$ROOT"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4
@@ -33,7 +37,7 @@ run_command() {
 
 prepare_trace() {
   local SIZE="$1"
-  run_command "$PYTHON" -u benchmarks/prepare_lmsys_maf_trace.py \
+  run_command "$TRACE_PYTHON" -u benchmarks/prepare_lmsys_maf_trace.py \
     --dataset /data/hub/LMSYS-33k \
     --maf-file /data/hub/MAF/azurefunctions2019/invocations_per_function_md.anon.d01.csv \
     --maf-skewness 1 --maf-minute-start 1 --maf-minute-end 1440 \
@@ -75,7 +79,11 @@ run_model() (
 if [ "$DRY_RUN" -eq 1 ]; then
   prepare_trace 7b
   prepare_trace 13b
-  printf 'Wait until GPUs 0 and 1 have no compute processes for two consecutive checks.\n'
+  if [ "$NO_WAIT" -eq 1 ]; then
+    printf 'Check GPUs 0 and 1 once; start immediately if free, otherwise exit.\n'
+  else
+    printf 'Wait until GPUs 0 and 1 have no compute processes for two consecutive checks.\n'
+  fi
   printf 'CUDA_VISIBLE_DEVICES=0\n'
   run_model 0 7b 125000
   printf 'CUDA_VISIBLE_DEVICES=1\n'
@@ -92,11 +100,22 @@ if ! flock -n 9; then
 fi
 
 # CPU-only preparation happens while the previous GPU jobs are still running.
-prepare_trace 7b > "$OUT/prepare_7b.log" 2>&1
-prepare_trace 13b > "$OUT/prepare_13b.log" 2>&1
-printf 'Traces prepared. Waiting for BOTH GPUs to be free; checking every 2 seconds.\n'
+for SIZE in 7b 13b; do
+  if ! prepare_trace "$SIZE" > "$OUT/prepare_${SIZE}.log" 2>&1; then
+    printf 'Trace preparation failed for %s; inspect %s/prepare_%s.log\n' "$SIZE" "$OUT" "$SIZE" >&2
+    tail -n 40 "$OUT/prepare_${SIZE}.log" >&2
+    exit 1
+  fi
+done
+REQUIRED_IDLE_CHECKS=2
+if [ "$NO_WAIT" -eq 1 ]; then
+  REQUIRED_IDLE_CHECKS=1
+  printf 'Traces prepared. Checking GPU availability once; no waiting.\n'
+else
+  printf 'Traces prepared. Waiting for BOTH GPUs to be free; checking every 2 seconds.\n'
+fi
 IDLE_CHECKS=0
-while [ "$IDLE_CHECKS" -lt 2 ]; do
+while [ "$IDLE_CHECKS" -lt "$REQUIRED_IDLE_CHECKS" ]; do
   if ! GPU_PIDS="$(nvidia-smi -i 0,1 --query-compute-apps=pid --format=csv,noheader,nounits)"; then
     printf 'Cannot query GPUs; refusing to start experiments.\n' >&2
     exit 1
@@ -104,9 +123,13 @@ while [ "$IDLE_CHECKS" -lt 2 ]; do
   if [[ -z "${GPU_PIDS//[[:space:]]/}" ]]; then
     IDLE_CHECKS=$((IDLE_CHECKS + 1))
   else
+    if [ "$NO_WAIT" -eq 1 ]; then
+      printf 'GPUs 0 and/or 1 are busy; --no-wait refuses to start competing experiments.\n' >&2
+      exit 1
+    fi
     IDLE_CHECKS=0
   fi
-  if [ "$IDLE_CHECKS" -lt 2 ]; then
+  if [ "$IDLE_CHECKS" -lt "$REQUIRED_IDLE_CHECKS" ]; then
     sleep 2
   fi
 done

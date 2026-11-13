@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import io
+import json
 from types import SimpleNamespace
 import unittest
 
@@ -179,6 +180,8 @@ def make_router(queue, rpc, ranks):
     router.send_to_detokenization = SimpleNamespace(send_pyobj=router.messages.append)
     router.service_cycles = ServiceCycleRecorder(io.StringIO())
     router.online_preemptions = router.online_recomputed_tokens = router.online_rejections = 0
+    router.online_preempted_request_ids = set()
+    router.preemption_stats_file = io.StringIO()
     return router
 
 
@@ -200,6 +203,17 @@ class OnlineLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(router.online_preemptions, 0)
         self.assertGreater(len(rpc.resumes), 0)
         self.assertEqual(router.online_rejections, 0)
+        events = [json.loads(line) for line in router.preemption_stats_file.getvalue().splitlines()]
+        preemptions = [row for row in events if row["event"] == "preempt"]
+        resumes = [row for row in events if row["event"] == "resume_prefill"]
+        self.assertEqual(len(preemptions), router.online_preemptions)
+        self.assertEqual(router.online_preemptions, sum(req.preemptions for req in reqs))
+        self.assertEqual(router.online_preempted_request_ids,
+                         {req.request_id for req in reqs if req.preemptions})
+        self.assertEqual(router.online_recomputed_tokens, sum(
+            req["input_tokens"] + req["generated_tokens"] for row in resumes for req in row["requests"]))
+        self.assertEqual(sum(len(row["requests"]) for row in resumes), len(rpc.resumes))
+        self.assertTrue(all(row["prefill_wall_seconds"] >= 0 for row in resumes))
         for req in reqs:
             emitted = [token for message in router.messages if isinstance(message, BatchTokenIdOut)
                        for identifier, token, _, _, _ in message.reqs_infs if identifier == req.request_id]
