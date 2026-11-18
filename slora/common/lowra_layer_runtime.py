@@ -162,7 +162,11 @@ def reconstruct_prefix_layer_fused_kv(static, infer_adapter, metadata, layer_id,
 
 
 def reconstruct_prefix_layer_bounded(static, infer_adapter, metadata, layer_id, out_k, out_v,
-                                     workers=648):
+                                     workers=648, block_r=16, rank_loop="max"):
+    if block_r not in (16, 32):
+        raise ValueError("bounded reconstruction block_r must be 16 or 32")
+    if rank_loop not in ("max", "actual"):
+        raise ValueError("rank_loop must be 'max' or 'actual'")
     key_rope = getattr(static, "key_rope_cos", None) is not None
     b_buffer = infer_adapter.mem_manager.value_buffer[layer_id]
     if b_buffer.shape[1:] != (static.tp_k_head_num, static.head_dim):
@@ -174,7 +178,8 @@ def reconstruct_prefix_layer_bounded(static, infer_adapter, metadata, layer_id, 
         lowra_reconstruct_bounded(base.view(static.prefix_len, embed), mini, b_buffer.view(-1, embed),
                                   out.view(-1, embed), metadata.prefix_locs, b_locs,
                                   metadata.rank_starts, metadata.rank_lens, metadata.scalings,
-                                  workers=workers, launch_config=(32, 128, 16, 4), b_packed=True,
+                                  workers=workers, launch_config=(32, 128, block_r, 4), b_packed=True,
+                                  rank_loop=rank_loop,
                                   add_base=not key_rope or out is out_v)
     if key_rope:
         rotate_delta_k_add_base(static.base_k[layer_id], out_k, metadata.prefix_locs,

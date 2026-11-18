@@ -110,6 +110,23 @@ class LongContextTests(unittest.TestCase):
         actual = model._cos_cached[positions, 0]
         torch.testing.assert_close(actual, torch.cos(positions.float()).half(), atol=0, rtol=0)
 
+    def test_rope_table_extends_to_server_limit_without_position_wrapping(self):
+        import torch
+        from slora.models.llama.model import LlamaTpPartModel
+        from slora.common.configs.config import setting
+
+        model = object.__new__(LlamaTpPartModel)
+        model.config = dict(max_sequence_length=2048)
+        model.head_dim_ = 16
+        with patch.dict(setting, max_req_total_len=80000), \
+                patch.dict(os.environ, SLORA_NTK_ALPHA="1"), \
+                patch.object(torch.Tensor, "cuda", lambda tensor, *args, **kwargs: tensor):
+            model._init_to_get_rotary()
+        self.assertEqual(model._cos_cached.shape[0], 80000)
+        positions = torch.tensor([15000, 32767, 79999])
+        torch.testing.assert_close(model._cos_cached[positions, 0],
+                                   torch.cos(positions.float()).half(), atol=0, rtol=0)
+
     def test_long_location_table_and_slot_lifecycle_on_cpu(self):
         import torch
         from slora.common.configs.config import setting

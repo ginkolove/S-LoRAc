@@ -1,4 +1,5 @@
-from slora.common.prefix_modes import FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, normalize_prefix_mode
+from slora.common.prefix_modes import FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+from slora.common.space_plan_config import SpacePlanConfig
 
 
 class ServeParams:
@@ -66,6 +67,7 @@ class InputParams:
         lowra_reconstruction_workers=None,
         schedule_interval=1,
         max_active_loras=None,
+        space_plan_config=None,
     ) -> None:
         self.max_req_total_len = max_req_total_len
         self.nccl_port = int(nccl_port)
@@ -110,6 +112,11 @@ class InputParams:
         self.lowra_shared_prefix_len = lowra_shared_prefix_len
         self.lowra_wait_slo_ms = lowra_wait_slo_ms
         self.lowra_prefix_mode = normalize_prefix_mode(lowra_prefix_mode)
+        self.space_plan_config = vars(SpacePlanConfig(**(space_plan_config or {})))
+        if self.lowra_prefix_mode == LAYER_ADAPTIVE and (
+                not enable_lowra or scheduler != "online" or lowra_retain_layers
+                or lowra_retain_top_k is not None or lowra_pin_hot_adapters):
+            raise ValueError("adaptive mode requires online LowRA without fixed retention/top-K/pinning")
         self.lowra_workspace_loras = lowra_workspace_loras
         self.lowra_retain_layers = int(lowra_retain_layers)
         self.lowra_retain_top_k = lowra_retain_top_k
@@ -117,7 +124,7 @@ class InputParams:
         if lowra_reconstruction_kernel not in ("auto", "bounded"):
             raise ValueError("unknown LowRA reconstruction kernel")
         if lowra_reconstruction_kernel == "bounded" and (
-                not enable_lowra or self.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED)):
+                not enable_lowra or self.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE)):
             raise ValueError("bounded reconstruction requires a LowRA layer mode")
         if lowra_reconstruction_workers is not None and (
                 lowra_reconstruction_kernel != "bounded"

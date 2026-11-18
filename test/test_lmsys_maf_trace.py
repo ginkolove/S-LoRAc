@@ -44,12 +44,13 @@ def parse_fixture(path, rank=8, mode="minikv-layer_serial", extra=()):
 
 
 class TraceTests(unittest.TestCase):
-    def test_launcher_forwards_duration_to_both_modes_and_keeps_old_default(self):
+    def test_launcher_uses_matched_budget_and_preserves_explicit_overrides(self):
         launcher = Path(__file__).resolve().parents[1] / "benchmarks/run_lmsys_rank_compare.sh"
         with tempfile.TemporaryDirectory() as tmp:
             trace = Path(tmp) / "trace.json"
             trace.write_text(json.dumps(fixture()))
             for extra, model, tokens, duration in (([], "7b", "125000", "10"),
+                    (["13b"], "13b", "65000", "10"),
                     (["13b", "60000", "30"], "13b", "60000", "30")):
                 with self.subTest(model=model, duration=duration):
                     output = subprocess.run(
@@ -70,6 +71,7 @@ class TraceTests(unittest.TestCase):
         args = prepare_args(["--output", "/tmp/unused-trace.json", "--seed", "7"])
         self.assertEqual((args.maf_minute_start, args.maf_minute_end), (1, 1440))
         self.assertEqual((args.maf_skewness, args.seed, args.data_seed), (1, 7, 42))
+        self.assertIsNone(args.max_context_len)
 
     def test_full_day_includes_late_minute_invocations(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -140,15 +142,62 @@ class TraceTests(unittest.TestCase):
         self.assertEqual([item["query"] for item in candidates], ["q", "q"])
         self.assertNotEqual(candidates[0]["source_id"], candidates[1]["source_id"])
 
-    def test_context_filter_does_not_truncate(self):
+    def test_explicit_context_fails_without_resampling_and_legacy_filter_is_opt_in(self):
         tokenizer = SimpleNamespace(encode=lambda text, add_special_tokens: list(range(len(text))))
         rng = SimpleNamespace(permutation=lambda count: range(count))
         candidates = [dict(source_id="long", source_model="a", query="x" * 12, answer="abc"),
                       dict(source_id="short", source_model="a", query="hi", answer="abc")]
-        samples, rejected = select_samples(candidates, 1, tokenizer, rng, 10, 20)
+        with self.assertRaisesRegex(ValueError, "sample long needs 25"):
+            select_samples(candidates, 1, tokenizer, rng, 10, 20)
+        samples, rejected = select_samples(candidates, 1, tokenizer, rng, 10, 20,
+                                           filter_over_context=True)
         self.assertEqual(rejected, 1)
         self.assertEqual(samples[0]["input_ids"], [0, 1])
         self.assertEqual(samples[0]["output_len"], 3)
+
+    def test_auto_context_keeps_long_samples_identical_across_prefix_lengths(self):
+        tokenizer = SimpleNamespace(encode=lambda text, add_special_tokens: [1] * len(text))
+        candidates = [dict(source_id="long", source_model="a", query="x" * 2000, answer="a" * 500),
+                      dict(source_id="short", source_model="a", query="hi", answer="abc")]
+        small, _ = select_samples(candidates, 2, tokenizer, None, 10000, None, order=[0, 1])
+        large, rejected = select_samples(candidates, 2, tokenizer, None, 15000, None, order=[0, 1])
+        self.assertEqual(small, large)
+        self.assertEqual(rejected, 0)
+        self.assertEqual(15000 + len(large[0]["input_ids"]) + large[0]["output_len"], 17500)
+
+    def test_benchmark_inherits_context_and_removes_fixed_batch_caps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.json"
+            data = fixture()
+            data["config"].update(prefix_len=15000, max_context_len=18000)
+            data["requests"][0].update(input_ids=[11] * 2000, output_len=1000)
+            path.write_text(json.dumps(data))
+            argv = ["bench", "--mode", "minikv-layer_serial", "--workload-trace", str(path),
+                    "--prefix-len", "15000", "--num-adapters", "2", "--request-rates", "3",
+                    "--duration", "10", "--seeds", "42", "--warmup", "0", "--steady-end", "1000",
+                    "--num-token", "12000", "--output-dir", tmp]
+            with patch("sys.argv", argv):
+                args = parse_args()
+            self.assertEqual(args.max_context_len, 18000)
+            self.assertEqual(args.batch_max_tokens, 12000)
+            self.assertEqual(args.running_max_req_size, 2)
+            command = server_command(args, Path(tmp) / "stats.jsonl")
+            self.assertEqual(command[command.index("--max_req_input_len") + 1], "17000")
+            self.assertEqual(command[command.index("--max_req_total_len") + 1], "18000")
+            with patch("sys.argv", argv + ["--batch-max-tokens", "2500", "--running-max-req-size", "1"]):
+                capped = parse_args()
+            self.assertEqual((capped.batch_max_tokens, capped.running_max_req_size), (2500, 1))
+
+    def test_synthetic_context_and_running_limit_are_auto_but_explicit_values_survive(self):
+        argv = ["bench", "--mode", "minikv-layer_serial", "--prefix-len", "15000",
+                "--query-len", "2000", "--output-len", "1000", "--output-dir", "/tmp/unused"]
+        with patch("sys.argv", argv):
+            args = parse_args()
+        self.assertEqual(args.max_context_len, 18000)
+        self.assertEqual(args.running_max_req_size, args.num_token)
+        with patch("sys.argv", argv + ["--max-context-len", "32768", "--running-max-req-size", "256"]):
+            args = parse_args()
+        self.assertEqual((args.max_context_len, args.running_max_req_size), (32768, 256))
 
     def test_all_modes_and_ranks_share_ids_arrivals_tokens_and_adapter_indices(self):
         with tempfile.TemporaryDirectory() as tmp:

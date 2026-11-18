@@ -14,7 +14,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from slora.common.prefix_modes import (
-    PREFIX_MODES, FULL_RECONSTRUCT, FULL_REPREFILL, LAYER_SERIAL, LAYER_RETAINED, normalize_prefix_mode,
+    PREFIX_MODES, FULL_RECONSTRUCT, FULL_REPREFILL, LAYER_SERIAL, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode,
 )
 
 
@@ -73,6 +73,7 @@ def build_server(args):
     from slora.common.full_reprefill import FULL_REPREFILL_MODES, FULL_PREFIX_CACHE_MODES, FullPrefixKVCache, FullReprefillRuntime
     from slora.common.full_reconstruct import FullReconstructPrefixKVCache, FullReconstructRuntime
     from slora.common.lowra_retained import RetainedPrefixKVCache, RetainedLayerRuntime
+    from slora.common.lowra_adaptive import AdaptivePrefixKVCache, AdaptiveLayerRuntime
     from slora.models.llama.model import LlamaTpPartModel
     from slora.models.peft.lora_adapter import LoraTpPartAdapter
     from slora.server.router.model_infer.infer_adapter import InferAdapter
@@ -106,6 +107,8 @@ def build_server(args):
     persistent = args.batch_size * (args.query_len + args.output_len) + 4 * args.unique_loras * args.rank
     prefix_budget = ((workspace + layers - 1) // layers if workspace else
                      args.unique_loras * args.prefix_len)
+    if args.mode == LAYER_ADAPTIVE:
+        prefix_budget = args.unique_loras * args.prefix_len + (workspace + layers - 1) // layers
     if args.mode == LAYER_RETAINED:
         retained = getattr(args, "retain_layers", 0)
         if not 0 <= retained <= layers:
@@ -144,6 +147,11 @@ def build_server(args):
             cache = FullReconstructPrefixKVCache(args.prefix_len, model.mem_manager,
                                                  pinned_lora_dirs=dirs[:getattr(args, "pin_hot_adapters", 0)])
             runtime = FullReconstructRuntime(static, model.mem_manager, cache, profiler)
+        elif args.mode == LAYER_ADAPTIVE:
+            cache = AdaptivePrefixKVCache(args.prefix_len, model.mem_manager)
+            runtime = AdaptiveLayerRuntime(static, model.mem_manager, cache, profiler,
+                reconstruction_kernel=getattr(args, "reconstruction_kernel", "auto"),
+                reconstruction_workers=getattr(args, "reconstruction_workers", None))
         elif args.mode == LAYER_RETAINED:
             cache = RetainedPrefixKVCache(args.prefix_len, args.retain_layers, model.mem_manager,
                                           retain_top_k=getattr(args, "retain_top_k", None),

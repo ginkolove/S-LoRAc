@@ -102,7 +102,7 @@ class OnlineReqQueue(ReqQueue):
         # reconstruction consumes memory/compute but not the prefill token budget.
         prefill_tokens = query_tokens + (prefix_build_tokens if self.prefix_mode == FULL_REPREFILL else 0)
         fits = (required() <= self.max_total_tokens
-                and len(requests) <= min(self.running_max_req_size, self.batch_max_tokens)
+                and len(requests) <= self.running_max_req_size
                 and prefill_tokens <= self.batch_max_tokens
                 and (self.max_active_loras is None or len(needed) <= self.max_active_loras)
                 and (not self.prefix_len or self.prefix_mode in (FULL_REPREFILL, FULL_RECONSTRUCT)

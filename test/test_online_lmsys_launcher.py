@@ -23,6 +23,8 @@ class OnlineLauncherTests(unittest.TestCase):
                         if "benchmarks/lowra_saturation_exp.py --mode" in line]
             self.assertEqual(len(commands), 4)
             for command in commands:
+                for option in ("--max-context-len", "--batch-max-tokens", "--running-max-req-size"):
+                    self.assertNotIn(option, command)
                 value = lambda flag: command[command.index(flag) + 1]
                 self.assertEqual(value("--scheduler"), "online")
                 self.assertEqual(value("--schedule-interval"), "1")
@@ -33,7 +35,7 @@ class OnlineLauncherTests(unittest.TestCase):
                 self.assertEqual(value("--seeds"), "42")
                 self.assertEqual(value("--num-adapters"), "50")
                 size = "13b" if value("--model-dir").endswith("13b") else "7b"
-                self.assertEqual(value("--num-token"), "60000" if size == "13b" else "125000")
+                self.assertEqual(value("--num-token"), "65000" if size == "13b" else "125000")
                 self.assertIn("llama%s" % size, value("--workload-trace"))
                 self.assertEqual(value("--adapter-base"), "dummy-lora-%s-rank-16" % size)
             self.assertFalse(output.exists())
@@ -59,6 +61,8 @@ class OnlineLauncherTests(unittest.TestCase):
             (root / "benchmarks/results").mkdir(parents=True)
             launcher = root / "benchmarks" / LAUNCHER.name
             shutil.copyfile(LAUNCHER, launcher)
+            shutil.copyfile(LAUNCHER.parent / "llama_memory_budget.sh",
+                            root / "benchmarks/llama_memory_budget.sh")
             binary = root / "bin"
             binary.mkdir()
             python = binary / "fake-python"

@@ -32,14 +32,19 @@ from slora.server.router.peft_req_queue import PEFTReqQueue
 from slora.server.router.lowra_fifo_req_queue import LowRAFIFOReqQueue
 from slora.server.router.full_reprefill_req_queue import FullReprefillReqQueue
 from slora.server.router.online_req_queue import OnlineReqQueue
+from slora.server.router.adaptive_req_queue import AdaptiveReqQueue
+from slora.common.space_plan_config import space_plan_options
 from slora.common.full_reprefill import FULL_REPREFILL_MODES, FULL_PREFIX_CACHE_MODES
-from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, normalize_prefix_mode
+from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
 from slora.common.service_cycles import ServiceCycleRecorder
 
 
 def get_scheduler(input_params, adapter_dirs):
     if getattr(input_params, "scheduler", "slora") == "online":
-        return OnlineReqQueue(
+        adaptive = input_params.lowra_prefix_mode == LAYER_ADAPTIVE
+        queue_class = AdaptiveReqQueue if adaptive else OnlineReqQueue
+        extra = dict(space_plan_config=input_params.space_plan_config) if adaptive else {}
+        return queue_class(
             input_params.max_total_token_num, input_params.batch_max_tokens,
             input_params.running_max_req_size,
             prefix_len=input_params.lowra_shared_prefix_len if input_params.enable_lowra else 0,
@@ -48,7 +53,7 @@ def get_scheduler(input_params, adapter_dirs):
             retain_top_k=input_params.lowra_retain_top_k,
             pinned_lora_dirs=adapter_dirs[:input_params.lowra_pin_hot_adapters],
             max_active_loras=input_params.max_active_loras,
-            workspace_lora_limit=input_params.lowra_workspace_loras)
+            workspace_lora_limit=input_params.lowra_workspace_loras, **extra)
     if input_params.enable_lowra:
         prefix_mode = normalize_prefix_mode(input_params.lowra_prefix_mode)
         if prefix_mode in FULL_PREFIX_CACHE_MODES:
@@ -96,6 +101,8 @@ class RouterManager:
         self.load_way = load_way
         self.mode = mode
         self.input_params = input_params
+        if input_params.lowra_prefix_mode == LAYER_ADAPTIVE and world_size != 1:
+            raise ValueError("experimental adaptive planning currently supports TP=1 only")
         if input_params.scheduler == "online" and mode:
             raise ValueError("online scheduling currently requires the FP16 Unified Paging path")
         self.input_params.lowra_prefix_mode = normalize_prefix_mode(
@@ -206,15 +213,17 @@ class RouterManager:
         self.runtime_stats_last_time = 0.0
         self.service_cycles = None
         
+        self._init_transport(router_port, detokenization_port)
+        self.model_rpc_ports = model_rpc_ports
+        self.stats_tool = Stats(log_stats, log_stats_interval)
+
+    def _init_transport(self, router_port, detokenization_port):
         context = zmq.asyncio.Context(2)
         self.recv_from_httpserver = context.socket(zmq.PULL)
         self.recv_from_httpserver.bind(f"tcp://127.0.0.1:{router_port}")
         
         self.send_to_detokenization = context.socket(zmq.PUSH)
         self.send_to_detokenization.connect(f"tcp://127.0.0.1:{detokenization_port}")
-        self.model_rpc_ports = model_rpc_ports
-
-        self.stats_tool = Stats(log_stats, log_stats_interval)
 
 
     async def wait_to_model_ready(self):
@@ -433,6 +442,8 @@ class RouterManager:
             await self._filter_runing_batch()
 
         await self._sync_lowra_prefix_cache_state()
+        if isinstance(self.req_queue, AdaptiveReqQueue):
+            await self._plan_adaptive_space()
         preempted = False
         while self.running_batch is not None:
             plan = self.req_queue.plan(self.running_batch.reqs, [], self.lora_ranks)
@@ -451,6 +462,8 @@ class RouterManager:
                 await self._preempt_online_request(victim)
                 preempted = True
             await self._sync_lowra_prefix_cache_state()
+            if isinstance(self.req_queue, AdaptiveReqQueue):
+                await self._plan_adaptive_space(allow_admission=False)
 
         interval = self.input_params.schedule_interval
         if not preempted and (self.running_batch is None or self.has_wait_tokens >= interval):
@@ -458,6 +471,8 @@ class RouterManager:
             while new_batch is None and self.running_batch is None and self.req_queue.waiting_req_list:
                 victim = self.req_queue.waiting_req_list.pop(0)
                 self._reject_online_request(victim, "known prompt/history cannot fit online admission budgets")
+                if isinstance(self.req_queue, AdaptiveReqQueue):
+                    await self._plan_adaptive_space()
                 new_batch = self.req_queue.generate_new_batch(None, self.lora_ranks)
             if new_batch is not None:
                 if self.service_cycles is not None and self.service_cycles.current is None:
@@ -467,7 +482,14 @@ class RouterManager:
                 if not self.input_params.no_lora:
                     await asyncio.gather(*[rpc.offload_adapters(running_dirs | new_batch.adapter_dirs)
                                            for rpc in self.model_rpcs])
+                    load_start = time.perf_counter()
                     await asyncio.gather(*[rpc.load_adapters(new_batch.adapter_dirs) for rpc in self.model_rpcs])
+                    if isinstance(self.req_queue, AdaptiveReqQueue):
+                        slots = sum(4 * self.lora_ranks[d] for d in new_batch.adapter_dirs - running_dirs)
+                        if slots:
+                            measured = (time.perf_counter() - load_start) * 1000. / slots
+                            old = self.req_queue.cost.load_ms_per_slot
+                            self.req_queue.cost.load_ms_per_slot = measured if not old else 0.8 * old + 0.2 * measured
                 self.online_recomputed_tokens += sum(
                     req.input_len + len(req.output_ids) for req in new_batch.reqs if req.preemptions)
                 resumed = [dict(req_id=req.request_id, input_tokens=req.input_len,
@@ -499,8 +521,34 @@ class RouterManager:
             await self._decode_batch(self.running_batch)
             await self._filter_runing_batch()
             self.has_wait_tokens += 1
+            if isinstance(self.req_queue, AdaptiveReqQueue):
+                self.req_queue.decode_steps += 1
         elif self.service_cycles is not None and self.service_cycles.current is not None:
             self.service_cycles.finish(len(self.req_queue.waiting_req_list))
+
+    async def _plan_adaptive_space(self, allow_admission=True):
+        running = self.running_batch.reqs if self.running_batch else []
+        if not running and not self.req_queue.waiting_req_list:
+            self.req_queue.pending = None
+            return
+        allow_admission = allow_admission and (
+            not running or self.has_wait_tokens >= self.input_params.schedule_interval)
+        choice = self.req_queue.choose(running, self.lora_ranks, allow_admission)
+        if choice.plan.fits:
+            old = self.req_queue.prefix_cache_state.get("retained_layers", {})
+            if choice.plan.evictions or any(old.get(d, 0) != k for d, k in choice.layers.items()):
+                dirs = {r.adapter_dir for r in running + choice.selected}
+                # Reclaim unrelated weights before expanding prefix storage.
+                await asyncio.gather(*[rpc.offload_adapters(dirs) for rpc in self.model_rpcs])
+                await asyncio.gather(*[rpc.apply_space_plan(choice.layers, choice.plan.evictions)
+                                       for rpc in self.model_rpcs])
+                await self._sync_lowra_prefix_cache_state()
+        record = self.req_queue.last_record
+        if record is not None and getattr(self, "runtime_stats_file", None) is not None:
+            if not hasattr(self, "space_plan_stats_file"):
+                path = self.runtime_stats_file.name.rsplit(".", 1)[0] + ".plans.jsonl"
+                self.space_plan_stats_file = open(path, "a", buffering=1)
+            self.space_plan_stats_file.write(json.dumps(dict(monotonic_time=time.monotonic(), **record)) + "\n")
 
     async def _evict_online_prefixes(self, directories):
         if directories:
@@ -795,6 +843,7 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
                                lowra_retain_top_k=args.lowra_retain_top_k,
                                lowra_pin_hot_adapters=args.lowra_pin_hot_adapters,
                                nccl_port=args.nccl_port,
+                               space_plan_config=space_plan_options(args),
                               )
 
     try:

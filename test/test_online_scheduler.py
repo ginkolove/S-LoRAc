@@ -20,6 +20,15 @@ def request(identifier, adapter="a", query=5, output=20):
 
 
 class OnlineAdmissionTests(unittest.TestCase):
+    def test_prefill_token_cap_is_not_a_decode_batch_size_cap(self):
+        queue = OnlineReqQueue(100, 2, 10)
+        running = [request(str(i), query=1) for i in range(3)]
+        self.assertTrue(queue.plan(running, [], {"a": 1}).fits)
+        self.assertTrue(queue.plan(running, [request("new", query=2)], {"a": 1}).fits)
+        self.assertFalse(queue.plan(running, [request("large", query=3)], {"a": 1}).fits)
+        queue.running_max_req_size = 3
+        self.assertFalse(queue.plan(running, [request("new", query=1)], {"a": 1}).fits)
+
     def test_output_length_is_never_read(self):
         class HiddenLength:
             def __init__(self, identifier):

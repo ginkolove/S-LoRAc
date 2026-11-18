@@ -31,9 +31,10 @@ sys.path.insert(0, str(ROOT))
 
 from benchmarks.lowra_shared_ratio_exp import expand_adapter_dirs, zipf_probs
 from slora.common.prefix_modes import (
-    FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_RETAINED, LAYER_PREFETCH,
+    FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_RETAINED, LAYER_PREFETCH, LAYER_ADAPTIVE,
     normalize_prefix_mode,
 )
+from slora.common.space_plan_config import add_space_plan_arguments, space_plan_command, space_plan_options
 from benchmarks.saturation_cycles import decode_cache_entries, summarize_cycles
 from benchmarks.lmsys_maf_trace import load_trace, validate_run, bind_requests
 
@@ -392,6 +393,8 @@ def server_command(args, stats_path):
     if getattr(args, "max_active_loras", None) is not None:
         command.extend(["--max-active-loras", str(args.max_active_loras)])
     command.extend(["--lowra-reconstruction-kernel", args.reconstruction_kernel])
+    if args.mode == LAYER_ADAPTIVE:
+        command.extend(space_plan_command(args))
     if args.reconstruction_workers is not None:
         command.extend(["--lowra-reconstruction-workers", str(args.reconstruction_workers)])
     if args.mode == LAYER_RETAINED:
@@ -493,6 +496,11 @@ def suite_summary(points, args):
 
 
 async def run_suite(args):
+    print("Resolved limits: context=%s (%s), prefill_tokens=%s, running_requests=%s (%s), "
+          "pool_tokens=%s, schedule_interval=%s" % (
+              args.max_context_len, args.context_limit_source, args.batch_max_tokens,
+              args.running_max_req_size, args.running_limit_source, args.num_token,
+              args.schedule_interval), flush=True)
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = output / "manifest.json"
@@ -535,6 +543,9 @@ async def run_suite(args):
                                                     "slora/common/lowra_reconstruct.py",
                                                     "slora/common/lowra_reconstruct_bounded.py",
                                                     "slora/common/lowra_retained.py",
+                                                    "slora/common/lowra_adaptive.py",
+                                                    "slora/common/space_plan_config.py",
+                                                    "slora/server/router/adaptive_req_queue.py",
                                                     "slora/common/lowra_runtime_stats.py",
                                                     "slora/common/service_cycles.py",
                                                     "slora/server/router/manager.py",
@@ -638,7 +649,7 @@ async def run_suite(args):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", type=normalize_prefix_mode,
-                        choices=(FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_RETAINED,
+                        choices=(FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_RETAINED, LAYER_ADAPTIVE,
                                  LAYER_PREFETCH), required=True)
     parser.add_argument("--retain-layers", type=int, default=0,
                         help="First K prefix layers retained per active adapter in minikv-layer_retained.")
@@ -654,10 +665,13 @@ def parse_args():
     parser.add_argument("--prefix-len", type=int, default=1440)
     parser.add_argument("--query-len", type=int, default=480)
     parser.add_argument("--output-len", type=int, default=64)
-    parser.add_argument("--max-context-len", type=int, default=2048)
+    parser.add_argument("--max-context-len", type=int, default=None,
+                        help="Default: frozen trace context, or the synthetic request's total length.")
     parser.add_argument("--num-token", type=int, default=36864)
-    parser.add_argument("--batch-max-tokens", type=int)
-    parser.add_argument("--running-max-req-size", type=int, default=256)
+    parser.add_argument("--batch-max-tokens", type=int,
+                        help="Prefill token cap; default is the total KV token budget, not 36864.")
+    parser.add_argument("--running-max-req-size", type=int, default=None,
+                        help="Default: no extra cap below the pool/trace request-count bound.")
     parser.add_argument("--scheduler", choices=("online", "slora"), default="online",
                         help="online: no output-length-based admission; slora: legacy peak reservation.")
     parser.add_argument("--schedule-interval", type=int, default=1)
@@ -697,13 +711,20 @@ def parse_args():
                         help="Frozen LMSYS/MAF trace; per-request tokens and output lengths override fixed lengths.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dummy", action="store_true")
+    add_space_plan_arguments(parser)
     args = parser.parse_args()
+    try:
+        space_plan_options(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.mode == LAYER_ADAPTIVE and args.scheduler != "online":
+        parser.error("minikv-adaptive requires the online scheduler")
     if args.schedule_interval <= 0 or (args.max_active_loras is not None and args.max_active_loras <= 0):
         parser.error("schedule-interval and max-active-loras must be positive")
     if args.generation_max_new_tokens <= 0:
         parser.error("generation-max-new-tokens must be positive")
     args.output_length_admission = "hidden" if args.scheduler == "online" else "max_new_tokens_peak_reservation"
-    if args.reconstruction_kernel == "bounded" and args.mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED):
+    if args.reconstruction_kernel == "bounded" and args.mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE):
         parser.error("bounded reconstruction requires a layer mode")
     if args.reconstruction_workers is not None and (
             args.reconstruction_kernel != "bounded" or args.reconstruction_workers <= 0):
@@ -731,21 +752,34 @@ def parse_args():
     args.nccl_port = args.nccl_port if args.nccl_port is not None else ports[1]
     args.internal_port_start = args.internal_port_start if args.internal_port_start is not None else ports[2]
     args.batch_max_tokens = args.batch_max_tokens if args.batch_max_tokens is not None else args.num_token
+    args.context_limit_source = "explicit" if args.max_context_len is not None else "automatic"
+    args.running_limit_source = "explicit" if args.running_max_req_size is not None else "pool_bound"
     args.output_dir, args.trace_dir = args.output_dir.resolve(), args.trace_dir.resolve()
     args.workload_kind = "lmsys_maf_poisson" if args.workload_trace else "synthetic_zipf_gamma"
     if args.workload_trace:
         args.workload_trace = args.workload_trace.resolve()
         try:
             trace, args.workload_sha256 = load_trace(args.workload_trace)
+            if args.max_context_len is None:
+                args.max_context_len = trace["config"]["max_context_len"]
             validate_run(trace, args)
         except (ValueError, KeyError, TypeError, OSError) as exc:
             parser.error(str(exc))
         args.query_len = max(len(request["input_ids"]) for request in trace["requests"])
         args.output_len = max(request["output_len"] for request in trace["requests"])
         args.maf_skewness = trace["config"].get("maf_skewness")
+        if args.running_max_req_size is None:
+            args.running_max_req_size = min(args.num_token, len(trace["requests"]))
+            args.running_limit_source = "pool_and_trace_bound"
+    elif args.max_context_len is None:
+        generation_cap = args.generation_max_new_tokens if args.generation_mode == "eos" else args.output_len
+        args.max_context_len = args.prefix_len + args.query_len + generation_cap
+    if args.running_max_req_size is None:
+        args.running_max_req_size = args.num_token
     positive = (args.num_adapters, args.prefix_len, args.query_len, args.output_len, args.num_token,
                 args.running_max_req_size, args.duration, args.cv, args.stats_interval,
-                args.bin_seconds, args.startup_timeout, args.request_timeout, args.drain_timeout)
+                args.bin_seconds, args.startup_timeout, args.request_timeout, args.drain_timeout,
+                args.max_context_len, args.batch_max_tokens)
     floats = (*positive, args.warmup, args.steady_end, args.alpha, args.plateau_tolerance,
               *args.request_rates)
     if not all(math.isfinite(value) for value in floats) or min(positive) <= 0:
@@ -760,7 +794,7 @@ def parse_args():
         parser.error("completion measurement requires 0 <= warmup < steady-end")
     if not args.workload_trace and args.prefix_len + args.query_len + args.output_len > args.max_context_len:
         parser.error("prefix + query + output exceeds max-context-len")
-    if args.batch_max_tokens < args.max_context_len:
+    if args.scheduler != "online" and args.batch_max_tokens < args.max_context_len:
         parser.error("batch-max-tokens must be at least max-context-len")
     if min(args.request_rates) <= 0 or len(set(args.request_rates)) != len(args.request_rates):
         parser.error("request-rates must be positive and unique")

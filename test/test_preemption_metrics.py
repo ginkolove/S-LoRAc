@@ -67,9 +67,12 @@ class PreemptionMetricsTests(unittest.TestCase):
             self.assertEqual(value(trace, "--duration"), "180")
             self.assertEqual(value(trace, "--maf-minute-end"), "1440")
             self.assertEqual(value(trace, "--data-seed"), "42")
+            self.assertNotIn("--max-context-len", trace)
             self.assertEqual([value(cmd, "--mode") for cmd in runs],
                              ["minikv-full_reconstruct", "minikv-layer_serial"])
             for cmd in runs:
+                for option in ("--max-context-len", "--batch-max-tokens", "--running-max-req-size"):
+                    self.assertNotIn(option, cmd)
                 for flag, expected in (("--request-rates", "3"), ("--duration", "180"),
                                        ("--prefix-len", "10000"), ("--num-token", "125000"),
                                        ("--scheduler", "online"), ("--schedule-interval", "1"),
@@ -95,7 +98,7 @@ class PreemptionMetricsTests(unittest.TestCase):
         for cmd in runs:
             for flag, expected in (("--model-dir", "huggyllama/llama-13b"),
                                    ("--adapter-base", "dummy-lora-13b-rank-16"),
-                                   ("--num-token", "60000"), ("--port", "9400"),
+                                   ("--num-token", "65000"), ("--port", "9400"),
                                    ("--nccl-port", "34400"), ("--internal-port-start", "50000"),
                                    ("--request-rates", "3"), ("--duration", "180")):
                 self.assertEqual(cmd[cmd.index(flag) + 1], expected)
@@ -105,7 +108,7 @@ class PreemptionMetricsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             for extra in (["--gpu", "other"], ["--model-size", "65b"], ["--gpu"],
                           ["--prefix-len"], ["--prefix-len", "-1"], ["--prefix-len", "0"],
-                          ["--prefix-len", "16384"], ["--prefix-len", "4000.5"],
+                          ["--max-context-len", "10000"], ["--prefix-len", "4000.5"],
                           ["--prefix-len", "04000"], ["--request-rate"], ["--duration"],
                           ["--request-rate", "0"], ["--request-rate", "-1"],
                           ["--request-rate", "nan"], ["--duration", "0.0"],
@@ -136,15 +139,15 @@ class PreemptionMetricsTests(unittest.TestCase):
                              ["minikv-full_reconstruct", "minikv-layer_serial"])
             for cmd in runs:
                 for flag, expected in (("--request-rates", rate), ("--duration", duration),
-                                       ("--prefix-len", "10000"), ("--num-token", "60000"),
+                                       ("--prefix-len", "10000"), ("--num-token", "65000"),
                                        ("--adapter-base", "dummy-lora-13b-rank-16"),
                                        ("--scheduler", "online"), ("--schedule-interval", "1")):
                     self.assertEqual(value(cmd, flag), expected)
                 self.assertEqual(value(cmd, "--workload-trace"), value(trace, "--output"))
 
-    def test_30b_uses_4k_prefix_and_matching_trace_on_gpu1(self):
+    def test_30b_uses_4k_default_and_matching_trace_on_gpu1(self):
         with tempfile.TemporaryDirectory() as temporary:
-            for extra in ([], ["--prefix-len", "4000"]):
+            for extra, prefix in (([], "4000"), (["--prefix-len", "3000"], "3000")):
                 output = subprocess.check_output(
                     ["bash", str(ROOT / "benchmarks/run_lmsys_preemption.sh"), temporary,
                      "--model-size", "30b", "--gpu", "1", "--dry-run"] + extra,
@@ -153,20 +156,33 @@ class PreemptionMetricsTests(unittest.TestCase):
                 trace = next(cmd for cmd in commands if "benchmarks/prepare_lmsys_maf_trace.py" in cmd)
                 value = lambda cmd, flag: cmd[cmd.index(flag) + 1]
                 self.assertEqual(value(trace, "--tokenizer"), "huggyllama/llama-30b")
-                self.assertEqual(value(trace, "--prefix-len"), "4000")
+                self.assertEqual(value(trace, "--prefix-len"), prefix)
                 runs = [cmd for cmd in commands if "benchmarks/lowra_saturation_exp.py" in cmd]
                 self.assertEqual([value(cmd, "--mode") for cmd in runs],
                                  ["minikv-full_reconstruct", "minikv-layer_serial"])
                 for cmd in runs:
                     for flag, expected in (("--model-dir", "huggyllama/llama-30b"),
                                            ("--adapter-base", "dummy-lora-30b-rank-16"),
-                                           ("--num-token", "10240"), ("--prefix-len", "4000"),
+                                           ("--num-token", "8800"), ("--prefix-len", prefix),
                                            ("--port", "9401"), ("--nccl-port", "34401"),
                                            ("--internal-port-start", "50016"),
                                            ("--request-rates", "3"), ("--duration", "180")):
                         self.assertEqual(value(cmd, flag), expected)
                     self.assertEqual(value(cmd, "--workload-trace"), value(trace, "--output"))
                 self.assertIn("CUDA_VISIBLE_DEVICES=1", output)
+            self.assertFalse(list(Path(temporary).iterdir()))
+
+    def test_30b_oversized_prefix_rejected_before_preparation_or_gpu_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for prefix, minimum in (("5000", "10667"), ("6000", "12788")):
+                result = subprocess.run(
+                    ["bash", str(ROOT / "benchmarks/run_lmsys_preemption.sh"), temporary,
+                     "--model-size", "30b", "--prefix-len", prefix, "--dry-run"],
+                    cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("needs at least %s pool tokens" % minimum, result.stderr)
+                self.assertIn("allows 8800", result.stderr)
+                self.assertEqual(result.stdout, "")
             self.assertFalse(list(Path(temporary).iterdir()))
 
     def test_prefix_override_applies_to_trace_and_both_runs(self):
@@ -178,6 +194,22 @@ class PreemptionMetricsTests(unittest.TestCase):
         prefixes = [cmd[cmd.index("--prefix-len") + 1] for cmd in commands if "--prefix-len" in cmd]
         self.assertEqual(prefixes, ["5000", "5000", "5000"])
 
+    def test_long_prefix_and_explicit_safety_caps_forward_to_both_modes(self):
+        output = subprocess.check_output(
+            ["bash", str(ROOT / "benchmarks/run_lmsys_preemption.sh"), "/tmp/unused",
+             "--prefix-len", "20000", "--max-context-len", "32768", "--batch-max-tokens", "4096",
+             "--running-max-req-size", "20", "--schedule-interval", "10", "--dry-run"],
+            cwd=ROOT, text=True)
+        commands = [shlex.split(line) for line in output.splitlines() if line.startswith("/")]
+        for cmd in commands:
+            if "--prefix-len" in cmd:
+                self.assertEqual(cmd[cmd.index("--prefix-len") + 1], "20000")
+                self.assertEqual(cmd[cmd.index("--max-context-len") + 1], "32768")
+            if "benchmarks/lowra_saturation_exp.py" in cmd:
+                for option, expected in (("--batch-max-tokens", "4096"),
+                                         ("--running-max-req-size", "20"), ("--schedule-interval", "10")):
+                    self.assertEqual(cmd[cmd.index(option) + 1], expected)
+
 
 class PreemptionLauncherLifecycleTests(unittest.TestCase):
     def run_mocked(self, busy):
@@ -186,6 +218,8 @@ class PreemptionLauncherLifecycleTests(unittest.TestCase):
             (root / "benchmarks").mkdir()
             launcher = root / "benchmarks/run_lmsys_preemption.sh"
             shutil.copyfile(ROOT / "benchmarks/run_lmsys_preemption.sh", launcher)
+            shutil.copyfile(ROOT / "benchmarks/llama_memory_budget.sh",
+                            root / "benchmarks/llama_memory_budget.sh")
             binary = root / "bin"
             binary.mkdir()
             program = binary / "fake-python"

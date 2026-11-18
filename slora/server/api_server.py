@@ -55,7 +55,8 @@ from .api_models import (
 
 from slora.mprophet.measure import ModelProphet
 from slora.mprophet.lora_stats import LoRAProphet
-from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, normalize_prefix_mode
+from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+from slora.common.space_plan_config import add_space_plan_arguments, space_plan_options
 
 
 GB = 1024 ** 3
@@ -392,8 +393,8 @@ def main():
                         help="max tokens num for new cat batch, it control prefill batch size to Preventing OOM")
     parser.add_argument("--eos_id", type=int, default=2,
                         help="eos stop token id")
-    parser.add_argument("--running_max_req_size", type=int, default=1000,
-                        help="the max size for forward requests in the same time")
+    parser.add_argument("--running_max_req_size", type=int, default=None,
+                        help="max concurrent requests; online defaults to the KV pool token bound, legacy to 1000")
     parser.add_argument("--tp", type=int, default=1,
                         help="model tp parral size, the default is 1")
     parser.add_argument("--max_req_input_len", type=int, default=2048,
@@ -464,9 +465,17 @@ def main():
                         help="LowRA waiting-queue SLO in milliseconds. 0 disables deadline promotion.")
     ''' end of slora arguments '''
 
+    add_space_plan_arguments(parser)
     args = parser.parse_args()
+    try:
+        space_plan_options(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.lowra_prefix_mode == LAYER_ADAPTIVE and (
+            not args.enable_lowra or args.scheduler != "online" or args.tp != 1):
+        parser.error("minikv-adaptive requires --enable-lowra --scheduler online --tp 1")
     if args.lowra_reconstruction_kernel == "bounded" and (
-            not args.enable_lowra or args.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED)):
+            not args.enable_lowra or args.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE)):
         parser.error("bounded reconstruction requires enable-lowra and a layer mode")
     if args.lowra_reconstruction_workers is not None and (
             args.lowra_reconstruction_kernel != "bounded" or args.lowra_reconstruction_workers <= 0):
@@ -478,18 +487,22 @@ def main():
     if args.lowra_runtime_stats_path and not args.enable_lowra:
         parser.error("lowra-runtime-stats-path requires enable-lowra")
 
+    if args.running_max_req_size is None:
+        args.running_max_req_size = args.max_total_token_num if args.scheduler == "online" else 1000
     assert args.max_req_input_len < args.max_req_total_len
     setting["max_req_total_len"] = args.max_req_total_len
     setting["nccl_port"] = args.nccl_port
 
     if args.batch_max_tokens is None:
-        batch_max_tokens = int(1 / 6 * args.max_total_token_num)
-        batch_max_tokens = max(batch_max_tokens, args.max_req_total_len)
+        batch_max_tokens = (args.max_total_token_num if args.scheduler == "online" else
+                            max(int(1 / 6 * args.max_total_token_num), args.max_req_total_len))
         args.batch_max_tokens = batch_max_tokens
-    else:
+    elif args.scheduler != "online":
         assert (
             args.batch_max_tokens >= args.max_req_total_len
         ), "batch_max_tokens must >= max_req_total_len"
+    if args.batch_max_tokens <= 0 or args.running_max_req_size <= 0:
+        parser.error("batch_max_tokens and running_max_req_size must be positive")
 
     can_use_ports = alloc_can_use_network_port(
         num=3 + args.tp, used_nccl_port=args.nccl_port,

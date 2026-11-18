@@ -30,7 +30,8 @@ from slora.common.full_reprefill import (
 )
 from slora.common.full_reconstruct import FullReconstructPrefixKVCache, FullReconstructRuntime
 from slora.common.lowra_retained import RetainedPrefixKVCache, RetainedLayerRuntime
-from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, normalize_prefix_mode
+from slora.common.lowra_adaptive import AdaptivePrefixKVCache, AdaptiveLayerRuntime
+from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
 from slora.utils.infer_utils import set_random_seed
 from slora.utils.infer_utils import calculate_time, mark_start, mark_end
 from slora.utils.model_utils import get_model_config
@@ -172,6 +173,14 @@ class ModelRpcServer(rpyc.Service):
                     pinned_lora_dirs=list(lora_rank_map)[:getattr(input_params, "lowra_pin_hot_adapters", 0)])
                 self.lowra_runtime = FullReconstructRuntime(
                     static_store, self.model.mem_manager, self.lowra_prefix_cache)
+            elif input_params.lowra_prefix_mode == LAYER_ADAPTIVE:
+                self.lowra_prefix_cache = AdaptivePrefixKVCache(static_store.prefix_len, self.model.mem_manager)
+                self.lowra_runtime = AdaptiveLayerRuntime(
+                    static_store, self.model.mem_manager, self.lowra_prefix_cache,
+                    workspace_lora_limit=input_params.lowra_workspace_loras,
+                    reconstruction_kernel=input_params.lowra_reconstruction_kernel,
+                    reconstruction_workers=input_params.lowra_reconstruction_workers,
+                    sample_interval=input_params.space_plan_config["interval"])
             elif input_params.lowra_prefix_mode == LAYER_RETAINED:
                 self.lowra_prefix_cache = RetainedPrefixKVCache(
                     static_store.prefix_len, input_params.lowra_retain_layers, self.model.mem_manager,
@@ -237,7 +246,16 @@ class ModelRpcServer(rpyc.Service):
     def exposed_lowra_prefix_cache_state(self):
         if self.lowra_prefix_cache is None:
             return None
-        return self.lowra_prefix_cache.state_dict()
+        state = self.lowra_prefix_cache.state_dict()
+        if isinstance(self.lowra_runtime, AdaptiveLayerRuntime):
+            self.lowra_runtime.collect_observations()
+            state["adaptive_profile"] = list(self.lowra_runtime.profile_records)
+        return state
+
+    def exposed_apply_space_plan(self, layers, evictions):
+        if not isinstance(self.lowra_prefix_cache, AdaptivePrefixKVCache):
+            raise ValueError("space plans require minikv-adaptive")
+        self.lowra_prefix_cache.apply_plan(dict(layers), list(evictions))
 
     def exposed_evict_lowra_prefixes(self, lora_dirs):
         if self.lowra_prefix_cache is None:
@@ -406,6 +424,8 @@ class ModelRpcServer(rpyc.Service):
                 engine = LoraUnorderedBatchInfer(self.model, adapters, infer_adapter=self.infer_adapter)
             kwargs["no_lora_compute"] = self.input_params.no_lora_compute
             if self.lowra_runtime is not None:
+                if isinstance(self.lowra_runtime, AdaptiveLayerRuntime):
+                    self.lowra_runtime.start_observation(batch.adapter_dirs, batch.nopad_total_token_num, is_prefill)
                 prefix_by_dir = ({directory: entry.prefix_indices
                                   for directory, entry in self.lowra_prefix_cache.entries.items()}
                                  if self.lowra_prefix_cache is not None else None)
@@ -424,6 +444,8 @@ class ModelRpcServer(rpyc.Service):
             frame = kwargs.get("lowra_frame")
             if frame is not None:
                 frame.finish()
+            if isinstance(self.lowra_runtime, AdaptiveLayerRuntime):
+                self.lowra_runtime.end_observation()
         next_token_ids, next_token_probs = sample(logits, batch)
         next_token_ids = next_token_ids.detach().cpu().numpy()
         next_token_logprobs = torch.log(next_token_probs).detach().cpu().numpy()
@@ -595,6 +617,7 @@ class ModelRpcClient:
             self._evict_lowra_prefixes = async_wrap(self.model.evict_lowra_prefixes)
             self._reset_lowra_runtime = async_wrap(self.model.reset_lowra_runtime)
             self._lowra_runtime_stats = async_wrap(self.model.lowra_runtime_stats)
+            self._apply_space_plan = async_wrap(self.model.apply_space_plan)
         else:
             self._init_model = self.model.exposed_init_model
             self._load_adapters = self.model.exposed_load_adapters
@@ -612,6 +635,7 @@ class ModelRpcClient:
             self._evict_lowra_prefixes = self.model.exposed_evict_lowra_prefixes
             self._reset_lowra_runtime = self.model.exposed_reset_lowra_runtime
             self._lowra_runtime_stats = self.model.exposed_lowra_runtime_stats
+            self._apply_space_plan = getattr(self.model, "exposed_apply_space_plan", None)
         return
 
     async def init_model(self, rank_id, world_size, weight_dir, adapter_dirs,
@@ -719,6 +743,10 @@ class ModelRpcClient:
 
     async def lowra_runtime_stats(self):
         ans = self._lowra_runtime_stats()
+        return await ans if self.use_rpc else ans
+
+    async def apply_space_plan(self, layers, evictions):
+        ans = self._apply_space_plan(layers, evictions)
         return await ans if self.use_rpc else ans
 
 

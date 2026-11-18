@@ -11,12 +11,13 @@ RANK="$2"
 TRACE="$(realpath "$3")"
 OUT="$(realpath -m "$4")"
 MODEL_SIZE="${5:-7b}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/benchmarks/llama_memory_budget.sh"
 case "$MODEL_SIZE" in
-  7b) DEFAULT_TOKENS=125000 ;;
-  13b) DEFAULT_TOKENS=60000 ;;
+  7b|13b) llama_memory_budget "$MODEL_SIZE" ;;
   *) printf 'Supported MODEL_SIZE values are 7b and 13b.\n' >&2; exit 2 ;;
 esac
-NUM_TOKEN="${6:-$DEFAULT_TOKENS}"
+NUM_TOKEN="${6:-$LLAMA_POOL_TOKENS}"
 DURATION="${7:-10}"
 if ! [[ "$GPU" =~ ^[0-9]+$ && "$RANK" =~ ^[0-9]+$ ]] || [ "$RANK" -le 0 ]; then
   printf 'GPU must be nonnegative and RANK must be positive.\n' >&2
@@ -41,8 +42,8 @@ for MODE in minikv-full_reconstruct minikv-layer_serial; do
     --mode "$MODE" "${EXTRA[@]}" \
     --model-dir "huggyllama/llama-${MODEL_SIZE}" \
     --adapter-base "dummy-lora-${MODEL_SIZE}-rank-${RANK}" --num-adapters 50 \
-    --workload-trace "$TRACE" --prefix-len 10000 --max-context-len 16384 \
-    --num-token "$NUM_TOKEN" --batch-max-tokens 36864 --running-max-req-size 256 \
+    --workload-trace "$TRACE" --prefix-len 10000 \
+    --num-token "$NUM_TOKEN" \
     --request-rates 3 --duration "$DURATION" --cv 1 --seeds 42 --model-seed 42 \
     --warmup 0 --steady-end 1000000000 \
     --startup-timeout 1800 --request-timeout 10800 --drain-timeout 10800 \

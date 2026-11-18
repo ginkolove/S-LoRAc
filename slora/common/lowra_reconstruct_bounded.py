@@ -12,6 +12,7 @@ def _lowra_reconstruct_bounded_kernel(
     COUNT,
     P: tl.constexpr, E: tl.constexpr, R_TOTAL: tl.constexpr,
     MAX_RANK: tl.constexpr,
+    ACTUAL_RANK: tl.constexpr,
     B_PACKED: tl.constexpr,
     ADD_BASE: tl.constexpr,
     WORKERS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -37,7 +38,9 @@ def _lowra_reconstruct_bounded_kernel(
             rank_len = tl.load(RANK_LENS + adapter)
             scale = tl.load(SCALINGS + adapter)
             acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-            for r_base in range(0, MAX_RANK, BLOCK_R):
+            # MAX_RANK remains the B index-table stride in both execution modes.
+            rank_limit = rank_len if ACTUAL_RANK else MAX_RANK
+            for r_base in range(0, rank_limit, BLOCK_R):
                 ranks = r_base + offs_r
                 mini = tl.load(MINI + rows[:, None] * R_TOTAL + rank_start + ranks[None, :],
                                mask=(rows[:, None] < P) & (ranks[None, :] < rank_len), other=0.0)
@@ -62,8 +65,11 @@ def _lowra_reconstruct_bounded_kernel(
 @torch.no_grad()
 def lowra_reconstruct_bounded(base, mini, b_buffer, out, prefix_locs, b_locs,
                               rank_starts, rank_lens, scalings, workers=108,
-                              launch_config=(16, 64, 16, 4), b_packed=False, add_base=True):
+                              launch_config=(16, 64, 16, 4), b_packed=False, add_base=True,
+                              rank_loop="max"):
     """Write indexed KV; b_packed selects S-LoRA's paged HF B[E,rank] layout."""
+    if rank_loop not in ("max", "actual"):
+        raise ValueError("rank_loop must be 'max' or 'actual'")
     count = prefix_locs.shape[0]
     if count == 0:
         return
@@ -96,6 +102,7 @@ def lowra_reconstruct_bounded(base, mini, b_buffer, out, prefix_locs, b_locs,
     _lowra_reconstruct_bounded_kernel[(workers,)](
         base, mini, b_buffer, out, prefix_locs, b_locs, rank_starts, rank_lens, scalings, count,
         P=prefix, E=embed, R_TOTAL=mini.shape[1], MAX_RANK=max_rank,
+        ACTUAL_RANK=rank_loop == "actual",
         B_PACKED=b_packed,
         ADD_BASE=add_base,
         WORKERS=workers, BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_R=block_r,

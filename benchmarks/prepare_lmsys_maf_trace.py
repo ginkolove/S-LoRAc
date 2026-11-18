@@ -107,7 +107,8 @@ def first_turns(rows):
     return candidates
 
 
-def select_samples(candidates, count, tokenizer, rng, prefix_len, context_len, order=None):
+def select_samples(candidates, count, tokenizer, rng, prefix_len, context_len, order=None,
+                   filter_over_context=False):
     selected, rejected = [], 0
     if order is None:
         order = rng.permutation(len(candidates))
@@ -116,9 +117,18 @@ def select_samples(candidates, count, tokenizer, rng, prefix_len, context_len, o
         # Query is appended after the fixed prefix; do not insert an extra BOS.
         query = tokenizer.encode(item["query"], add_special_tokens=False)
         answer = tokenizer.encode(item["answer"], add_special_tokens=False)
-        if not query or not answer or prefix_len + len(query) + len(answer) > context_len:
+        if not query or not answer:
             rejected += 1
             continue
+        required = prefix_len + len(query) + len(answer)
+        if context_len is not None and required > context_len:
+            if filter_over_context:
+                rejected += 1
+                continue
+            raise ValueError("sample %s needs %s context tokens, exceeds --max-context-len %s; "
+                             "increase/omit the cap instead of changing the sample set, or explicitly "
+                             "use --filter-over-context for legacy filtering" %
+                             (item["source_id"], required, context_len))
         selected.append(dict(source_id=item["source_id"], source_model=item["source_model"],
                              input_ids=query, output_len=len(answer)))
         if len(selected) == count:
@@ -160,7 +170,11 @@ def build_trace(args):
         args.maf_skewness, args.num_adapters)), maf)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
     samples, rejected = select_samples(candidates, len(arrivals), tokenizer, sample_rng,
-                                       args.prefix_len, args.max_context_len, order=order)
+                                       args.prefix_len, args.max_context_len, order=order,
+                                       filter_over_context=args.filter_over_context)
+    required_context = args.prefix_len + max(len(sample["input_ids"]) + sample["output_len"]
+                                            for sample in samples)
+    context_len = args.max_context_len if args.max_context_len is not None else required_context
     adapters = adapter_rng.choice(args.num_adapters, size=len(arrivals), p=maf["adapter_probabilities"])
     requests = [dict(sample, req_id="lmsys-%s-%s" % (args.seed, i), req_time=arrival,
                      adapter_index=int(adapter))
@@ -169,7 +183,8 @@ def build_trace(args):
     output_lens = [request["output_len"] for request in requests]
     return dict(schema=SCHEMA, config=dict(
         tokenizer=args.tokenizer, vocab_size=len(tokenizer), num_adapters=args.num_adapters,
-        prefix_len=args.prefix_len, max_context_len=args.max_context_len,
+        prefix_len=args.prefix_len, max_context_len=context_len,
+        context_limit_source="explicit" if args.max_context_len is not None else "sample_maximum",
         request_rate=args.request_rate, duration=args.duration, seed=args.seed, data_seed=args.data_seed,
         arrival_distribution="homogeneous_poisson", adapter_distribution="maf_block_round_robin",
         maf_skewness=args.maf_skewness, maf_minute_start=args.maf_minute_start,
@@ -178,11 +193,13 @@ def build_trace(args):
         dataset=dict(files=source_files, data_seed=args.data_seed,
                      rows=len(rows), first_turn_candidates=len(candidates),
                      scope="first user/assistant pair from both branches; no subsequent-turn replay",
-                     sample_policy="fixed seed-permuted candidate order; reject empty or over-context pairs; no truncation",
+                     sample_policy=("legacy_filter_over_context" if args.filter_over_context else
+                                    "fixed seed-permuted nonempty pairs; no length filtering or truncation"),
                      rejected_candidates=rejected, add_special_tokens=False,
                      output_policy="generate exactly the token count of the recorded answer, ignore EOS",
                      shared_prefix="synthetic fixed prefix, not native LMSYS prefix reuse"),
-        summary=dict(total_requests=len(requests), adapter_counts=dict(Counter(map(int, adapters))),
+        summary=dict(total_requests=len(requests), required_context_len=required_context,
+                     adapter_counts=dict(Counter(map(int, adapters))),
                      query_tokens=dict(min=min(query_lens), mean=float(np.mean(query_lens)), max=max(query_lens)),
                      output_tokens=dict(min=min(output_lens), mean=float(np.mean(output_lens)), max=max(output_lens))),
         requests=requests)
@@ -200,7 +217,10 @@ def parse_args(argv=None):
     parser.add_argument("--tokenizer", default="huggyllama/llama-7b")
     parser.add_argument("--num-adapters", type=int, default=50)
     parser.add_argument("--prefix-len", type=int, default=10000)
-    parser.add_argument("--max-context-len", type=int, default=16384)
+    parser.add_argument("--max-context-len", type=int, default=None,
+                        help="Optional total-length cap. Omitted: derive from the fixed selected samples.")
+    parser.add_argument("--filter-over-context", action="store_true",
+                        help="Legacy sampling: skip over-cap samples. Changes the selected workload.")
     parser.add_argument("--request-rate", type=float, default=3)
     parser.add_argument("--duration", type=float, default=10)
     parser.add_argument("--seed", type=int, default=42)
@@ -209,7 +229,9 @@ def parse_args(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if (args.seed < 0 or args.data_seed < 0 or args.num_adapters <= 0 or args.maf_skewness <= 0
-            or not 0 < args.prefix_len < args.max_context_len
+            or args.prefix_len <= 0
+            or (args.max_context_len is not None and args.prefix_len >= args.max_context_len)
+            or (args.filter_over_context and args.max_context_len is None)
             or not 1 <= args.maf_minute_start <= args.maf_minute_end <= 1440):
         parser.error("invalid seed, prefix, adapter count or MAF configuration")
     return args

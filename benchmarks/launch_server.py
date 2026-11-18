@@ -6,7 +6,8 @@ from pathlib import Path
 
 from exp_suite import BASE_MODEL, LORA_DIR
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, normalize_prefix_mode
+from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, LAYER_ADAPTIVE, normalize_prefix_mode
+from slora.common.space_plan_config import add_space_plan_arguments, space_plan_command
 
 
 if __name__ == "__main__":
@@ -48,6 +49,7 @@ if __name__ == "__main__":
     parser.add_argument("--lowra-wait-slo-ms", type=float, default=0.0)
     parser.add_argument("--vllm-mem-ratio", type=float, default=0.95)
     parser.add_argument("--print-only", action="store_true")
+    add_space_plan_arguments(parser)
     args = parser.parse_args()
 
     base_model = args.model_dir or BASE_MODEL[args.model_setting]
@@ -114,6 +116,8 @@ if __name__ == "__main__":
             cmd += " --enable-lowra"
             cmd += f" --lowra-shared-prefix-len {args.lowra_shared_prefix_len}"
             cmd += f" --lowra-prefix-mode {args.lowra_prefix_mode}"
+            if args.lowra_prefix_mode == LAYER_ADAPTIVE:
+                cmd += " " + " ".join(space_plan_command(args))
             cmd += f" --lowra-reconstruction-kernel {args.lowra_reconstruction_kernel}"
             if args.lowra_reconstruction_workers is not None:
                 cmd += f" --lowra-reconstruction-workers {args.lowra_reconstruction_workers}"

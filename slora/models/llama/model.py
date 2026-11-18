@@ -12,6 +12,7 @@ from slora.models.llama.infer_struct import LlamaInferStateInfo
 from slora.common.mem_allocator import MemoryAllocator
 from slora.common.int8kv_mem_manager import INT8KVMemoryManager
 from slora.common.basemodel import TpPartBaseModel
+from slora.common.configs.config import setting
 
 
 class LlamaTpPartModel(TpPartBaseModel):
@@ -104,7 +105,8 @@ class LlamaTpPartModel(TpPartBaseModel):
             pass
 
         inv_freq = 1.0 / (base ** (torch.arange(0, self.head_dim_, 2, device="cpu", dtype=torch.float32) / self.head_dim_))
-        t = torch.arange(max_seq_len + 1024 * 64, device="cpu", dtype=torch.float32) / rope_scaling_factor
+        table_len = max(int(max_seq_len + 1024 * 64), int(setting.get("max_req_total_len", 0)))
+        t = torch.arange(table_len, device="cpu", dtype=torch.float32) / rope_scaling_factor
         freqs = torch.outer(t, inv_freq)
 
         self._cos_cached = torch.cos(freqs).to(torch.float16).cuda()
@@ -115,7 +117,7 @@ class LlamaTpPartModel(TpPartBaseModel):
         max_position_embeddings = self.config.get("max_position_embeddings", 2048)
         base = self.config.get("rope_theta", 10000.0)
         scaling_factor = self.config.get("rope_scaling", {}).get("factor", 1.0)
-        max_seq_len = 32 * max_position_embeddings # 64k
+        max_seq_len = max(32 * max_position_embeddings, int(setting.get("max_req_total_len", 0)))
         self._cos_cached = torch.zeros((max_seq_len, self.head_dim_ // 2), dtype=torch.float16, device="cuda")
         self._sin_cached = torch.zeros((max_seq_len, self.head_dim_ // 2), dtype=torch.float16, device="cuda")
         

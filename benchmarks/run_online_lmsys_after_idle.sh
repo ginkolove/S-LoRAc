@@ -18,6 +18,7 @@ for OPTION in "$@"; do
   esac
 done
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$ROOT/benchmarks/llama_memory_budget.sh"
 OUT="$(realpath -m "$OUTPUT_ARG")"
 PYTHON="${SLORA_PYTHON:-/home/qlh/anaconda3/envs/slora/bin/python}"
 TRACE_PYTHON="${SLORA_TRACE_PYTHON:-$PYTHON}"
@@ -42,14 +43,17 @@ prepare_trace() {
     --maf-file /data/hub/MAF/azurefunctions2019/invocations_per_function_md.anon.d01.csv \
     --maf-skewness 1 --maf-minute-start 1 --maf-minute-end 1440 \
     --tokenizer "huggyllama/llama-${SIZE}" --num-adapters 50 \
-    --prefix-len 10000 --max-context-len 16384 \
+    --prefix-len 10000 \
     --request-rate 5 --duration 60 --seed 42 --data-seed 42 \
     --output "$OUT/traces/llama${SIZE}/trace.json"
 }
 
 run_model() (
-  local GPU="$1" SIZE="$2" TOKENS="$3"
+  local GPU="$1" SIZE="$2"
+  llama_memory_budget "$SIZE"
+  local TOKENS="$LLAMA_POOL_TOKENS"
   export CUDA_VISIBLE_DEVICES="$GPU"
+  printf 'Llama-%s pool=%s tokens; matched model weights + pool=%s bytes (about 79.1 GB decimal).\n' "$SIZE" "$TOKENS" "$LLAMA_WEIGHT_POOL_BYTES"
   for MODE in minikv-full_reconstruct minikv-layer_serial; do
     EXTRA=()
     if [ "$MODE" = minikv-layer_serial ]; then
@@ -60,8 +64,8 @@ run_model() (
       --model-dir "huggyllama/llama-${SIZE}" \
       --adapter-base "dummy-lora-${SIZE}-rank-16" --num-adapters 50 \
       --workload-trace "$OUT/traces/llama${SIZE}/trace.json" \
-      --prefix-len 10000 --max-context-len 16384 \
-      --num-token "$TOKENS" --batch-max-tokens 36864 --running-max-req-size 256 \
+      --prefix-len 10000 \
+      --num-token "$TOKENS" \
       --scheduler online --schedule-interval 1 --generation-mode trace \
       --request-rates 5 --duration 60 --cv 1 --seeds 42 --model-seed 42 \
       --warmup 0 --steady-end 1000000000 \
@@ -85,9 +89,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
     printf 'Wait until GPUs 0 and 1 have no compute processes for two consecutive checks.\n'
   fi
   printf 'CUDA_VISIBLE_DEVICES=0\n'
-  run_model 0 7b 125000
+  run_model 0 7b
   printf 'CUDA_VISIBLE_DEVICES=1\n'
-  run_model 1 13b 60000
+  run_model 1 13b
   exit 0
 fi
 
@@ -135,9 +139,9 @@ while [ "$IDLE_CHECKS" -lt "$REQUIRED_IDLE_CHECKS" ]; do
 done
 
 printf 'Both GPUs are free. Starting 7B on GPU0 and 13B on GPU1.\n'
-run_model 0 7b 125000 > "$OUT/llama7b.log" 2>&1 &
+run_model 0 7b > "$OUT/llama7b.log" 2>&1 &
 PID7=$!
-run_model 1 13b 60000 > "$OUT/llama13b.log" 2>&1 &
+run_model 1 13b > "$OUT/llama13b.log" 2>&1 &
 PID13=$!
 printf 'Worker PIDs: 7B=%s 13B=%s; output=%s\n' "$PID7" "$PID13" "$OUT"
 STATUS=0

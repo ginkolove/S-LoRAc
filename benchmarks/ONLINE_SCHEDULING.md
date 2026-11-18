@@ -98,3 +98,93 @@ The opt-in GPU test uses a small three-layer, 1024-hidden dummy model with
 nonzero MiniKV/BaseKV. It compares uninterrupted and preempted/resumed greedy
 outputs, with sampling penalties, and verifies private/prefix/workspace cleanup.
 It is a correctness test, not a serving-throughput benchmark or a TP=2 test.
+
+# Automatic Replay Limits
+
+The LMSYS launchers no longer impose a 16,384-token context limit, a
+36,864-token prefill cap, or a 256-request running limit by default.
+`prepare_lmsys_maf_trace.py` selects nonempty examples in a fixed seed order
+without filtering by length, then derives the total context limit from
+`prefix_len + max(query_len + answer_len)` over the selected requests.
+Changing only the prefix length preserves sample IDs, query/output lengths,
+arrival times and adapter assignments. This remains a first-turn workload with
+a synthetic shared prefix, not a native multi-turn agent trace.
+
+An explicit `--max-context-len` that is too small fails rather than silently
+selecting shorter samples. The data-preparation-only `--filter-over-context`
+option reproduces the old filtering policy when an explicit cap is supplied.
+Existing frozen traces remain readable; their previously filtered-out samples
+cannot be restored by raising a server limit. Generate a fresh trace/output
+directory for the new sampling policy.
+
+The benchmark inherits context length from the trace. Online prefill capacity
+defaults to `num_token`, and the running-request limit defaults to the smaller
+of the pool token count and the number of trace requests (pool count for
+synthetic workloads). These are nonbinding bounds relative to the pool/trace,
+not output-length reservations. The online scheduler continues to use only
+known input/history plus immediate KV headroom, checking space before each
+decode and using existing eviction/preemption when necessary. A prefill token
+cap no longer also limits the decode batch's request count.
+
+The paired launcher accepts explicit `--max-context-len`, `--batch-max-tokens`,
+`--running-max-req-size`, and `--schedule-interval` overrides. Context and prefill
+budgets are independent for online scheduling: a long shared prefix does not
+require an equally large query-prefill cap. Explicit small prefill caps can
+still make individual requests inadmissible; chunked prefill is not introduced.
+Legacy S-LoRA scheduling keeps its original length-budget validation.
+
+Ordinary LLaMA RoPE tables now cover at least the configured server context
+limit without changing frequencies or wrapping positions. This permits long
+performance experiments, not a claim of long-context model accuracy. KV pool
+budgeting still does not guarantee enough memory for activations, workspaces
+and other allocations. Keep GPU headroom and use an explicit prefill cap when
+needed; removing fixed experimental caps is not an OOM guarantee. Resolved
+limits are printed at launch and saved in the manifest.
+
+## Matched Model Weights + Pool Budget
+
+The three LMSYS shell launchers share `llama_memory_budget.sh`. The current
+profile retains the original A100-80GB paper pool budgets for 7B (125,000 tokens)
+and 13B (65,000 tokens), and assigns 8,800 tokens to 30B so that **weights plus
+the total pool are about 79.1 GB (decimal) for all three models**. This supersedes
+the earlier 73-decimal-GB cap and idle-memory-minus-7-GB policy. The comparison
+uses measured FP16, TP=1 `base_model_weight_bytes`, excluding model buffers such
+as RoPE tables, and `4 * layers * hidden_size` bytes per pool token. The 30B
+model is our 60-layer, 6656-hidden model, not the original modified S5 model.
+This is a frozen reproducible profile, not a live GPU-memory autosizer.
+
+| Model | Weight bytes | Bytes per token | Default pool tokens | Weights + pool GB |
+| --- | ---: | ---: | ---: | ---: |
+| Llama-7B | 13,476,831,232 | 524,288 | 125,000 | 79.012831 |
+| Llama-13B | 26,031,728,640 | 819,200 | 65,000 | 79.279729 |
+| Llama-30B | 65,057,887,232 | 1,597,440 | 8,800 | 79.115359 |
+
+The original budgets are in `paper/synthetic/slora/exp_cmds_a100-80_S1.sh` and
+`paper/synthetic/slora/exp_cmds_a100-80_S4.sh`.
+
+The measurements come from per-rank `base_model_weight_bytes` in `runtime.jsonl`:
+
+- `results/llama7b_prefix15k_req3_180s_20261114_121857/`
+- `results/lmsys_preemption_13b_p10000_r5_t240_gpu0_20261111_092926/`
+- `results/lmsys_preemption_30b_p4000_r3_t180_20261111_062609/`
+
+The pool budget still includes static BaseKV/MiniKV and dynamic prefix, private
+KV, adapter and layer-workspace allocations. Both idle A100-80GB GPUs reported
+81,153 MiB available on 2026-11-14, approximately 85.095 GB. The remaining
+5.815-6.082 GB must cover model buffers, runtime activations, pool-external
+temporaries, allocator fragmentation and CUDA costs.
+This is not a hard peak-memory limit or an OOM guarantee. Recalibrate for a
+different GPU, dtype, TP degree, model or substantially larger model buffers.
+Direct `lowra_saturation_exp.py --num-token` values and the rank launcher's
+explicit token override remain authoritative and can leave this matched profile.
+
+**30B with a 4,000-token prefix can admit short queries but cannot complete the
+whole current trace in full reconstruction at this budget.** Its static region
+uses 4,481 equivalent slots; one full prefix and a rank-16 adapter leave only
+255 slots for private prompt/history. A one-token query plus immediate headroom
+fits (8,547 slots total), so the launcher's minimum-capacity check passes, but
+some queries and the longest private history (1,529 tokens) cannot fit. An
+explicit `--model-size 30b --prefix-len 3000` passes that single-request history
+capacity check. The suite never silently shortens the prefix or drops samples
+to fit. The early check is only a minimum capacity check; actual query/history
+growth and execution peaks still matter.
