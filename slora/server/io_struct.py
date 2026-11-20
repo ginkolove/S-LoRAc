@@ -1,3 +1,4 @@
+from copy import copy
 from .sampling_params import SamplingParams
 from typing import Dict, List, Optional, Tuple
 import asyncio
@@ -5,18 +6,22 @@ import time
 
 
 class Req:
-    def __init__(self, adapter_dir, request_id, prompt_ids, sample_params: SamplingParams, lowra_lengths=None):
+    def __init__(self, adapter_dir, request_id, prompt_ids, sample_params: SamplingParams,
+                 lowra_lengths=None, *, hide_output_limit=False):
         self.adapter_dir = adapter_dir
         self.request_id = request_id
         self.prompt_ids = prompt_ids
         self.input_len = len(prompt_ids)
-        self.max_output_len = sample_params.max_new_tokens
+        self.max_output_len = None if hide_output_limit else sample_params.max_new_tokens
         lowra_lengths = lowra_lengths or {}
         self.lowra_shared_prefix_len = int(lowra_lengths.get("shared_prefix_len", 0))
         self.lowra_query_len = int(lowra_lengths.get("query_len", self.input_len))
-        self.lowra_decode_len = int(lowra_lengths.get("decode_len", self.max_output_len))
+        self.lowra_decode_len = (None if hide_output_limit
+                                 else int(lowra_lengths.get("decode_len", self.max_output_len)))
         self.prefix_input_ids = lowra_lengths.get("prefix_input_ids")
-        self.sample_params = sample_params
+        self.sample_params = copy(sample_params) if hide_output_limit else sample_params
+        if hide_output_limit:
+            self.sample_params.max_new_tokens = None
         self.output_ids = []
         self.output_metadata_list = []
         self.has_generate_finished = False
@@ -25,18 +30,19 @@ class Req:
         self.preemptions = 0
 
     def to_rpc_obj(self):
-        return {"adapter_dir": self.adapter_dir,
+        request = {"adapter_dir": self.adapter_dir,
                 "request_id": self.request_id,
                 # Recompute uses the immutable prompt plus already emitted tokens.
                 # Always copy: single-rank RPC shares Python objects with the router.
                 "input_id": list(self.prompt_ids) + list(self.output_ids),
                 "generated_ids": list(self.output_ids),
-                "output_len": self.max_output_len,
                 "lowra_shared_prefix_len": self.lowra_shared_prefix_len,
                 "lowra_query_len": self.lowra_query_len,
-                "lowra_decode_len": self.lowra_decode_len,
                 "prefix_input_ids": self.prefix_input_ids,
                 "sampling_param": self.sample_params.to_dict() }
+        if self.max_output_len is not None:
+            request.update(output_len=self.max_output_len, lowra_decode_len=self.lowra_decode_len)
+        return request
 
     def to_req_detokenization_state(self):
         out = ReqDetokenizationState(self.request_id, self.prompt_ids, self.max_output_len, self.sample_params.ignore_eos)
@@ -64,7 +70,7 @@ class ReqDetokenizationState:
         self,
         request_id: str,
         prompt_ids: List[int],
-        max_output_len: int,
+        max_output_len: Optional[int],
         ignore_eos: bool,
     ) -> None:
         self.request_id = request_id
@@ -107,7 +113,7 @@ class Batch:
             tokens += req.input_len + len(req.output_ids)
         return tokens
 
-    def mark_finished_req(self, eos_id):
+    def mark_finished_req(self, eos_id, output_limits=None):
         has_new_finish = False
         for req in self.reqs:
             if req.stop_sequences_matched():
@@ -116,7 +122,10 @@ class Batch:
             if req.output_ids[-1] == eos_id and req.sample_params.ignore_eos == False:
                 req.has_generate_finished = True
                 has_new_finish = True
-            if len(req.output_ids) >= req.max_output_len or req.aborted:
+            limit = req.max_output_len
+            if limit is None and not req.aborted:
+                limit = output_limits[req.request_id]
+            if req.aborted or (limit is not None and len(req.output_ids) >= limit):
                 req.has_generate_finished = True
                 has_new_finish = True
         return has_new_finish

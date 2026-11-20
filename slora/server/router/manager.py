@@ -35,7 +35,7 @@ from slora.server.router.online_req_queue import OnlineReqQueue
 from slora.server.router.adaptive_req_queue import AdaptiveReqQueue
 from slora.common.space_plan_config import space_plan_options
 from slora.common.full_reprefill import FULL_REPREFILL_MODES, FULL_PREFIX_CACHE_MODES
-from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_MODES, CPU_FIXED_R64, CPU_PIN_COUNTS, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
 from slora.common.service_cycles import ServiceCycleRecorder
 
 
@@ -110,6 +110,14 @@ class RouterManager:
         retain_layers = getattr(input_params, "lowra_retain_layers", 0)
         retain_top_k = getattr(input_params, "lowra_retain_top_k", None)
         pin_count = getattr(input_params, "lowra_pin_hot_adapters", 0)
+        if input_params.lowra_prefix_mode in (ACTIVE_REPREFILL, *CPU_MODES):
+            if not input_params.enable_lowra or input_params.scheduler != "online" or world_size != 1:
+                raise ValueError("active prefix source benchmarks require --enable-lowra --scheduler online --tp 1")
+            if input_params.lowra_prefix_mode in CPU_PIN_COUNTS:
+                ids = input_params.cpu_fixed_hot_indices
+                if (len(ids) != CPU_PIN_COUNTS[input_params.lowra_prefix_mode] or len(set(ids)) != len(ids)
+                        or not all(0 <= i < len(adapter_dirs) for i in ids)):
+                    raise ValueError("invalid fixed hot adapter indices for " + input_params.lowra_prefix_mode)
         if pin_count < 0 or pin_count > len(adapter_dirs):
             raise ValueError("--lowra-pin-hot-adapters must be between zero and the configured adapter count")
         if pin_count and (not input_params.enable_lowra or input_params.lowra_prefix_mode not in
@@ -136,6 +144,10 @@ class RouterManager:
             config, _ = get_lora_config(lora_dir, input_params.dummy)
             self.lora_ranks[lora_dir] = config["r"]
         self.lora_ranks[None] = 0
+        if input_params.lowra_prefix_mode == CPU_FIXED_R64:
+            hot_dir = adapter_dirs[input_params.cpu_fixed_hot_indices[0]]
+            if self.lora_ranks[hot_dir] != 64:
+                raise ValueError("fixed1-r64 requires a rank-64 adapter")
 
         if (self.input_params.enable_lowra and self.input_params.lowra_shared_prefix_len > 0
                 and self.input_params.lowra_prefix_mode not in FULL_REPREFILL_MODES):
@@ -204,6 +216,7 @@ class RouterManager:
         self.has_wait_tokens = 0
         self.max_wait_tokens = 10
         self.online_preemptions = 0
+        self.online_output_limits = {}
         self.online_preempted_request_ids = set()
         self.online_recomputed_tokens = 0
         self.online_rejections = 0
@@ -276,12 +289,18 @@ class RouterManager:
         request_id: str,
         lowra_lengths=None,
     ):
-        req = Req(adapter_dir, request_id, prompt_ids, sampling_params, lowra_lengths)
+        online = self.input_params.scheduler == "online"
+        req = Req(adapter_dir, request_id, prompt_ids, sampling_params, lowra_lengths,
+                  hide_output_limit=online)
+        if online:
+            # Consume this limit only after a token has been generated, never in admission.
+            self.online_output_limits[request_id] = sampling_params.max_new_tokens
         self.req_queue.append(req)
         self.send_to_detokenization.send_pyobj(req.to_req_detokenization_state())
         return
 
     async def abort(self, request_id):
+        self.online_output_limits.pop(request_id, None)
         if self.running_batch is not None:
             for req in self.running_batch.reqs:
                 if req.request_id == request_id:
@@ -445,10 +464,16 @@ class RouterManager:
         if isinstance(self.req_queue, AdaptiveReqQueue):
             await self._plan_adaptive_space()
         preempted = False
+        pending_decode_evictions = []
         while self.running_batch is not None:
             plan = self.req_queue.plan(self.running_batch.reqs, [], self.lora_ranks)
             if plan.fits:
-                await self._evict_online_prefixes(plan.evictions)
+                # A decode-only probe has not yet considered the incoming mini-batch.
+                # Commit its evictions only if decode is actually the next forward.
+                if self.req_queue.prefix_cache_state.get("reuse_next_batch"):
+                    pending_decode_evictions = plan.evictions
+                else:
+                    await self._evict_online_prefixes(plan.evictions)
                 break
             # No allocation happens until a feasible decode plan exists.
             victim = self.running_batch.reqs[-1]
@@ -517,6 +542,8 @@ class RouterManager:
                 self.has_wait_tokens = 0
                 return
         if self.running_batch is not None:
+            if pending_decode_evictions:
+                await self._evict_online_prefixes(pending_decode_evictions)
             self.stats_tool.count_output_tokens(self.running_batch)
             await self._decode_batch(self.running_batch)
             await self._filter_runing_batch()
@@ -556,6 +583,7 @@ class RouterManager:
             await self._sync_lowra_prefix_cache_state()
 
     def _reject_online_request(self, req, reason):
+        self.online_output_limits.pop(req.request_id, None)
         req.aborted = req.has_generate_finished = True
         self.online_rejections += 1
         print("online admission rejected %s: %s" % (req.request_id, reason), flush=True)
@@ -680,7 +708,7 @@ class RouterManager:
         else:
             req_to_out_token_id = ans[0]
         self._add_token_id_to_req(batch, req_to_out_token_id)
-        has_new_finished_req = batch.mark_finished_req(self.eos_id)
+        has_new_finished_req = batch.mark_finished_req(self.eos_id, self.online_output_limits)
         self._send_to_detokenization_proc(batch, req_to_out_token_id)
         await self._handle_finish_req(batch, has_new_finished_req, minibatch=True)
         return
@@ -694,7 +722,7 @@ class RouterManager:
         else:
             req_to_out_token_id = ans[0]
         self._add_token_id_to_req(batch, req_to_out_token_id)
-        has_new_finished_req = batch.mark_finished_req(self.eos_id)
+        has_new_finished_req = batch.mark_finished_req(self.eos_id, self.online_output_limits)
         self._send_to_detokenization_proc(batch, req_to_out_token_id)
         await self._handle_finish_req(batch, has_new_finished_req)
         return
@@ -717,9 +745,10 @@ class RouterManager:
 
     async def _handle_finish_req(self, batch: Batch, has_new_finished_req, minibatch=False):
         if has_new_finished_req:
-            if self.service_cycles is not None:
-                for req in batch.reqs:
-                    if req.has_generate_finished:
+            for req in batch.reqs:
+                if req.has_generate_finished:
+                    self.online_output_limits.pop(req.request_id, None)
+                    if self.service_cycles is not None:
                         self.service_cycles.complete(req.request_id, req.aborted)
             batch.filter_finished()
 
@@ -842,6 +871,10 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
                                lowra_retain_layers=args.lowra_retain_layers,
                                lowra_retain_top_k=args.lowra_retain_top_k,
                                lowra_pin_hot_adapters=args.lowra_pin_hot_adapters,
+                               cpu_prefix_token_id=args.cpu_prefix_token_id,
+                               cpu_prefix_pool_gb=args.cpu_prefix_pool_gb,
+                               reuse_next_reconstructed=args.reuse_next_reconstructed,
+                               cpu_fixed_hot_indices=args.cpu_fixed_hot_indices,
                                nccl_port=args.nccl_port,
                                space_plan_config=space_plan_options(args),
                               )

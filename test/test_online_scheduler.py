@@ -189,6 +189,7 @@ def make_router(queue, rpc, ranks):
     router.send_to_detokenization = SimpleNamespace(send_pyobj=router.messages.append)
     router.service_cycles = ServiceCycleRecorder(io.StringIO())
     router.online_preemptions = router.online_recomputed_tokens = router.online_rejections = 0
+    router.online_output_limits = {}
     router.online_preempted_request_ids = set()
     router.preemption_stats_file = io.StringIO()
     return router
@@ -203,11 +204,46 @@ async def drain(router, steps=2000):
 
 
 class OnlineLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_next_batch_handoff_defers_eviction_until_admission_is_known(self):
+        class HandoffRPC(FakeRPC):
+            idle = None
+
+            async def lowra_prefix_cache_state(self):
+                return dict(reuse_next_batch=True, cached_lora_dirs=set(self.idle),
+                            inactive_lora_dirs=set(self.idle))
+
+            async def evict_lowra_prefixes(self, dirs):
+                self.idle.difference_update(dirs)
+
+        for admit in (False, True):
+            queue = OnlineReqQueue(200, 100, 6, prefix_len=4, prefix_mode=FULL_RECONSTRUCT)
+            rpc = HandoffRPC(200)
+            rpc.idle = set()
+            router = make_router(queue, rpc, dict.fromkeys("abcd", 1))
+            queue.append(request("running", "a"))
+            await router._step_online()
+            # b and c are now idle. Only b will be wanted by the new batch.
+            rpc.idle = {"b", "c"}
+            router.has_wait_tokens = 1
+            if admit:
+                queue.append(request("new", "b"))
+            await router._step_online()
+            self.assertEqual(rpc.idle, {"b"} if admit else set())
+
     async def test_pressure_recompute_preserves_every_output_and_frees_every_slot(self):
         queue, rpc = OnlineReqQueue(32, 100, 10), FakeRPC(32)
-        reqs = [request("a1", output=20), request("a2", output=15), request("b", "b", output=18)]
-        queue.waiting_req_list = reqs[:]
+        caps = {"a1": 20, "a2": 15, "b": 18}
         router = make_router(queue, rpc, {"a": 1, "b": 1})
+        for identifier, cap in caps.items():
+            params = SamplingParams(max_new_tokens=cap, ignore_eos=True)
+            params.stop_sequences = []
+            router.add_req(identifier[0], [10] * 5, params, identifier, {"decode_len": cap})
+        reqs = queue.waiting_req_list[:]
+        for req in reqs:
+            self.assertIsNone(req.max_output_len)
+            self.assertIsNone(req.lowra_decode_len)
+            self.assertIsNone(req.sample_params.max_new_tokens)
+        self.assertEqual(router.online_output_limits, caps)
         await drain(router)
         self.assertGreater(router.online_preemptions, 0)
         self.assertGreater(len(rpc.resumes), 0)
@@ -223,14 +259,22 @@ class OnlineLifecycleTests(unittest.IsolatedAsyncioTestCase):
             req["input_tokens"] + req["generated_tokens"] for row in resumes for req in row["requests"]))
         self.assertEqual(sum(len(row["requests"]) for row in resumes), len(rpc.resumes))
         self.assertTrue(all(row["prefill_wall_seconds"] >= 0 for row in resumes))
+        for payload in rpc.resumes:
+            self.assertNotIn("output_len", payload)
+            self.assertNotIn("lowra_decode_len", payload)
+            self.assertNotIn("max_new_tokens", payload["sampling_param"])
         for req in reqs:
-            emitted = [token for message in router.messages if isinstance(message, BatchTokenIdOut)
-                       for identifier, token, _, _, _ in message.reqs_infs if identifier == req.request_id]
-            self.assertEqual(emitted, list(range(101, 101 + req.max_output_len)))
+            outputs = [(token, finished) for message in router.messages if isinstance(message, BatchTokenIdOut)
+                       for identifier, token, _, finished, _ in message.reqs_infs if identifier == req.request_id]
+            emitted = [token for token, _ in outputs]
+            cap = caps[req.request_id]
+            self.assertEqual(emitted, list(range(101, 101 + cap)))
+            self.assertEqual([finished for _, finished in outputs], [False] * (cap - 1) + [True])
             self.assertEqual(req.output_ids, emitted)
             self.assertEqual(req.prompt_ids, [10] * 5)
         self.assertEqual(rpc.batches, {})
         self.assertEqual(rpc.adapters, set())
+        self.assertEqual(router.online_output_limits, {})
 
     async def test_impossible_prompt_rejects_instead_of_hanging(self):
         queue, rpc = OnlineReqQueue(20, 100, 10), FakeRPC(20)

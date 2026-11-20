@@ -11,7 +11,7 @@ import uuid
 from ..io_struct import Batch
 from .req_queue import ReqQueue
 from slora.common.prefix_modes import (
-    FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, normalize_prefix_mode,
+    FULL_REPREFILL, FULL_PREFIX_CACHE_MODES, PREFILL_BUILD_MODES, LAYER_RETAINED, normalize_prefix_mode,
 )
 
 
@@ -63,7 +63,7 @@ class OnlineReqQueue(ReqQueue):
         scratch = 0
         after = dict(sizes)
         before = dict(sizes)
-        if self.prefix_len and self.prefix_mode in (FULL_REPREFILL, FULL_RECONSTRUCT):
+        if self.prefix_len and self.prefix_mode in FULL_PREFIX_CACHE_MODES:
             for directory in cached | needed:
                 before[directory] = after[directory] = self.prefix_len
             prefix_build_tokens = len({r.adapter_dir for r in selected} - cached) * self.prefix_len
@@ -93,19 +93,19 @@ class OnlineReqQueue(ReqQueue):
         evictions = []
         last_used = state.get("last_used", {})
         for directory in sorted(inactive - needed - pinned, key=lambda d: (last_used.get(d, 0), d)):
-            if required() <= self.max_total_tokens:
+            if not state.get("reuse_next_batch") and required() <= self.max_total_tokens:
                 break
             before.pop(directory, None)
             after.pop(directory, None)
             evictions.append(directory)
         # Only reprefill computes missing prefixes as prompt tokens. MiniKV
         # reconstruction consumes memory/compute but not the prefill token budget.
-        prefill_tokens = query_tokens + (prefix_build_tokens if self.prefix_mode == FULL_REPREFILL else 0)
+        prefill_tokens = query_tokens + (prefix_build_tokens if self.prefix_mode in PREFILL_BUILD_MODES else 0)
         fits = (required() <= self.max_total_tokens
                 and len(requests) <= self.running_max_req_size
                 and prefill_tokens <= self.batch_max_tokens
                 and (self.max_active_loras is None or len(needed) <= self.max_active_loras)
-                and (not self.prefix_len or self.prefix_mode in (FULL_REPREFILL, FULL_RECONSTRUCT)
+                and (not self.prefix_len or self.prefix_mode in FULL_PREFIX_CACHE_MODES
                      or self.workspace_lora_limit is None or len(needed) <= self.workspace_lora_limit))
         return OnlinePlan(fits, required(), evictions, prefill_tokens, prefix_build_tokens)
 

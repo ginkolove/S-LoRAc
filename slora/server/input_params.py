@@ -1,4 +1,4 @@
-from slora.common.prefix_modes import FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+from slora.common.prefix_modes import CPU_MODES, FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
 from slora.common.space_plan_config import SpacePlanConfig
 
 
@@ -63,11 +63,15 @@ class InputParams:
         lowra_retain_layers=0,
         lowra_retain_top_k=None,
         lowra_pin_hot_adapters=0,
+        cpu_prefix_token_id=10,
+        reuse_next_reconstructed=False,
+        cpu_fixed_hot_indices=(0, 1),
         lowra_reconstruction_kernel="auto",
         lowra_reconstruction_workers=None,
         schedule_interval=1,
         max_active_loras=None,
         space_plan_config=None,
+        cpu_prefix_pool_gb=None,
     ) -> None:
         self.max_req_total_len = max_req_total_len
         self.nccl_port = int(nccl_port)
@@ -121,6 +125,13 @@ class InputParams:
         self.lowra_retain_layers = int(lowra_retain_layers)
         self.lowra_retain_top_k = lowra_retain_top_k
         self.lowra_pin_hot_adapters = int(lowra_pin_hot_adapters)
+        self.cpu_prefix_token_id = cpu_prefix_token_id
+        if cpu_prefix_pool_gb is not None and (
+                cpu_prefix_pool_gb < 1 or not dummy or not enable_lowra or self.lowra_prefix_mode not in CPU_MODES):
+            raise ValueError("--cpu-prefix-pool-gb needs a positive decimal GB cap and a dummy CPU prefix mode")
+        self.cpu_prefix_pool_gb = cpu_prefix_pool_gb
+        self.reuse_next_reconstructed = reuse_next_reconstructed
+        self.cpu_fixed_hot_indices = cpu_fixed_hot_indices
         if lowra_reconstruction_kernel not in ("auto", "bounded"):
             raise ValueError("unknown LowRA reconstruction kernel")
         if lowra_reconstruction_kernel == "bounded" and (

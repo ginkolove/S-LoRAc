@@ -120,16 +120,21 @@ class OnlineModelTests(unittest.TestCase):
                 self.assertEqual(pool.can_use_mem_size, pool.tot_size)
                 queue = OnlineReqQueue(pool.tot_size, 1000, 10, args.prefix_len, mode,
                                        layer_num=3, retain_layers=retained, retain_top_k=top_k)
-                queue.waiting_req_list = reqs[:]
                 router = make_router(queue, ModelRpcClient(server, 1), {d: 16 for d in dirs})
                 router.input_params.lowra_prefix_mode = mode
                 router.input_params.enable_lowra = True
+                for req in reqs:
+                    router.add_req(req.adapter_dir, req.prompt_ids, req.sample_params, req.request_id,
+                                   {"prefix_input_ids": req.prefix_input_ids})
+                online_reqs = queue.waiting_req_list[:]
                 asyncio.run(drain(router))
                 self.assertGreater(router.online_preemptions, 0)
                 self.assertEqual(router.online_rejections, 0)
-                for req in reqs:
+                for req in online_reqs:
+                    self.assertIsNone(req.max_output_len)
                     self.assertEqual(req.output_ids, expected[req.request_id])
                     self.assertEqual(req.prompt_ids, [10] * req.input_len)
+                self.assertEqual(router.online_output_limits, {})
                 self.assertEqual(server.cache, {})
                 if server.lowra_prefix_cache is not None:
                     self.assertTrue(all(entry.ref_count == 0 for entry in server.lowra_prefix_cache.entries.values()))

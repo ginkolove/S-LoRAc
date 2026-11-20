@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 
 import aiohttp
 import numpy as np
@@ -32,11 +33,12 @@ sys.path.insert(0, str(ROOT))
 from benchmarks.lowra_shared_ratio_exp import expand_adapter_dirs, zipf_probs
 from slora.common.prefix_modes import (
     FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_RETAINED, LAYER_PREFETCH, LAYER_ADAPTIVE,
+    CPU_MODES, CPU_FIXED, CPU_FIXED_R64, CPU_PIN_COUNTS, ACTIVE_REPREFILL, FULL_REPREFILL_MODES, PREFILL_BUILD_MODES, PREFIX_MODES,
     normalize_prefix_mode,
 )
 from slora.common.space_plan_config import add_space_plan_arguments, space_plan_command, space_plan_options
 from benchmarks.saturation_cycles import decode_cache_entries, summarize_cycles
-from benchmarks.lmsys_maf_trace import load_trace, validate_run, bind_requests
+from benchmarks.lmsys_maf_trace import CHAMELEON_SCHEMA, load_trace, validate_run, bind_requests
 
 
 @dataclass
@@ -136,7 +138,7 @@ def request_payload(request, args):
         if output_len <= 0:
             raise ValueError("request has no context space left for generation")
     inputs = query_ids
-    if normalize_prefix_mode(args.mode) == FULL_REPREFILL:
+    if normalize_prefix_mode(args.mode) in FULL_REPREFILL_MODES or getattr(args, "send_full_prompt", False):
         inputs = [args.prompt_token_id] * args.prefix_len + query_ids
     return dict(req_id=request["req_id"], lora_dir=request["adapter_dir"],
                    inputs=inputs,
@@ -403,6 +405,14 @@ def server_command(args, stats_path):
             command.extend(["--lowra-retain-top-k", str(args.retain_top_k)])
     if args.pin_hot_adapters:
         command.extend(["--lowra-pin-hot-adapters", str(args.pin_hot_adapters)])
+    if args.mode in CPU_MODES:
+        command.extend(["--cpu-prefix-token-id", str(args.prompt_token_id)])
+        if getattr(args, "cpu_prefix_pool_gb", None) is not None:
+            command.extend(["--cpu-prefix-pool-gb", str(args.cpu_prefix_pool_gb)])
+    if args.mode in CPU_PIN_COUNTS:
+        command.extend(["--cpu-fixed-hot-indices", *map(str, args.fixed_hot_indices)])
+    if getattr(args, "reuse_next_reconstructed", False):
+        command.append("--reuse-next-reconstructed")
     for directory in expand_adapter_dirs(args.adapter_base, args.num_adapters):
         command.extend(["--lora-dirs", directory])
     if args.dummy:
@@ -442,21 +452,72 @@ async def wait_ready(session, server, process, timeout):
     raise TimeoutError("server startup timed out; inspect server.log")
 
 
-async def reset_runtime(session, server):
-    deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
-        async with session.post(server + "/lowra/reset_runtime",
-                                timeout=aiohttp.ClientTimeout(total=65)) as response:
-            result = await response.json()
-            if response.status == 200 and result.get("ok"):
-                for rank in result["stats"]["per_rank"]:
-                    if rank["free_slots_after"] != rank["total_slots"]:
-                        raise RuntimeError("runtime reset leaked persistent slots")
-                return result
-            if response.status != 409:
-                raise RuntimeError("runtime reset failed: %s" % result)
-        await asyncio.sleep(0.5)
-    raise TimeoutError("server did not become idle for reset")
+async def reset_runtime(server, operation_id, process, timeout=120):
+    deadline = time.monotonic() + timeout
+    attempt, last_error = 0, None
+    # Control requests never borrow idle streaming connections. Reuse the ID,
+    # not the TCP connection: a lost response may follow a successful reset.
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=True),
+                                     trust_env=False) as session:
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("server exited during reset (code %s)" % process.returncode)
+            attempt += 1
+            try:
+                remaining = max(0.001, deadline - time.monotonic())
+                async with session.post(server + "/lowra/reset_runtime", params={"operation_id": operation_id},
+                                        timeout=aiohttp.ClientTimeout(total=min(65, remaining))) as response:
+                    result = await response.json()
+                    if result.get("operation_id") != operation_id:
+                        raise RuntimeError("server did not acknowledge reset operation " + operation_id)
+                    if response.status == 200 and result.get("ok"):
+                        ranks = result["stats"]["per_rank"]
+                        if not ranks or any(r["free_slots_after"] != r["total_slots"] for r in ranks):
+                            raise RuntimeError("runtime reset did not confirm all slots free: %s" % ranks)
+                        return result
+                    if response.status not in (409, 504):
+                        raise RuntimeError("runtime reset failed (HTTP %s): %s" % (response.status, result))
+                    last_error = "HTTP %s: %s" % (response.status, result.get("message"))
+            except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as exc:
+                last_error = repr(exc)
+            print("Reset %s attempt %d: %s; retrying" % (operation_id, attempt, last_error), flush=True)
+            await asyncio.sleep(min(0.5 * attempt, 3, max(0, deadline - time.monotonic())))
+    raise TimeoutError("reset %s not confirmed after %d attempts: %s" % (operation_id, attempt, last_error))
+
+
+def atomic_json(path, value):
+    tmp = path.with_name("." + path.name + ".tmp")
+    write_json(tmp, value)
+    tmp.replace(path)
+
+
+async def finalize_point(point, output, label, server, process):
+    result = point["result"]
+    if not result["valid"]:
+        atomic_json(output / (label + ".json"), point)
+        return
+
+    checkpoint = output / "checkpoints" / (label + ".json")
+    checkpoint.parent.mkdir(exist_ok=True)
+    op = str(uuid.uuid4())
+    status = dict(status="pending", operation_id=op)
+    # Keep these outside the valid-result glob used by comparison scripts.
+    provisional = dict(point, result=dict(result, valid=False), replay_valid=True, reset=status)
+    atomic_json(checkpoint, provisional)
+    try:
+        drained = await reset_runtime(server, op, process)
+        counters = drained["stats"]["per_rank"][0].get("prefix_access_before")
+        if counters is not None:
+            accesses = counters["batch_unique_hits"] + counters["batch_unique_misses"]
+            counters["hit_ratio"] = counters["batch_unique_hits"] / accesses if accesses else None
+            point["runtime"]["prefix_cache_stats"] = counters
+    except Exception as exc:
+        status.update(status="unconfirmed", error=repr(exc))
+        atomic_json(checkpoint, provisional)
+        raise
+    point["reset"] = dict(status="confirmed", operation_id=op)
+    atomic_json(output / (label + ".json"), point)
+    checkpoint.unlink()
 
 
 def suite_summary(points, args):
@@ -524,7 +585,9 @@ async def run_suite(args):
                           "--format=csv"], capture_output=True, text=True, check=False)
     write_json(manifest_path, dict(config={key: str(value) if isinstance(value, Path) else value
                                          for key, value in vars(args).items()},
-                                   prefix_source=("ordinary_lora_prefill" if args.mode == FULL_REPREFILL
+                                   prefix_source=("ordinary_lora_prefill" if args.mode in PREFILL_BUILD_MODES
+                                                  else "bounded_host_kv_replay" if args.cpu_prefix_pool_gb is not None
+                                                  else "prefilled_host_kv" if args.mode in CPU_MODES
                                                   else "mini_kv_reconstruction"),
                                    command=command, python=sys.executable,
                                    platform=platform.platform(), packages=packages,
@@ -537,6 +600,7 @@ async def run_suite(args):
                                                     "slora/models/peft/lora_unordered_batch_infer.py",
                                                     "slora/common/prefix_indices.py",
                                                     "slora/common/full_reprefill.py",
+                                                    "slora/common/prefix_source_cache.py",
                                                     "slora/common/full_reconstruct.py",
                                                     "slora/common/lowra_layer_runtime.py",
                                                     "slora/common/lowra_reconstruct_kv.py",
@@ -588,7 +652,7 @@ async def run_suite(args):
                     for seed in args.seeds:
                         if process.poll() is not None:
                             raise RuntimeError("server exited; inspect server.log")
-                        await reset_runtime(session, server)
+                        await reset_runtime(server, str(uuid.uuid4()), process)
                         cache_before = decode_cache_entries() if args.measure_saturation else set()
                         requests, trace_path, trace_hash = prepared_traces[(rate, seed)]
                         label = "rate%s_seed%s" % (format(rate, "g"), seed)
@@ -629,7 +693,7 @@ async def run_suite(args):
                                      adapter_counts=dict(Counter(req["adapter_dir"] for req in requests)),
                                      benchmark_origin_monotonic=origin, result=result, runtime=runtime,
                                      preemption=preemption)
-                        write_json(output / (label + ".json"), point)
+                        await finalize_point(point, output, label, server, process)
                         points.append(point)
                         write_json(output / "summary.json", suite_summary(points, args))
                         print("%s: steady=%.6f req/s total=%.6f req/s valid=%s backlog=%s" %
@@ -640,7 +704,6 @@ async def run_suite(args):
                             print("Saturation cycles: %s" % json.dumps(result["saturation"]), flush=True)
                         if not result["valid"]:
                             raise RuntimeError("invalid point; stopping instead of benchmarking a broken server")
-                        await reset_runtime(session, server)
         finally:
             stop_server(process)
     print("Finished: %s" % (output / "summary.json"), flush=True)
@@ -649,8 +712,12 @@ async def run_suite(args):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", type=normalize_prefix_mode,
-                        choices=(FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_RETAINED, LAYER_ADAPTIVE,
-                                 LAYER_PREFETCH), required=True)
+                        choices=PREFIX_MODES, required=True)
+    parser.add_argument("--send-full-prompt", action="store_true",
+                        help="Send identical prefix+query HTTP inputs even for MiniKV modes.")
+    parser.add_argument("--reuse-next-reconstructed", action="store_true")
+    parser.add_argument("--cpu-prefix-pool-gb", type=int,
+                        help="Dummy fixed-output replay only: cap host KV payload in decimal GB.")
     parser.add_argument("--retain-layers", type=int, default=0,
                         help="First K prefix layers retained per active adapter in minikv-layer_retained.")
     parser.add_argument("--reconstruction-kernel", choices=("auto", "bounded"), default="auto")
@@ -708,11 +775,29 @@ def parse_args():
     parser.add_argument("--plateau-tolerance", type=float, default=0.05)
     parser.add_argument("--trace-dir", type=Path, default=ROOT / "benchmarks/results/lowra_saturation/traces")
     parser.add_argument("--workload-trace", type=Path,
-                        help="Frozen LMSYS/MAF trace; per-request tokens and output lengths override fixed lengths.")
+                        help="Frozen LMSYS trace; per-request tokens and output lengths override fixed lengths.")
+    parser.add_argument("--adapter-profile", choices=("maf", "chameleon"),
+                        help="Require that the frozen trace has this adapter profile.")
+    parser.add_argument("--data-seed", type=int,
+                        help="Require this LMSYS sampling seed in the frozen workload trace.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dummy", action="store_true")
     add_space_plan_arguments(parser)
     args = parser.parse_args()
+    if args.adapter_profile and not args.workload_trace:
+        parser.error("--adapter-profile requires --workload-trace")
+    if args.data_seed is not None and (args.data_seed < 0 or not args.workload_trace):
+        parser.error("--data-seed requires a frozen workload trace and a nonnegative seed")
+    if args.cpu_prefix_pool_gb is not None and (
+            args.cpu_prefix_pool_gb <= 0 or args.mode not in CPU_MODES or not args.dummy or args.generation_mode != "trace"):
+        parser.error("--cpu-prefix-pool-gb requires a positive cap, a CPU prefix mode, --dummy and --generation-mode trace")
+    if args.reuse_next_reconstructed and (args.mode != FULL_RECONSTRUCT or args.pin_hot_adapters
+                                          or args.scheduler != "online"):
+        parser.error("--reuse-next-reconstructed requires online, unpinned minikv-full_reconstruct")
+    if args.mode in (ACTIVE_REPREFILL, *CPU_MODES) and args.scheduler != "online":
+        parser.error("active prefix-source baselines require --scheduler online")
+    if args.mode == CPU_FIXED and args.num_adapters < 2:
+        parser.error("fixed2 requires at least two adapters")
     try:
         space_plan_options(args)
     except ValueError as exc:
@@ -763,6 +848,17 @@ def parse_args():
             if args.max_context_len is None:
                 args.max_context_len = trace["config"]["max_context_len"]
             validate_run(trace, args)
+            if trace["schema"] == CHAMELEON_SCHEMA:
+                from slora.models.peft.lora_adapter import get_lora_config
+                dirs = expand_adapter_dirs(args.adapter_base, args.num_adapters)
+                ranks = [get_lora_config(d, args.dummy)[0]["r"] for d in dirs]
+                if ranks != trace["chameleon"]["adapter_ranks"]:
+                    raise ValueError("server adapter ranks disagree with the frozen chameleon trace; "
+                                     "pass --adapter-base in rank 16, 32, 64 order")
+                args.workload_kind = "lmsys_chameleon_poisson"
+                args.adapter_profile = "chameleon"
+            else:
+                args.adapter_profile = "maf"
         except (ValueError, KeyError, TypeError, OSError) as exc:
             parser.error(str(exc))
         args.query_len = max(len(request["input_ids"]) for request in trace["requests"])
@@ -774,6 +870,31 @@ def parse_args():
     elif args.max_context_len is None:
         generation_cap = args.generation_max_new_tokens if args.generation_mode == "eos" else args.output_len
         args.max_context_len = args.prefix_len + args.query_len + generation_cap
+    if args.mode in CPU_PIN_COUNTS:
+        if args.mode == CPU_FIXED_R64 and (not args.workload_trace or args.adapter_profile != "chameleon"):
+            parser.error("fixed1-r64 requires a rank-stratified chameleon workload trace")
+        probs = (trace[args.adapter_profile]["adapter_probabilities"] if args.workload_trace
+                 else zipf_probs(args.num_adapters, args.alpha))
+        eligible = range(args.num_adapters)
+        if args.mode == CPU_FIXED_R64:
+            eligible = [i for i in eligible if trace["chameleon"]["adapter_ranks"][i] == 64]
+        args.fixed_hot_indices = sorted(eligible, key=lambda i: (-probs[i], i))[:CPU_PIN_COUNTS[args.mode]]
+        # Permanently pinned idle prefixes must not make a cold request impossible
+        # even in an otherwise empty pool. Only a benchmark validity check, not
+        # output-length-based online admission.
+        if args.workload_trace:
+            from slora.models.peft.lora_adapter import get_lora_config
+            dirs = expand_adapter_dirs(args.adapter_base, args.num_adapters)
+            ranks = [get_lora_config(d, args.dummy)[0]["r"] for d in dirs]
+            for req in trace["requests"]:
+                idx = req["adapter_index"]
+                prefixes = len(set(args.fixed_hot_indices) | {idx})
+                query = len(req["input_ids"])
+                decode = (req["output_len"] if args.generation_mode == "trace" else
+                          min(args.generation_max_new_tokens, args.max_context_len - args.prefix_len - query))
+                if args.num_token < prefixes * args.prefix_len + 4 * ranks[idx] + query + decode:
+                    parser.error("fixed hot prefixes leave too little GPU pool for a trace request; "
+                                 "shorten the common prefix or increase the common budget")
     if args.running_max_req_size is None:
         args.running_max_req_size = args.num_token
     positive = (args.num_adapters, args.prefix_len, args.query_len, args.output_len, args.num_token,

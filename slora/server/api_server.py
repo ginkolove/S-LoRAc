@@ -30,7 +30,7 @@ import json
 from http import HTTPStatus
 import uuid
 import multiprocessing as mp
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import Response, StreamingResponse, JSONResponse
@@ -55,7 +55,7 @@ from .api_models import (
 
 from slora.mprophet.measure import ModelProphet
 from slora.mprophet.lora_stats import LoRAProphet
-from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
 from slora.common.space_plan_config import add_space_plan_arguments, space_plan_options
 
 
@@ -115,18 +115,16 @@ def healthcheck():
 
 
 @app.post("/lowra/reset_runtime")
-async def lowra_reset_runtime() -> Response:
+async def lowra_reset_runtime(operation_id: Optional[uuid.UUID] = None) -> Response:
     global isFirst
     if isFirst:
         loop = asyncio.get_event_loop()
         loop.create_task(httpserver_manager.handle_loop())
         isFirst = False
 
-    request_id = f"lowra-reset-{uuid.uuid4().hex}"
-    result = await httpserver_manager.reset_lowra_runtime(request_id)
-    result = _json_safe(result)
-    status_code = 200 if result.get("ok") else 409
-    return JSONResponse(result, status_code=status_code)
+    op = operation_id or uuid.uuid4()
+    status, result = await httpserver_manager.reset_lowra_runtime(f"lowra-reset-{op.hex}")
+    return JSONResponse(dict(_json_safe(result), operation_id=str(op)), status_code=status)
 
 
 @app.post("/generate")
@@ -426,6 +424,13 @@ def main():
     parser.add_argument("--prefetch", action="store_true")
     parser.add_argument("--prefetch-size", type=int, default=0)
     parser.add_argument("--scheduler", type=str, default="slora")
+    parser.add_argument("--cpu-prefix-token-id", type=int, default=10,
+                        help="Repeated shared prefix token used to prefill the benchmark CPU bank.")
+    parser.add_argument("--cpu-fixed-hot-indices", type=int, nargs="+", default=(0, 1))
+    parser.add_argument("--cpu-prefix-pool-gb", type=int, help="Dummy performance replay only: cap physical "
+                        "host prefix KV in decimal GB, reusing whole source entries across adapters.")
+    parser.add_argument("--reuse-next-reconstructed", action="store_true",
+                        help="Keep complete MiniKV reconstructions needed by the next batch; evict the rest.")
     parser.add_argument("--schedule-interval", type=int, default=1,
                         help="online: try admitting waiting requests after this many decode steps.")
     parser.add_argument("--max-active-loras", type=int, default=None,
@@ -467,6 +472,9 @@ def main():
 
     add_space_plan_arguments(parser)
     args = parser.parse_args()
+    if args.reuse_next_reconstructed and (not args.enable_lowra or args.scheduler != "online"
+            or args.lowra_prefix_mode != FULL_RECONSTRUCT or args.lowra_pin_hot_adapters):
+        parser.error("--reuse-next-reconstructed requires online, unpinned minikv-full_reconstruct")
     try:
         space_plan_options(args)
     except ValueError as exc:
@@ -525,6 +533,7 @@ def main():
         enable_lowra=args.enable_lowra,
         lowra_shared_prefix_len=args.lowra_shared_prefix_len,
         lowra_prefix_mode=args.lowra_prefix_mode,
+        cpu_prefix_token_id=args.cpu_prefix_token_id,
         scheduler=args.scheduler,
     )
     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)

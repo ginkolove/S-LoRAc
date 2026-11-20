@@ -19,17 +19,19 @@ class FullPrefixEntry:
 
 
 class FullPrefixKVCache:
-    def __init__(self, prefix_len, mem_manager, pinned_lora_dirs=()):
+    def __init__(self, prefix_len, mem_manager, pinned_lora_dirs=(), reuse_next_batch=False):
         self.prefix_len = int(prefix_len)
         self.mem_manager = mem_manager
         self.entries = {}
         self.pinned_lora_dirs = frozenset(pinned_lora_dirs)
+        self.reuse_next_batch = reuse_next_batch
         self.shared_prefix_ids = None
         self.clock = 0
         self.reset_access_stats()
 
     def reset_access_stats(self):
         self.batch_unique_hits = 0
+        self.idle_hits = self.pinned_idle_hits = 0
         self.batch_unique_misses = 0
         self.evictions = 0
         self.prefix_prefill_builds = 0
@@ -38,6 +40,10 @@ class FullPrefixKVCache:
 
     def access_stats(self):
         return dict(batch_unique_hits=self.batch_unique_hits,
+                    reuse_next_batch=self.reuse_next_batch,
+                    active_shared_hits=self.batch_unique_hits - self.idle_hits,
+                    idle_pinned_hits=self.pinned_idle_hits,
+                    idle_unpinned_hits=self.idle_hits - self.pinned_idle_hits,
                     batch_unique_misses=self.batch_unique_misses, evictions=self.evictions,
                     prefix_prefill_builds=self.prefix_prefill_builds,
                     prefix_prefill_tokens=self.prefix_prefill_tokens,
@@ -74,6 +80,7 @@ class FullPrefixKVCache:
             raise ValueError("full reprefill requires a LoRA for every request")
         prefix_ids = self._validate_prefix_inputs(requests)
         hits = [directory for directory in counts if directory in self.entries]
+        idle_hits = [d for d in hits if self.entries[d].ref_count == 0]
         misses = [directory for directory in counts if directory not in self.entries]
         created = []
         for directory in hits:
@@ -100,6 +107,8 @@ class FullPrefixKVCache:
         self.shared_prefix_ids = prefix_ids
         self.touch(counts)
         self.batch_unique_hits += len(hits)
+        self.idle_hits += len(idle_hits)
+        self.pinned_idle_hits += sum(d in self.pinned_lora_dirs for d in idle_hits)
         self.batch_unique_misses += len(misses)
         self._record_prefix_builds(misses)
         return {directory: self.entries[directory].prefix_indices for directory in counts}

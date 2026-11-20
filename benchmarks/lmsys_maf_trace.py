@@ -1,4 +1,4 @@
-"""Rank-independent request traces for LMSYS content and MAF adapter popularity."""
+"""Frozen LMSYS traces with MAF or rank-stratified adapter popularity."""
 
 import hashlib
 import json
@@ -7,12 +7,29 @@ from pathlib import Path
 
 
 SCHEMA = "lmsys-maf-poisson-v1"
+CHAMELEON_SCHEMA = "lmsys-chameleon-poisson-v1"
+CHAMELEON_RANKS = (16, 32, 64)
+
+
+def chameleon_profile(num_adapters):
+    """Round-robin adapter IDs match expand_adapter_dirs; Zipf is local to each rank."""
+    groups = len(CHAMELEON_RANKS)
+    if num_adapters < groups:
+        raise ValueError("chameleon needs at least three adapters, one per rank")
+    ranks = [CHAMELEON_RANKS[i % groups] for i in range(num_adapters)]
+    probabilities = [0.] * num_adapters
+    for offset in range(groups):
+        indices = range(offset, num_adapters, groups)
+        harmonic = math.fsum(1 / j for j in range(1, len(indices) + 1))
+        for j, idx in enumerate(indices, 1):
+            probabilities[idx] = 1 / (groups * harmonic * j)
+    return dict(adapter_ranks=ranks, adapter_probabilities=probabilities, within_rank_zipf_alpha=1.0)
 
 
 def load_trace(path):
     raw = Path(path).read_bytes()
     trace = json.loads(raw)
-    if trace.get("schema") != SCHEMA:
+    if trace.get("schema") not in (SCHEMA, CHAMELEON_SCHEMA):
         raise ValueError("unsupported workload trace schema")
     config = trace["config"]
     for key in ("num_adapters", "prefix_len", "max_context_len", "vocab_size"):
@@ -21,6 +38,8 @@ def load_trace(path):
     for key in ("request_rate", "duration"):
         if not math.isfinite(config[key]) or config[key] <= 0:
             raise ValueError("invalid trace config: %s" % key)
+    if trace["schema"] == CHAMELEON_SCHEMA and trace.get("chameleon") != chameleon_profile(config["num_adapters"]):
+        raise ValueError("invalid chameleon rank or popularity map")
     if type(config["seed"]) is not int or config["seed"] < 0:
         raise ValueError("invalid trace seed")
     if not trace["requests"]:
@@ -51,6 +70,11 @@ def load_trace(path):
 
 def validate_run(trace, args):
     config = trace["config"]
+    profile = "chameleon" if trace["schema"] == CHAMELEON_SCHEMA else "maf"
+    if getattr(args, "adapter_profile", None) not in (None, profile):
+        raise ValueError("frozen trace disagrees with --adapter-profile; use a fresh output directory")
+    if getattr(args, "data_seed", None) is not None and config.get("data_seed") != args.data_seed:
+        raise ValueError("workload trace disagrees with --data-seed; use a fresh output directory")
     for key in ("num_adapters", "prefix_len", "max_context_len", "duration"):
         if config[key] != getattr(args, key):
             raise ValueError("workload trace disagrees with --%s" % key.replace("_", "-"))

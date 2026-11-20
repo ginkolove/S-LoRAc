@@ -14,7 +14,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from slora.common.prefix_modes import (
-    PREFIX_MODES, FULL_RECONSTRUCT, FULL_REPREFILL, LAYER_SERIAL, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode,
+    FULL_RECONSTRUCT, FULL_REPREFILL, LAYER_PREFETCH, LAYER_SERIAL, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode,
 )
 
 
@@ -23,7 +23,8 @@ def parse_args():
     parser.add_argument("--model-dir", default="huggyllama/llama-7b")
     parser.add_argument("--adapter-base", default="dummy-lora-7b-rank-16")
     parser.add_argument("--mode", type=lambda value: value if value == "all" else normalize_prefix_mode(value),
-                        choices=("all", *PREFIX_MODES), default="all")
+                        choices=("all", FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_PREFETCH,
+                                 LAYER_RETAINED, LAYER_ADAPTIVE), default="all")
     parser.add_argument("--prefix-len", type=int, default=1440)
     parser.add_argument("--query-len", type=int, default=480)
     parser.add_argument("--output-len", type=int, default=64)

@@ -6,6 +6,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import time
@@ -15,7 +16,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from benchmarks.lmsys_maf_trace import SCHEMA, bind_requests, load_trace
+from benchmarks.lmsys_maf_trace import CHAMELEON_SCHEMA, SCHEMA, bind_requests, chameleon_profile, load_trace
 from benchmarks.prepare_lmsys_maf_trace import (
     aggregate_maf, first_turns, poisson_arrivals, select_samples, save_artifact,
     parse_args as prepare_args,
@@ -26,7 +27,7 @@ from benchmarks.lowra_saturation_exp import parse_args, request_payload, send_re
 def fixture():
     return dict(schema=SCHEMA, config=dict(tokenizer="huggyllama/llama-7b", vocab_size=32000,
                 num_adapters=2, prefix_len=10, max_context_len=20, duration=10,
-                request_rate=3, seed=42), requests=[
+                request_rate=3, seed=42, data_seed=42), requests=[
                     dict(req_id="r0", req_time=0.3, adapter_index=0, source_id="row:a",
                          input_ids=[11] * 7, output_len=2),
                     dict(req_id="r1", req_time=0.8, adapter_index=1, source_id="row:b",
@@ -44,6 +45,84 @@ def parse_fixture(path, rank=8, mode="minikv-layer_serial", extra=()):
 
 
 class TraceTests(unittest.TestCase):
+    def test_chameleon_distribution(self):
+        for n in (3, 50, 51, 52):
+            profile = chameleon_profile(n)
+            probs = profile["adapter_probabilities"]
+            ranks = profile["adapter_ranks"]
+            self.assertEqual(ranks, ([16, 32, 64] * n)[:n])
+            for r in (16, 32, 64):
+                group = [p for p, rank in zip(probs, ranks) if rank == r]
+                self.assertAlmostEqual(sum(group), 1 / 3)
+                for j, p in enumerate(group, 1):
+                    self.assertAlmostEqual(p * j, group[0])
+        with self.assertRaises(ValueError):
+            chameleon_profile(2)
+
+    def test_five_modes_bind_the_same_mixed_rank_trace_and_pin_by_prior(self):
+        launcher = Path(__file__).resolve().parents[1] / "benchmarks/run_lmsys_preemption.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.json"
+            data = fixture()
+            data.update(schema=CHAMELEON_SCHEMA, chameleon=chameleon_profile(50))
+            data["config"].update(num_adapters=50)
+            data["requests"][1]["adapter_index"] = 49
+            path.write_text(json.dumps(data))
+            lines = subprocess.check_output(
+                ["bash", str(launcher), tmp, "--prefix-sources", "--dry-run", "--prefix-len", "10",
+                 "--request-rate", "3", "--duration", "10"], text=True).splitlines()
+            commands = [shlex.split(line)[2:] for line in lines if " -u benchmarks/lowra_saturation_exp.py " in line]
+            self.assertEqual(len(commands), 5)
+            reference = None
+            for command in commands:
+                with patch("sys.argv", command):
+                    args = parse_args()
+                bound, _, digest = trace_for(args, 3, 42)
+                self.assertEqual([r["adapter_dir"] for r in bound],
+                                 ["dummy-lora-7b-rank-16-0", "dummy-lora-7b-rank-32-16"])
+                server = server_command(args, Path(tmp) / "stats")
+                dirs = [server[i+1] for i, option in enumerate(server) if option == "--lora-dirs"]
+                self.assertEqual(dirs, ["dummy-lora-7b-rank-%d-%d" % (rank, i//3)
+                                        for i, rank in enumerate(data["chameleon"]["adapter_ranks"])])
+                if reference is None:
+                    reference = (digest, bound)
+                self.assertEqual(reference, (digest, bound))
+                if args.mode == "cpu-read-fixed2":
+                    self.assertEqual(args.fixed_hot_indices, [2, 0])  # ID 2 got no requests
+                    top1 = ["cpu-read-fixed1-r64" if arg == args.mode else arg for arg in command]
+                    with patch("sys.argv", top1):
+                        hot = parse_args()
+                    self.assertEqual(hot.fixed_hot_indices, [2])
+                    cmd = server_command(hot, Path(tmp) / "stats")
+                    self.assertEqual(cmd[cmd.index("--cpu-fixed-hot-indices")+1], "2")
+            with patch("sys.argv", command + ["--adapter-profile", "maf"]), self.assertRaises(SystemExit):
+                parse_args()
+            wrong_rank = ["dummy-lora-7b-rank-8" if part == "dummy-lora-7b-rank-64" else part
+                          for part in command]
+            with patch("sys.argv", wrong_rank), self.assertRaises(SystemExit):
+                parse_args()
+            data["chameleon"]["adapter_ranks"][2] = 16
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "rank or popularity"):
+                load_trace(path)
+
+    def test_launcher_forwards_independent_data_seed(self):
+        launcher = Path(__file__).resolve().parents[1] / "benchmarks/run_lmsys_preemption.sh"
+        result = subprocess.run(
+            ["bash", str(launcher), "/tmp/lmsys-dry-run", "--data-seed", "17", "--dry-run"],
+            check=True, capture_output=True, text=True)
+        self.assertEqual(result.stdout.count("--data-seed 17"), 3)
+        self.assertIn("--seed 42 --data-seed 17", result.stdout)
+        self.assertIn("--seeds 42", result.stdout)
+
+    def test_rejects_reusing_trace_with_different_data_seed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.json"
+            path.write_text(json.dumps(fixture()))
+            self.assertEqual(parse_fixture(path, extra=["--data-seed", "42"]).data_seed, 42)
+            with self.assertRaises(SystemExit):
+                parse_fixture(path, extra=["--data-seed", "17"])
+
     def test_launcher_uses_matched_budget_and_preserves_explicit_overrides(self):
         launcher = Path(__file__).resolve().parents[1] / "benchmarks/run_lmsys_rank_compare.sh"
         with tempfile.TemporaryDirectory() as tmp:

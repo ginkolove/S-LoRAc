@@ -32,6 +32,8 @@ from slora.common.full_reconstruct import FullReconstructPrefixKVCache, FullReco
 from slora.common.lowra_retained import RetainedPrefixKVCache, RetainedLayerRuntime
 from slora.common.lowra_adaptive import AdaptivePrefixKVCache, AdaptiveLayerRuntime
 from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_PIN_COUNTS, CPU_MODES
+from slora.common.prefix_source_cache import ActivePrefixCache, HostPrefixBank
 from slora.utils.infer_utils import set_random_seed
 from slora.utils.infer_utils import calculate_time, mark_start, mark_end
 from slora.utils.model_utils import get_model_config
@@ -141,13 +143,40 @@ class ModelRpcServer(rpyc.Service):
 
         if input_params.enable_lowra and input_params.lowra_shared_prefix_len > 0:
             if input_params.lowra_prefix_mode in FULL_REPREFILL_MODES:
-                self.lowra_prefix_cache = FullPrefixKVCache(
-                    input_params.lowra_shared_prefix_len, self.model.mem_manager)
+                source = input_params.lowra_prefix_mode
+                length, pool = input_params.lowra_shared_prefix_len, self.model.mem_manager
+                bank = None
+                if source in CPU_MODES:
+                    token = input_params.cpu_prefix_token_id
+                    if not 0 <= token < self.model.vocab_size:
+                        raise ValueError("invalid CPU bank prefix token")
+                    cap = input_params.cpu_prefix_pool_gb
+                    bank = HostPrefixBank(pool, [token] * length, adapter_dirs,
+                                          byte_cap=cap * 10**9 if cap is not None else None)
+                    bank.check_capacity()
+                    print("CPU prefix bank: %d logical adapters, %d physical entries, %d bytes/entry"
+                          % (len(adapter_dirs), len(bank.physical_dirs), bank.entry_bytes), flush=True)
+                if source == ACTIVE_REPREFILL or bank is not None:
+                    fixed = [adapter_dirs[i] for i in input_params.cpu_fixed_hot_indices] if source in CPU_PIN_COUNTS else []
+                    self.lowra_prefix_cache = ActivePrefixCache(length, pool, source, fixed, bank)
+                else:
+                    self.lowra_prefix_cache = FullPrefixKVCache(length, pool)
                 self.lowra_runtime = FullReprefillRuntime(
                     input_params.lowra_shared_prefix_len, self.model.mem_manager,
                     self.lowra_prefix_cache)
-                print("Full-reprefill initialized: prefix_len=%s, static_token_equiv=0" %
-                      input_params.lowra_shared_prefix_len)
+                if bank is not None:
+                    # Build each physical source once, outside replay. Runtime
+                    # resets clear GPU prefixes but intentionally preserve DRAM.
+                    for directory in tqdm(bank.physical_dirs, desc="Prefill CPU prefix bank"):
+                        self.exposed_load_adapters([directory])
+                        slots = pool.alloc(length)
+                        try:
+                            self._prefill_full_prefixes([directory], bank.prefix_ids, {directory: slots})
+                            bank.capture(directory, slots)
+                        finally:
+                            pool.free(slots)
+                            self.exposed_offload_adapters([])
+                print("%s initialized: prefix_len=%s, static_token_equiv=0" % (source, length))
                 set_random_seed(2147483647)
                 return
             lora_rank_map = {
@@ -170,6 +199,7 @@ class ModelRpcServer(rpyc.Service):
             if input_params.lowra_prefix_mode == FULL_RECONSTRUCT:
                 self.lowra_prefix_cache = FullReconstructPrefixKVCache(
                     static_store.prefix_len, self.model.mem_manager,
+                    reuse_next_batch=getattr(input_params, "reuse_next_reconstructed", False),
                     pinned_lora_dirs=list(lora_rank_map)[:getattr(input_params, "lowra_pin_hot_adapters", 0)])
                 self.lowra_runtime = FullReconstructRuntime(
                     static_store, self.model.mem_manager, self.lowra_prefix_cache)
@@ -272,6 +302,7 @@ class ModelRpcServer(rpyc.Service):
             "total_slots": self.model.mem_manager.tot_size,
         }
         if self.lowra_prefix_cache is not None:
+            stats["prefix_access_before"] = self.lowra_prefix_cache.access_stats()
             stats["prefix_cache_before"] = self.lowra_prefix_cache.state_dict()
             stats["prefix_entries_cleared"] = self.lowra_prefix_cache.clear_metadata_if_inactive()
         if hasattr(self, "infer_adapter") and self.infer_adapter is not None:

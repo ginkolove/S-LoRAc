@@ -1,12 +1,13 @@
 import zmq
 import zmq.asyncio
 import asyncio
+import time
 import uvloop
 from typing import Union
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 from ..tokenizer import get_tokenizer
-from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, normalize_prefix_mode
+from slora.common.prefix_modes import CPU_MODES, FULL_REPREFILL_MODES, FULL_REPREFILL, FULL_RECONSTRUCT, normalize_prefix_mode
 from ..io_struct import BatchStrOut, AbortReq, BatchAbortReq, LowRAResetReq, LowRAResetAck
 
 
@@ -26,6 +27,7 @@ class HttpServerManager:
         lowra_shared_prefix_len=0,
         lowra_prefix_mode=FULL_REPREFILL,
         scheduler="slora",
+        cpu_prefix_token_id=10,
     ):
         context = zmq.asyncio.Context(2)
         self.send_to_router = context.socket(zmq.PUSH)
@@ -41,8 +43,7 @@ class HttpServerManager:
                 self.tokenizer = get_tokenizer("huggyllama/llama-7b", tokenizor_mode) 
 
         self.req_id_to_out_inf = {}  # value type (out_str, metadata, finished, event)
-        self.reset_req_id_to_event = {}
-        self.reset_req_id_to_result = {}
+        self.reset_operations = {}
 
         self.total_token_num = total_token_num
         self.scheduler = scheduler
@@ -51,7 +52,8 @@ class HttpServerManager:
         self.enable_lowra = enable_lowra
         self.lowra_shared_prefix_len = lowra_shared_prefix_len
         prefix_mode = normalize_prefix_mode(lowra_prefix_mode)
-        self.full_reprefill = prefix_mode == FULL_REPREFILL
+        self.full_reprefill = prefix_mode in FULL_REPREFILL_MODES
+        self.cpu_prefix_ids = ((cpu_prefix_token_id,) * lowra_shared_prefix_len if prefix_mode in CPU_MODES else None)
         self.full_reconstruct = prefix_mode == FULL_RECONSTRUCT
         self.shared_prefix_ids = None
 
@@ -84,6 +86,8 @@ class HttpServerManager:
                 if query_len <= 0 or len(prompt_ids) != shared_prefix_len + query_len:
                     raise ValueError("full reprefill requires full [shared prefix + query] token input")
                 prefix_ids = tuple(prompt_ids[:shared_prefix_len])
+                if getattr(self, "cpu_prefix_ids", None) is not None and prefix_ids != self.cpu_prefix_ids:
+                    raise ValueError("request prefix does not match the CPU bank")
                 if self.shared_prefix_ids is not None and prefix_ids != self.shared_prefix_ids:
                     raise ValueError("all full-mode requests must use the same shared prefix")
                 lowra_lengths["prefix_input_ids"] = list(prefix_ids)
@@ -175,36 +179,49 @@ class HttpServerManager:
         return
 
     async def reset_lowra_runtime(self, request_id):
-        event = asyncio.Event()
-        self.reset_req_id_to_event[request_id] = event
-        self.send_to_router.send_pyobj(LowRAResetReq(request_id))
+        # Retain the pre-reset snapshot longer than the benchmark's 120s retry
+        # window. An HTTP timeout/cancellation must not cancel the operation.
+        now = time.monotonic()
+        for key, (expires, _) in list(self.reset_operations.items()):
+            if expires <= now:
+                del self.reset_operations[key]
+        if request_id not in self.reset_operations:
+            if len(self.reset_operations) >= 128:
+                return 503, {"ok": False, "message": "Too many recent reset operations", "stats": {}}
+            result = asyncio.get_running_loop().create_future()
+            self.reset_operations[request_id] = (now + 300, result)
+            try:
+                await asyncio.shield(self.send_to_router.send_pyobj(LowRAResetReq(request_id)))
+            except Exception as exc:
+                if not result.done():
+                    result.set_result((500, {"ok": False, "message": repr(exc), "stats": {}}))
+        else:
+            _, result = self.reset_operations[request_id]
         try:
-            await asyncio.wait_for(event.wait(), timeout=60)
+            return await asyncio.wait_for(asyncio.shield(result), timeout=60)
         except asyncio.TimeoutError:
-            return {"ok": False, "message": "Timed out waiting for LowRA runtime reset", "stats": {}}
-        finally:
-            self.reset_req_id_to_event.pop(request_id, None)
-        result = self.reset_req_id_to_result.pop(
-            request_id,
-            {"ok": False, "message": "LowRA runtime reset returned no result", "stats": {}},
-        )
-        if result["ok"] and self.full_reprefill:
+            return 504, {"ok": False, "message": "Still waiting for LowRA runtime reset", "stats": {}}
+
+    def _finish_reset(self, ack):
+        operation = self.reset_operations.get(ack.req_id)
+        if operation is None or operation[1].done():
+            return
+        if ack.ok and self.full_reprefill:
             self.shared_prefix_ids = None
-        return result
+        # Only a busy rejection is safe to execute again: the router checked
+        # for active work before it touched the pool.
+        busy = not ack.ok and "running_batch_size" in ack.stats
+        if busy:
+            del self.reset_operations[ack.req_id]
+        status = 200 if ack.ok else (409 if busy else 500)
+        operation[1].set_result((status, {"ok": ack.ok, "message": ack.message, "stats": ack.stats}))
 
     async def handle_loop(self):
         while True:
             recv_ans:Union(BatchStrOut, BatchAbortReq, LowRAResetAck) = await self.recv_from_detokenization.recv_pyobj()
             assert isinstance(recv_ans, (BatchStrOut, BatchAbortReq, LowRAResetAck)), f"error recv type {type(recv_ans)}"
             if isinstance(recv_ans, LowRAResetAck):
-                self.reset_req_id_to_result[recv_ans.req_id] = {
-                    "ok": recv_ans.ok,
-                    "message": recv_ans.message,
-                    "stats": recv_ans.stats,
-                }
-                event = self.reset_req_id_to_event.get(recv_ans.req_id)
-                if event is not None:
-                    event.set()
+                self._finish_reset(recv_ans)
                 continue
 
             if isinstance(recv_ans, BatchStrOut):

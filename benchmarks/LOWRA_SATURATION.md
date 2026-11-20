@@ -1,5 +1,9 @@
 # Full Cache versus Layer-Serial Saturation
 
+For the five-source, mixed-rank LMSYS replay, see the
+[2026-11-20 experiment handoff](PREFIX_SOURCE_HANDOFF_2026-11-20.md) for
+the 55-run matrix, verified results, restart commands and validity checks.
+
 **2026-11-06 correction:** all MiniKV serving reconstruction wrappers now decode
 the actual S-LoRA packed B layout (`b_packed=True`). Earlier MiniKV timings used
 incorrect rank-major reads from that pool. The performance source tensors are
@@ -36,7 +40,25 @@ Only query tokens are sent for this mode, with explicit logical length metadata.
 Thus identical policies do not imply identical admitted batches: the available
 dynamic budgets differ from `full-reprefill`.
 
-## LMSYS Content with MAF Popularity
+## LMSYS Adapter Profiles
+
+The five prefix-source comparisons (`run_lmsys_preemption.sh --prefix-sources`
+or `--prefix-source-group compute|cpu`) default to `--adapter-profile chameleon`.
+Adapter IDs cycle through fixed ranks 16, 32, 64, giving 17/17/16 adapters for
+N=50. Each rank gets one third of the probability mass; within a group the
+j-th adapter has weight proportional to 1/j. These are sampling probabilities,
+not quotas. `trace.json` freezes each request's adapter index; `chameleon`
+contains the rank and probability vectors indexed by adapter ID, and `summary`
+reports observed request counts by rank. The CPU fixed Top-2 uses the two
+highest prior probabilities (tie: lower adapter index), not replay counts.
+All five methods use the same trace and validate the server adapter ranks.
+
+Use a fresh output directory. Pass `--adapter-profile maf` to reproduce the
+rank-16 five-way setup; the standalone generator and ordinary two-mode launcher
+still default to MAF. Changing only the profile preserves arrivals, query IDs,
+input tokens and output lengths for the same seeds, dataset and tokenizer.
+
+### MAF Profile
 
 `prepare_lmsys_maf_trace.py` prepares a rank-independent JSON trace on CPU. It
 uses the first user/assistant pair from each LMSYS-33K A/B branch; subsequent
@@ -74,6 +96,14 @@ Fixed `--query-len` / `--output-len` become trace maxima for server configuratio
 each HTTP payload and completion check uses its own lengths. `--alpha` is unused
 on this path. Fixed-output saturation-cycle estimation is explicitly rejected.
 The preflight uses real pairs and then resets the dynamic state before replay.
+At the end of a valid replay, the client first writes
+`checkpoints/rate<R>_seed<S>.json` with `replay_valid=true` and
+`result.valid=false`. It uses a fresh control connection and the same reset
+operation ID across retries for up to 120 s. The HTTP server keeps that
+operation's original snapshot for 300 s in the same server process.
+Only a confirmed reset with all rank pools free publishes the normal result
+and removes the checkpoint. An unconfirmed checkpoint is diagnostic data, not
+a successful benchmark or a replacement for missing cache counters.
 All runs save their bound request trace; only the adapter directory changes
 between rank=8 and rank=16. The original synthetic trace path is unchanged.
 
