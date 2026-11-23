@@ -1,0 +1,244 @@
+--- a/slora/common/prefix_modes.py
++++ b/slora/common/prefix_modes.py
+@@ -13,11 +13,13 @@
+ LAYER_PREFETCH = "layer_prefetch"
+ LAYER_ADAPTIVE = "minikv-adaptive"
+ 
++RANK_SPLIT_LIMITS = {f"minikv-serial-le{r}-full-gt{r}": r for r in (16, 32)}
++
+ PREFILL_BUILD_MODES = (FULL_REPREFILL, ACTIVE_REPREFILL)
+ # Full-size GPU entries produced without a static MiniKV region.
+ FULL_REPREFILL_MODES = PREFILL_BUILD_MODES + CPU_MODES
+ FULL_PREFIX_CACHE_MODES = FULL_REPREFILL_MODES + (FULL_RECONSTRUCT,)
+-PREFIX_MODES = FULL_PREFIX_CACHE_MODES + (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE)
++PREFIX_MODES = FULL_PREFIX_CACHE_MODES + (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, *RANK_SPLIT_LIMITS)
+ SOURCE_COMPARISON_MODES = (ACTIVE_REPREFILL, CPU_READ, CPU_FIXED, FULL_RECONSTRUCT, LAYER_SERIAL)
+ 
+ _ALIASES = {mode: mode for mode in PREFIX_MODES}
+--- a/slora/server/router/online_req_queue.py
++++ b/slora/server/router/online_req_queue.py
+@@ -11,7 +11,7 @@
+ from ..io_struct import Batch
+ from .req_queue import ReqQueue
+ from slora.common.prefix_modes import (
+-    FULL_REPREFILL, FULL_PREFIX_CACHE_MODES, PREFILL_BUILD_MODES, LAYER_RETAINED, normalize_prefix_mode,
++    FULL_REPREFILL, FULL_PREFIX_CACHE_MODES, PREFILL_BUILD_MODES, LAYER_RETAINED, RANK_SPLIT_LIMITS, normalize_prefix_mode,
+ )
+ 
+ 
+@@ -60,6 +60,7 @@
+         adapters = sum(4 * lora_ranks[directory] for directory in needed)
+         query_tokens = sum(self.known_tokens(req) for req in selected)
+         prefix_build_tokens = 0
++        workspace_count = len(needed)
+         scratch = 0
+         after = dict(sizes)
+         before = dict(sizes)
+@@ -67,6 +68,15 @@
+             for directory in cached | needed:
+                 before[directory] = after[directory] = self.prefix_len
+             prefix_build_tokens = len({r.adapter_dir for r in selected} - cached) * self.prefix_len
++        elif self.prefix_len and self.prefix_mode in RANK_SPLIT_LIMITS:
++            limit = RANK_SPLIT_LIMITS[self.prefix_mode]
++            full = {d for d in needed if lora_ranks[d] > limit}
++            for directory in cached | full:
++                before[directory] = after[directory] = self.prefix_len
++            misses = {r.adapter_dir for r in selected} & (full - cached)
++            prefix_build_tokens = len(misses) * self.prefix_len
++            workspace_count = len(needed) - len(full)
++            scratch = (workspace_count * self.prefix_len + self.layer_num - 1) // self.layer_num
+         elif self.prefix_len and self.prefix_mode == LAYER_RETAINED:
+             slots = (self.prefix_len * self.retain_layers + self.layer_num - 1) // self.layer_num
+             if pinned:
+@@ -106,7 +116,7 @@
+                 and prefill_tokens <= self.batch_max_tokens
+                 and (self.max_active_loras is None or len(needed) <= self.max_active_loras)
+                 and (not self.prefix_len or self.prefix_mode in FULL_PREFIX_CACHE_MODES
+-                     or self.workspace_lora_limit is None or len(needed) <= self.workspace_lora_limit))
++                     or self.workspace_lora_limit is None or workspace_count <= self.workspace_lora_limit))
+         return OnlinePlan(fits, required(), evictions, prefill_tokens, prefix_build_tokens)
+ 
+     def generate_new_batch(self, current_batch, lora_ranks):
+--- a/slora/server/router/model_infer/model_rpc.py
++++ b/slora/server/router/model_infer/model_rpc.py
+@@ -31,7 +31,8 @@
+ from slora.common.full_reconstruct import FullReconstructPrefixKVCache, FullReconstructRuntime
+ from slora.common.lowra_retained import RetainedPrefixKVCache, RetainedLayerRuntime
+ from slora.common.lowra_adaptive import AdaptivePrefixKVCache, AdaptiveLayerRuntime
+-from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
++from slora.common.h20_rank_split_runtime import RankSplitCache, RankSplitRuntime
++from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, RANK_SPLIT_LIMITS, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+ from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_PIN_COUNTS, CPU_MODES
+ from slora.common.prefix_source_cache import ActivePrefixCache, HostPrefixBank
+ from slora.utils.infer_utils import set_random_seed
+@@ -203,6 +204,13 @@
+                     pinned_lora_dirs=list(lora_rank_map)[:getattr(input_params, "lowra_pin_hot_adapters", 0)])
+                 self.lowra_runtime = FullReconstructRuntime(
+                     static_store, self.model.mem_manager, self.lowra_prefix_cache)
++            elif input_params.lowra_prefix_mode in RANK_SPLIT_LIMITS:
++                mode = input_params.lowra_prefix_mode
++                self.lowra_prefix_cache = RankSplitCache(
++                    static_store, self.model.mem_manager, RANK_SPLIT_LIMITS[mode])
++                self.lowra_runtime = RankSplitRuntime(
++                    static_store, self.model.mem_manager, self.lowra_prefix_cache, mode,
++                    input_params.lowra_reconstruction_workers, input_params.lowra_workspace_loras)
+             elif input_params.lowra_prefix_mode == LAYER_ADAPTIVE:
+                 self.lowra_prefix_cache = AdaptivePrefixKVCache(static_store.prefix_len, self.model.mem_manager)
+                 self.lowra_runtime = AdaptiveLayerRuntime(
+--- a/slora/server/router/manager.py
++++ b/slora/server/router/manager.py
+@@ -35,7 +35,7 @@
+ from slora.server.router.adaptive_req_queue import AdaptiveReqQueue
+ from slora.common.space_plan_config import space_plan_options
+ from slora.common.full_reprefill import FULL_REPREFILL_MODES, FULL_PREFIX_CACHE_MODES
+-from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_MODES, CPU_FIXED_R64, CPU_PIN_COUNTS, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
++from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_MODES, CPU_FIXED_R64, CPU_PIN_COUNTS, FULL_REPREFILL, FULL_RECONSTRUCT, RANK_SPLIT_LIMITS, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+ from slora.common.service_cycles import ServiceCycleRecorder
+ 
+ 
+@@ -190,6 +190,9 @@
+             elif self.input_params.lowra_prefix_mode == FULL_RECONSTRUCT:
+                 print("minikv-full_reconstruct: static BaseKV/MiniKV; complete prefix cache, adapters "
+                       "and request KV share Unified Paging; no single-layer workspace")
++            elif self.input_params.lowra_prefix_mode in RANK_SPLIT_LIMITS:
++                print("MiniKV serial reconstruction through rank %d; higher ranks use full reconstruction" %
++                      RANK_SPLIT_LIMITS[self.input_params.lowra_prefix_mode])
+             elif self.input_params.lowra_prefix_mode == LAYER_RETAINED:
+                 print("minikv-layer_retained: keep first %s layers for %s; "
+                       "other prefixes/layers overwrite one workspace; both charge Unified Paging" %
+@@ -696,7 +699,7 @@
+         self.last_prefill_tokens = getattr(batch, "prefill_token_num", batch.input_tokens())
+         self.last_admission_tokens = self.last_prefill_tokens
+         self.last_prefix_reconstruct_tokens = 0
+-        if self.input_params.lowra_prefix_mode == FULL_RECONSTRUCT:
++        if self.input_params.lowra_prefix_mode in (FULL_RECONSTRUCT, *RANK_SPLIT_LIMITS):
+             self.last_prefix_reconstruct_tokens = getattr(batch, "prefix_prefill_tokens", 0)
+             self.last_prefill_tokens = batch.input_tokens()
+         self.last_prefill_batch_size = len(batch.reqs)
+--- a/slora/server/input_params.py
++++ b/slora/server/input_params.py
+@@ -1,4 +1,4 @@
+-from slora.common.prefix_modes import CPU_MODES, FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
++from slora.common.prefix_modes import CPU_MODES, RANK_SPLIT_LIMITS, FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+ from slora.common.space_plan_config import SpacePlanConfig
+ 
+ 
+@@ -121,6 +121,11 @@
+                 not enable_lowra or scheduler != "online" or lowra_retain_layers
+                 or lowra_retain_top_k is not None or lowra_pin_hot_adapters):
+             raise ValueError("adaptive mode requires online LowRA without fixed retention/top-K/pinning")
++        if self.lowra_prefix_mode in RANK_SPLIT_LIMITS and (
++                not enable_lowra or scheduler != "online" or not reuse_next_reconstructed
++                or lowra_reconstruction_kernel != "bounded" or lowra_pin_hot_adapters
++                or lowra_retain_layers or lowra_retain_top_k is not None):
++            raise ValueError("rank-split MiniKV requires online bounded reconstruction and next-batch reuse")
+         self.lowra_workspace_loras = lowra_workspace_loras
+         self.lowra_retain_layers = int(lowra_retain_layers)
+         self.lowra_retain_top_k = lowra_retain_top_k
+@@ -135,7 +140,7 @@
+         if lowra_reconstruction_kernel not in ("auto", "bounded"):
+             raise ValueError("unknown LowRA reconstruction kernel")
+         if lowra_reconstruction_kernel == "bounded" and (
+-                not enable_lowra or self.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE)):
++                not enable_lowra or self.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, *RANK_SPLIT_LIMITS)):
+             raise ValueError("bounded reconstruction requires a LowRA layer mode")
+         if lowra_reconstruction_workers is not None and (
+                 lowra_reconstruction_kernel != "bounded"
+--- a/slora/server/httpserver/manager.py
++++ b/slora/server/httpserver/manager.py
+@@ -7,7 +7,7 @@
+ 
+ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+ from ..tokenizer import get_tokenizer
+-from slora.common.prefix_modes import CPU_MODES, FULL_REPREFILL_MODES, FULL_REPREFILL, FULL_RECONSTRUCT, normalize_prefix_mode
++from slora.common.prefix_modes import CPU_MODES, FULL_REPREFILL_MODES, FULL_REPREFILL, FULL_RECONSTRUCT, RANK_SPLIT_LIMITS, normalize_prefix_mode
+ from ..io_struct import BatchStrOut, AbortReq, BatchAbortReq, LowRAResetReq, LowRAResetAck
+ 
+ 
+@@ -54,7 +54,7 @@
+         prefix_mode = normalize_prefix_mode(lowra_prefix_mode)
+         self.full_reprefill = prefix_mode in FULL_REPREFILL_MODES
+         self.cpu_prefix_ids = ((cpu_prefix_token_id,) * lowra_shared_prefix_len if prefix_mode in CPU_MODES else None)
+-        self.full_reconstruct = prefix_mode == FULL_RECONSTRUCT
++        self.full_reconstruct = prefix_mode in (FULL_RECONSTRUCT, *RANK_SPLIT_LIMITS)
+         self.shared_prefix_ids = None
+ 
+     async def generate(self, adapter_dir, prompt, sampling_params, request_id, lowra_lengths=None):
+--- a/slora/server/api_server.py
++++ b/slora/server/api_server.py
+@@ -55,7 +55,7 @@
+ 
+ from slora.mprophet.measure import ModelProphet
+ from slora.mprophet.lora_stats import LoRAProphet
+-from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
++from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, FULL_RECONSTRUCT, RANK_SPLIT_LIMITS, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
+ from slora.common.space_plan_config import add_space_plan_arguments, space_plan_options
+ 
+ 
+@@ -473,17 +473,20 @@
+     add_space_plan_arguments(parser)
+     args = parser.parse_args()
+     if args.reuse_next_reconstructed and (not args.enable_lowra or args.scheduler != "online"
+-            or args.lowra_prefix_mode != FULL_RECONSTRUCT or args.lowra_pin_hot_adapters):
++            or args.lowra_prefix_mode not in (FULL_RECONSTRUCT, *RANK_SPLIT_LIMITS) or args.lowra_pin_hot_adapters):
+         parser.error("--reuse-next-reconstructed requires online, unpinned minikv-full_reconstruct")
+     try:
+         space_plan_options(args)
+     except ValueError as exc:
+         parser.error(str(exc))
++    if args.lowra_prefix_mode in RANK_SPLIT_LIMITS and (
++            args.tp != 1 or not args.reuse_next_reconstructed or args.lowra_reconstruction_kernel != "bounded"):
++        parser.error("rank-split MiniKV requires TP=1, bounded reconstruction and next-batch reuse")
+     if args.lowra_prefix_mode == LAYER_ADAPTIVE and (
+             not args.enable_lowra or args.scheduler != "online" or args.tp != 1):
+         parser.error("minikv-adaptive requires --enable-lowra --scheduler online --tp 1")
+     if args.lowra_reconstruction_kernel == "bounded" and (
+-            not args.enable_lowra or args.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE)):
++            not args.enable_lowra or args.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, *RANK_SPLIT_LIMITS)):
+         parser.error("bounded reconstruction requires enable-lowra and a layer mode")
+     if args.lowra_reconstruction_workers is not None and (
+             args.lowra_reconstruction_kernel != "bounded" or args.lowra_reconstruction_workers <= 0):
+--- a/benchmarks/lowra_saturation_exp.py
++++ b/benchmarks/lowra_saturation_exp.py
+@@ -32,7 +32,7 @@
+ 
+ from benchmarks.lowra_shared_ratio_exp import expand_adapter_dirs, zipf_probs
+ from slora.common.prefix_modes import (
+-    FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_RETAINED, LAYER_PREFETCH, LAYER_ADAPTIVE,
++    FULL_REPREFILL, FULL_RECONSTRUCT, RANK_SPLIT_LIMITS, LAYER_SERIAL, LAYER_RETAINED, LAYER_PREFETCH, LAYER_ADAPTIVE,
+     CPU_MODES, CPU_FIXED, CPU_FIXED_R64, CPU_PIN_COUNTS, ACTIVE_REPREFILL, FULL_REPREFILL_MODES, PREFILL_BUILD_MODES, PREFIX_MODES,
+     normalize_prefix_mode,
+ )
+@@ -616,6 +616,9 @@
+                                                     "slora/common/prefix_source_cache.py",
+                                                     "slora/common/full_reconstruct.py",
+                                                     "slora/common/lowra_layer_runtime.py",
++                                                    "slora/common/h20_rank_split_runtime.py",
++                                                    "slora/common/prefix_modes.py",
++                                                    "slora/server/router/online_req_queue.py",
+                                                     "slora/common/lowra_reconstruct_kv.py",
+                                                     "slora/common/lowra_reconstruct.py",
+                                                     "slora/common/lowra_reconstruct_bounded.py",
+@@ -804,9 +807,12 @@
+     if args.cpu_prefix_pool_gb is not None and (
+             args.cpu_prefix_pool_gb <= 0 or args.mode not in CPU_MODES or not args.dummy or args.generation_mode != "trace"):
+         parser.error("--cpu-prefix-pool-gb requires a positive cap, a CPU prefix mode, --dummy and --generation-mode trace")
+-    if args.reuse_next_reconstructed and (args.mode != FULL_RECONSTRUCT or args.pin_hot_adapters
++    if args.reuse_next_reconstructed and (args.mode not in (FULL_RECONSTRUCT, *RANK_SPLIT_LIMITS) or args.pin_hot_adapters
+                                           or args.scheduler != "online"):
+         parser.error("--reuse-next-reconstructed requires online, unpinned minikv-full_reconstruct")
++    if args.mode in RANK_SPLIT_LIMITS and (
++            not args.reuse_next_reconstructed or args.reconstruction_kernel != "bounded"):
++        parser.error("rank-split MiniKV requires bounded reconstruction and next-batch reuse")
+     if args.mode in (ACTIVE_REPREFILL, *CPU_MODES) and args.scheduler != "online":
+         parser.error("active prefix-source baselines require --scheduler online")
+     if args.mode == CPU_FIXED and args.num_adapters < 2:
+@@ -822,7 +828,7 @@
+     if args.generation_max_new_tokens <= 0:
+         parser.error("generation-max-new-tokens must be positive")
+     args.output_length_admission = "hidden" if args.scheduler == "online" else "max_new_tokens_peak_reservation"
+-    if args.reconstruction_kernel == "bounded" and args.mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE):
++    if args.reconstruction_kernel == "bounded" and args.mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, *RANK_SPLIT_LIMITS):
+         parser.error("bounded reconstruction requires a layer mode")
+     if args.reconstruction_workers is not None and (
+             args.reconstruction_kernel != "bounded" or args.reconstruction_workers <= 0):

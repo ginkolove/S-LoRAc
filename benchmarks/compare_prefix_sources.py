@@ -31,6 +31,7 @@ def compare(root, modes=SOURCE_COMPARISON_MODES):
             "completed_req_per_s_steady", "output_tokens_per_s_total", "latency_mean", "latency_p95",
             "ttft_mean", "ttft_p95")}
         points[mode]["cache"] = cache
+        points[mode]["peak_output_window_10s"] = result.get("peak_output_window_10s")
         points[mode]["peak_without_model_bytes"] = point["runtime"]["peak_allocated_without_base_model_bytes"]
     return dict(trace_sha256=digest, methods=points)
 

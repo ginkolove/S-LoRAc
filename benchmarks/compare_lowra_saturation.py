@@ -48,6 +48,8 @@ def compare(full_dir, serial_dir):
             a, b = full["result"]["completed_req_per_s_steady"], serial["result"]["completed_req_per_s_steady"]
             rows.append(dict(request_rate=rate, seed=seed, full_req_per_s=a, serial_req_per_s=b,
                              full_mode=modes[0], serial_mode=modes[1],
+                             full_peak_output_window_10s=full["result"].get("peak_output_window_10s"),
+                             serial_peak_output_window_10s=serial["result"].get("peak_output_window_10s"),
                              serial_over_full=b / a if a else None,
                              full_batch_mean=full["runtime"]["running_batch_size"]["mean"],
                              serial_batch_mean=serial["runtime"]["running_batch_size"]["mean"],
@@ -74,6 +76,7 @@ if __name__ == "__main__":
         reconstructed = compare(args.reconstruct_dir, args.serial_dir)
         for row, reconstructed_row in zip(rows, reconstructed):
             row.update(reconstruct_req_per_s=reconstructed_row["full_req_per_s"],
+                       reconstruct_peak_output_window_10s=reconstructed_row["full_peak_output_window_10s"],
                        reconstruct_mode=FULL_RECONSTRUCT,
                        serial_over_reconstruct=reconstructed_row["serial_over_full"],
                        reconstruct_batch_mean=reconstructed_row["full_batch_mean"],

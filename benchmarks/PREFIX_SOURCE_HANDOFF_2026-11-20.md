@@ -2,6 +2,21 @@
 
 分支：`breakdown_hybridpage`。本轮是**服务性能实验**，不是 `accexp` 精度实验，也不是之前的固定 rank、固定 decode 长度或弹性布局实验。接手时先看本文，再看 [全矩阵入口](run_prefix_sources_300s.sh)、[双卡配对入口](run_prefix_sources_after_idle.sh) 和 [单组实际参数](run_lmsys_preemption.sh)。
 
+## 后续 H20 实验的 rank 配置
+
+用 `run_prefix_sources.py --hardware h20` 启动新实验时，7B、13B、30B 默认共用 `hf-llama7b`。2026-11-20 的普查按公开 LoRA 仓库计数，实际配置的基座为 `huggyllama/llama-7b`。348 个符合条件的仓库中，323 个落在选用的四档。按这 323 个仓库归一化，再用最大余数法分配 50 个逻辑适配器。[普查明细](results/llama7b_hf_lora_rank_census_20261120.csv)
+
+| Rank | HF 仓库数 | 50 个适配器中的个数 | 请求抽样概率 | 120 s、seed 42 的实际请求数 |
+|---:|---:|---:|---:|---:|
+| 8 | 147 | 23 | 45.51% | 177 |
+| 16 | 81 | 12 | 25.08% | 78 |
+| 32 | 32 | 5 | 9.91% | 28 |
+| 64 | 63 | 10 | 19.50% | 68 |
+
+请求的 rank 概率取各档精确仓库占比，作为合成负载假设。每档内部继续按 Zipf(1) 选适配器。四档 rank 总和为 1176，固定 rank-64 Top-1 对应逻辑 ID 3。MiniKV actual 算子回放使用同一实验点的冻结 trace。这一轮已准备好的 11 个点位于 `benchmarks/results/h20_hf_llama7b_rankmix_120s_traces`，可直接作为 `--trace-root`。
+
+下文的三档配置和结果属于 `chameleon`。A100 入口默认使用该配置，通过 `run_prefix_sources.py --hardware a100 --adapter-profile hf-llama7b` 可选择四档配置。
+
 ## 这次要回答什么
 
 同样的长前缀文本，挂不同 LoRA 后会产生不同的 prefix KV。在相同的到达、query、生成长度和 LoRA 分配下，比较五条路径：重新 prefill、从主机读完整 KV（含一个固定缓存对照）、从 MiniKV 完整或逐层重构。完整展开省下后续重构，但占用运行请求也需要的显存；逐层重构省显存，却可能延长每个 decode step。**分别看吞吐、TTFT 和端到端延迟，不只给一个“最快”。**

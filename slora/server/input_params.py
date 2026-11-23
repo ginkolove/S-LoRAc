@@ -72,6 +72,7 @@ class InputParams:
         max_active_loras=None,
         space_plan_config=None,
         cpu_prefix_pool_gb=None,
+        impress_read_percent=None,
     ) -> None:
         self.max_req_total_len = max_req_total_len
         self.nccl_port = int(nccl_port)
@@ -130,6 +131,7 @@ class InputParams:
                 cpu_prefix_pool_gb < 1 or not dummy or not enable_lowra or self.lowra_prefix_mode not in CPU_MODES):
             raise ValueError("--cpu-prefix-pool-gb needs a positive decimal GB cap and a dummy CPU prefix mode")
         self.cpu_prefix_pool_gb = cpu_prefix_pool_gb
+        self.impress_read_percent = impress_read_percent
         self.reuse_next_reconstructed = reuse_next_reconstructed
         self.cpu_fixed_hot_indices = cpu_fixed_hot_indices
         if lowra_reconstruction_kernel not in ("auto", "bounded"):

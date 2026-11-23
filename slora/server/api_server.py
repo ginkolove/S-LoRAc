@@ -39,9 +39,11 @@ from .sampling_params import SamplingParams
 from .httpserver.manager import HttpServerManager
 from .detokenization.manager import start_detokenization_process
 from .router.manager import start_router_process
+from slora.common.prefix_modes import IMPRESS, add_impress_read_argument
 
 from slora.utils.net_utils import alloc_can_use_network_port
 from slora.common.configs.config import setting
+from slora.common.benchmark_gpu import spawn_router
 from .api_models import (
     ChatCompletionRequest,
     UsageInfo,
@@ -427,6 +429,7 @@ def main():
     parser.add_argument("--cpu-prefix-token-id", type=int, default=10,
                         help="Repeated shared prefix token used to prefill the benchmark CPU bank.")
     parser.add_argument("--cpu-fixed-hot-indices", type=int, nargs="+", default=(0, 1))
+    add_impress_read_argument(parser)
     parser.add_argument("--cpu-prefix-pool-gb", type=int, help="Dummy performance replay only: cap physical "
                         "host prefix KV in decimal GB, reusing whole source entries across adapters.")
     parser.add_argument("--reuse-next-reconstructed", action="store_true",
@@ -501,6 +504,8 @@ def main():
     setting["max_req_total_len"] = args.max_req_total_len
     setting["nccl_port"] = args.nccl_port
 
+    if args.impress_read_percent is not None and args.lowra_prefix_mode != IMPRESS:
+        parser.error("--impress-read-percent requires --lowra-prefix-mode impress")
     if args.batch_max_tokens is None:
         batch_max_tokens = (args.max_total_token_num if args.scheduler == "online" else
                             max(int(1 / 6 * args.max_total_token_num), args.max_req_total_len))
@@ -538,9 +543,9 @@ def main():
     )
     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
-    proc_router = mp.Process(
-        target=start_router_process,
-        args=(
+    proc_router = spawn_router(
+        start_router_process,
+        (
             args,
             router_port,
             detokenization_port,
@@ -549,7 +554,6 @@ def main():
             pipe_router_writer,
         ),
     )
-    proc_router.start()
     proc_detoken = mp.Process(
         target=start_detokenization_process,
         args=(

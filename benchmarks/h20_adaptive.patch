@@ -1,0 +1,104 @@
+--- a/slora/server/router/adaptive_req_queue.py
++++ b/slora/server/router/adaptive_req_queue.py
+@@ -12,6 +12,7 @@
+ 
+ import numpy as np
+ 
++from slora.common.h20_adaptive_layout import blocked_head_comparison, tiled_rank
+ from slora.common.space_plan_config import SpacePlanConfig
+ from slora.server.io_struct import Batch
+ from slora.server.router.online_req_queue import OnlinePlan, OnlineReqQueue
+@@ -88,7 +89,7 @@
+     def reconstruction_ms(self, ranks, prefix):
+         if not ranks:
+             return 0.
+-        return self.reconstruction_group_ms(len(ranks), sum(ranks), prefix)
++        return self.reconstruction_group_ms(len(ranks), sum(tiled_rank(r) for r in ranks), prefix)
+ 
+     def reconstruction_group_ms(self, count, rank_sum, prefix):
+         if not count:
+@@ -106,7 +107,7 @@
+             for layer, sign in ((first, 1), (end, -1)):
+                 counts = events.setdefault(layer, [0, 0])
+                 counts[0] += sign
+-                counts[1] += sign * rank
++                counts[1] += sign * tiled_rank(rank)
+         count = ranks = previous = 0
+         total = 0.
+         for layer in sorted(events):
+@@ -288,6 +289,9 @@
+         heavy = (not running or not current.fits or urgent or
+                  self.decode_steps - self.last_heavy_step >= self.config.interval)
+         window = self.config.window if heavy else max(1, self.config.window - (self.decode_steps - self.last_heavy_step))
++        head = blocked_head_comparison(self, running, waiting, ranks, window)
++        if head is not None:
++            window = head.keep.window
+         candidates = []
+         # FCFS prefixes only. Test all lengths for capacity before spending time
+         # on optimization, so a costly search cannot hide a feasible old request.
+@@ -325,6 +329,8 @@
+                 for index in indices:
+                     selected = candidates[index]
+                     result = self._search(running, selected, ranks, window, deadline, heavy=False)
++                    if head is not None and index == 1:
++                        result = head.release
+                     if result is None and heavy:
+                         result = self._evaluate(running, selected, ranks,
+                             {r.adapter_dir: 0 for r in running + selected}, window)
+@@ -352,6 +358,9 @@
+                 margin = max(self.config.hysteresis, min(0.5, self.cost.error))
+                 if old.plan.fits and old.slo_feasible and choice.score <= old.score * (1 + margin):
+                     choice = old
++                if (head is not None and choice.selected and not urgent and head.keep.slo_feasible
++                        and (not choice.slo_feasible or choice.score <= head.keep.score * (1 + margin))):
++                    choice = head.keep
+         if heavy:
+             self.last_heavy_step = self.decode_steps
+         self.pending = choice if choice.plan.fits else None
+@@ -364,6 +373,8 @@
+             predicted_progress_tokens_s=choice.score, predicted_step_ms=choice.step_ms,
+             step_slo_feasible=choice.slo_feasible,
+             planning_ms=(time.perf_counter() - start) * 1000., model=self.cost.state_dict())
++        if head is not None:
++            self.last_record["head_pressure"] = head.record(choice)
+         return choice
+ 
+     def generate_new_batch(self, current_batch, lora_ranks):
+--- a/slora/common/lowra_adaptive.py
++++ b/slora/common/lowra_adaptive.py
+@@ -9,6 +9,7 @@
+ 
+ import torch
+ 
++from slora.common.h20_adaptive_layout import tiled_rank
+ from slora.common.lowra_retained import RetainedPrefixKVCache, RetainedLayerRuntime
+ from slora.common.lowra_layer_runtime import profile_interval
+ from slora.common.prefix_indices import PrefixIndexedFrame
+@@ -252,14 +253,15 @@
+         with profile_interval(runtime.profiler, "reconstruct", layer_id):
+             if runtime.reconstruction_kernel == "bounded":
+                 reconstruct_prefix_layer_bounded(runtime.static_store, self.infer_adapter,
+-                    meta, layer_id, *self.buffers(layer_id), workers=runtime.reconstruction_workers)
++                    meta, layer_id, *self.buffers(layer_id), workers=runtime.reconstruction_workers,
++                    rank_loop="actual", block_r=16)
+             else:
+                 reconstruct_prefix_layer(runtime.static_store, self.infer_adapter,
+                                          meta, layer_id, *self.buffers(layer_id))
+         if observation is not None:
+             end.record()
+             observation["calls"].append((start, end, len(build),
+-                sum(runtime.static_store.lora_ranks[d] for d in build)))
++                sum(tiled_rank(runtime.static_store.lora_ranks[d]) for d in build)))
+         for directory in build:
+             entry = runtime.cache.entries[directory]
+             if layer_id < entry.layers:
+--- a/benchmarks/lowra_saturation_exp.py
++++ b/benchmarks/lowra_saturation_exp.py
+@@ -621,6 +621,7 @@
+                                                     "slora/common/lowra_reconstruct_bounded.py",
+                                                     "slora/common/lowra_retained.py",
+                                                     "slora/common/lowra_adaptive.py",
++                                                    "slora/common/h20_adaptive_layout.py",
+                                                     "slora/common/space_plan_config.py",
+                                                     "slora/server/router/adaptive_req_queue.py",
+                                                     "slora/common/lowra_runtime_stats.py",

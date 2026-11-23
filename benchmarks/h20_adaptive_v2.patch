@@ -1,0 +1,178 @@
+--- a/slora/common/prefix_modes.py
++++ b/slora/common/prefix_modes.py
+@@ -12,12 +12,14 @@
+ LAYER_RETAINED = "minikv-layer_retained"
+ LAYER_PREFETCH = "layer_prefetch"
+ LAYER_ADAPTIVE = "minikv-adaptive"
++LAYER_ADAPTIVE_V2 = "minikv-adaptive-v2"
++ADAPTIVE_MODES = (LAYER_ADAPTIVE, LAYER_ADAPTIVE_V2)
+ 
+ PREFILL_BUILD_MODES = (FULL_REPREFILL, ACTIVE_REPREFILL)
+ # Full-size GPU entries produced without a static MiniKV region.
+ FULL_REPREFILL_MODES = PREFILL_BUILD_MODES + CPU_MODES
+ FULL_PREFIX_CACHE_MODES = FULL_REPREFILL_MODES + (FULL_RECONSTRUCT,)
+-PREFIX_MODES = FULL_PREFIX_CACHE_MODES + (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE)
++PREFIX_MODES = FULL_PREFIX_CACHE_MODES + (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, *ADAPTIVE_MODES)
+ SOURCE_COMPARISON_MODES = (ACTIVE_REPREFILL, CPU_READ, CPU_FIXED, FULL_RECONSTRUCT, LAYER_SERIAL)
+ 
+ _ALIASES = {mode: mode for mode in PREFIX_MODES}
+--- a/slora/server/router/manager.py
++++ b/slora/server/router/manager.py
+@@ -33,16 +33,18 @@
+ from slora.server.router.full_reprefill_req_queue import FullReprefillReqQueue
+ from slora.server.router.online_req_queue import OnlineReqQueue
+ from slora.server.router.adaptive_req_queue import AdaptiveReqQueue
++from slora.server.router.h20_adaptive_v2 import AdaptiveV2ReqQueue
+ from slora.common.space_plan_config import space_plan_options
+ from slora.common.full_reprefill import FULL_REPREFILL_MODES, FULL_PREFIX_CACHE_MODES
+-from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_MODES, CPU_FIXED_R64, CPU_PIN_COUNTS, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
++from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_MODES, CPU_FIXED_R64, CPU_PIN_COUNTS, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, LAYER_ADAPTIVE_V2, ADAPTIVE_MODES, normalize_prefix_mode
+ from slora.common.service_cycles import ServiceCycleRecorder
+ 
+ 
+ def get_scheduler(input_params, adapter_dirs):
+     if getattr(input_params, "scheduler", "slora") == "online":
+-        adaptive = input_params.lowra_prefix_mode == LAYER_ADAPTIVE
+-        queue_class = AdaptiveReqQueue if adaptive else OnlineReqQueue
++        adaptive = input_params.lowra_prefix_mode in ADAPTIVE_MODES
++        queue_class = (AdaptiveV2ReqQueue if input_params.lowra_prefix_mode == LAYER_ADAPTIVE_V2
++                       else AdaptiveReqQueue if adaptive else OnlineReqQueue)
+         extra = dict(space_plan_config=input_params.space_plan_config) if adaptive else {}
+         return queue_class(
+             input_params.max_total_token_num, input_params.batch_max_tokens,
+@@ -101,7 +103,7 @@
+         self.load_way = load_way
+         self.mode = mode
+         self.input_params = input_params
+-        if input_params.lowra_prefix_mode == LAYER_ADAPTIVE and world_size != 1:
++        if input_params.lowra_prefix_mode in ADAPTIVE_MODES and world_size != 1:
+             raise ValueError("experimental adaptive planning currently supports TP=1 only")
+         if input_params.scheduler == "online" and mode:
+             raise ValueError("online scheduling currently requires the FP16 Unified Paging path")
+--- a/slora/server/router/model_infer/model_rpc.py
++++ b/slora/server/router/model_infer/model_rpc.py
+@@ -31,7 +31,7 @@
+ from slora.common.full_reconstruct import FullReconstructPrefixKVCache, FullReconstructRuntime
+ from slora.common.lowra_retained import RetainedPrefixKVCache, RetainedLayerRuntime
+ from slora.common.lowra_adaptive import AdaptivePrefixKVCache, AdaptiveLayerRuntime
+-from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
++from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, ADAPTIVE_MODES, normalize_prefix_mode
+ from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_PIN_COUNTS, CPU_MODES
+ from slora.common.prefix_source_cache import ActivePrefixCache, HostPrefixBank
+ from slora.utils.infer_utils import set_random_seed
+@@ -203,7 +203,7 @@
+                     pinned_lora_dirs=list(lora_rank_map)[:getattr(input_params, "lowra_pin_hot_adapters", 0)])
+                 self.lowra_runtime = FullReconstructRuntime(
+                     static_store, self.model.mem_manager, self.lowra_prefix_cache)
+-            elif input_params.lowra_prefix_mode == LAYER_ADAPTIVE:
++            elif input_params.lowra_prefix_mode in ADAPTIVE_MODES:
+                 self.lowra_prefix_cache = AdaptivePrefixKVCache(static_store.prefix_len, self.model.mem_manager)
+                 self.lowra_runtime = AdaptiveLayerRuntime(
+                     static_store, self.model.mem_manager, self.lowra_prefix_cache,
+@@ -211,6 +211,7 @@
+                     reconstruction_kernel=input_params.lowra_reconstruction_kernel,
+                     reconstruction_workers=input_params.lowra_reconstruction_workers,
+                     sample_interval=input_params.space_plan_config["interval"])
++                self.lowra_runtime.mode = input_params.lowra_prefix_mode
+             elif input_params.lowra_prefix_mode == LAYER_RETAINED:
+                 self.lowra_prefix_cache = RetainedPrefixKVCache(
+                     static_store.prefix_len, input_params.lowra_retain_layers, self.model.mem_manager,
+--- a/slora/server/input_params.py
++++ b/slora/server/input_params.py
+@@ -1,4 +1,4 @@
+-from slora.common.prefix_modes import CPU_MODES, FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
++from slora.common.prefix_modes import CPU_MODES, FULL_REPREFILL, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, ADAPTIVE_MODES, normalize_prefix_mode
+ from slora.common.space_plan_config import SpacePlanConfig
+ 
+ 
+@@ -117,7 +117,7 @@
+         self.lowra_wait_slo_ms = lowra_wait_slo_ms
+         self.lowra_prefix_mode = normalize_prefix_mode(lowra_prefix_mode)
+         self.space_plan_config = vars(SpacePlanConfig(**(space_plan_config or {})))
+-        if self.lowra_prefix_mode == LAYER_ADAPTIVE and (
++        if self.lowra_prefix_mode in ADAPTIVE_MODES and (
+                 not enable_lowra or scheduler != "online" or lowra_retain_layers
+                 or lowra_retain_top_k is not None or lowra_pin_hot_adapters):
+             raise ValueError("adaptive mode requires online LowRA without fixed retention/top-K/pinning")
+@@ -135,7 +135,7 @@
+         if lowra_reconstruction_kernel not in ("auto", "bounded"):
+             raise ValueError("unknown LowRA reconstruction kernel")
+         if lowra_reconstruction_kernel == "bounded" and (
+-                not enable_lowra or self.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE)):
++                not enable_lowra or self.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, *ADAPTIVE_MODES)):
+             raise ValueError("bounded reconstruction requires a LowRA layer mode")
+         if lowra_reconstruction_workers is not None and (
+                 lowra_reconstruction_kernel != "bounded"
+--- a/slora/server/api_server.py
++++ b/slora/server/api_server.py
+@@ -55,7 +55,7 @@
+ 
+ from slora.mprophet.measure import ModelProphet
+ from slora.mprophet.lora_stats import LoRAProphet
+-from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, normalize_prefix_mode
++from slora.common.prefix_modes import PREFIX_MODES, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE, ADAPTIVE_MODES, normalize_prefix_mode
+ from slora.common.space_plan_config import add_space_plan_arguments, space_plan_options
+ 
+ 
+@@ -479,11 +479,11 @@
+         space_plan_options(args)
+     except ValueError as exc:
+         parser.error(str(exc))
+-    if args.lowra_prefix_mode == LAYER_ADAPTIVE and (
++    if args.lowra_prefix_mode in ADAPTIVE_MODES and (
+             not args.enable_lowra or args.scheduler != "online" or args.tp != 1):
+         parser.error("minikv-adaptive requires --enable-lowra --scheduler online --tp 1")
+     if args.lowra_reconstruction_kernel == "bounded" and (
+-            not args.enable_lowra or args.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE)):
++            not args.enable_lowra or args.lowra_prefix_mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, *ADAPTIVE_MODES)):
+         parser.error("bounded reconstruction requires enable-lowra and a layer mode")
+     if args.lowra_reconstruction_workers is not None and (
+             args.lowra_reconstruction_kernel != "bounded" or args.lowra_reconstruction_workers <= 0):
+--- a/benchmarks/lowra_saturation_exp.py
++++ b/benchmarks/lowra_saturation_exp.py
+@@ -32,7 +32,7 @@
+ 
+ from benchmarks.lowra_shared_ratio_exp import expand_adapter_dirs, zipf_probs
+ from slora.common.prefix_modes import (
+-    FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_RETAINED, LAYER_PREFETCH, LAYER_ADAPTIVE,
++    FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, LAYER_RETAINED, LAYER_PREFETCH, LAYER_ADAPTIVE, ADAPTIVE_MODES,
+     CPU_MODES, CPU_FIXED, CPU_FIXED_R64, CPU_PIN_COUNTS, ACTIVE_REPREFILL, FULL_REPREFILL_MODES, PREFILL_BUILD_MODES, PREFIX_MODES,
+     normalize_prefix_mode,
+ )
+@@ -408,7 +408,7 @@
+     if getattr(args, "max_active_loras", None) is not None:
+         command.extend(["--max-active-loras", str(args.max_active_loras)])
+     command.extend(["--lowra-reconstruction-kernel", args.reconstruction_kernel])
+-    if args.mode == LAYER_ADAPTIVE:
++    if args.mode in ADAPTIVE_MODES:
+         command.extend(space_plan_command(args))
+     if args.reconstruction_workers is not None:
+         command.extend(["--lowra-reconstruction-workers", str(args.reconstruction_workers)])
+@@ -624,6 +624,10 @@
+                                                     "slora/common/h20_adaptive_layout.py",
+                                                     "slora/common/space_plan_config.py",
+                                                     "slora/server/router/adaptive_req_queue.py",
++                                                    "slora/server/router/h20_adaptive_v2.py",
++                                                    "slora/common/prefix_modes.py",
++                                                    "slora/server/api_server.py",
++                                                    "slora/server/input_params.py",
+                                                     "slora/common/lowra_runtime_stats.py",
+                                                     "slora/common/service_cycles.py",
+                                                     "slora/server/router/manager.py",
+@@ -817,14 +821,14 @@
+         space_plan_options(args)
+     except ValueError as exc:
+         parser.error(str(exc))
+-    if args.mode == LAYER_ADAPTIVE and args.scheduler != "online":
++    if args.mode in ADAPTIVE_MODES and args.scheduler != "online":
+         parser.error("minikv-adaptive requires the online scheduler")
+     if args.schedule_interval <= 0 or (args.max_active_loras is not None and args.max_active_loras <= 0):
+         parser.error("schedule-interval and max-active-loras must be positive")
+     if args.generation_max_new_tokens <= 0:
+         parser.error("generation-max-new-tokens must be positive")
+     args.output_length_admission = "hidden" if args.scheduler == "online" else "max_new_tokens_peak_reservation"
+-    if args.reconstruction_kernel == "bounded" and args.mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, LAYER_ADAPTIVE):
++    if args.reconstruction_kernel == "bounded" and args.mode not in (LAYER_SERIAL, LAYER_PREFETCH, LAYER_RETAINED, *ADAPTIVE_MODES):
+         parser.error("bounded reconstruction requires a layer mode")
+     if args.reconstruction_workers is not None and (
+             args.reconstruction_kernel != "bounded" or args.reconstruction_workers <= 0):

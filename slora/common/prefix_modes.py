@@ -3,10 +3,11 @@
 FULL_REPREFILL = "full-reprefill"
 ACTIVE_REPREFILL = "active-reprefill"
 CPU_READ = "cpu-read"
+IMPRESS = "impress"
 CPU_FIXED = "cpu-read-fixed2"
 CPU_FIXED_R64 = "cpu-read-fixed1-r64"
 CPU_PIN_COUNTS = {CPU_FIXED: 2, CPU_FIXED_R64: 1}
-CPU_MODES = (CPU_READ, *CPU_PIN_COUNTS)
+CPU_MODES = (CPU_READ, *CPU_PIN_COUNTS, IMPRESS)
 FULL_RECONSTRUCT = "minikv-full_reconstruct"
 LAYER_SERIAL = "minikv-layer_serial"
 LAYER_RETAINED = "minikv-layer_retained"
@@ -31,3 +32,8 @@ def normalize_prefix_mode(mode):
         return _ALIASES[mode]
     except KeyError:
         raise ValueError("unknown prefix mode: %s" % mode) from None
+
+
+def add_impress_read_argument(parser):
+    parser.add_argument("--impress-read-percent", type=int, choices=range(101), metavar="0..100",
+                        help="Percentage of prefix positions that Impress copies from CPU (default 50).")

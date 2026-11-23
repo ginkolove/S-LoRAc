@@ -1,6 +1,7 @@
 """CPU-only tests for real-content, rank-independent replay."""
 
 import asyncio
+from collections import Counter
 import csv
 from dataclasses import asdict
 import json
@@ -16,7 +17,9 @@ from unittest.mock import patch
 
 import numpy as np
 
-from benchmarks.lmsys_maf_trace import CHAMELEON_SCHEMA, SCHEMA, bind_requests, chameleon_profile, load_trace
+from benchmarks.lmsys_maf_trace import (
+    CHAMELEON_SCHEMA, HF_PROFILE, PROFILE_SCHEMAS, SCHEMA, bind_requests, chameleon_profile, hf_profile, load_trace,
+)
 from benchmarks.prepare_lmsys_maf_trace import (
     aggregate_maf, first_turns, poisson_arrivals, select_samples, save_artifact,
     parse_args as prepare_args,
@@ -45,6 +48,55 @@ def parse_fixture(path, rank=8, mode="minikv-layer_serial", extra=()):
 
 
 class TraceTests(unittest.TestCase):
+    def test_hf_catalog_and_request_mass(self):
+        for n in (4, 5, 50, 323):
+            profile = hf_profile(n)
+            ranks = profile["adapter_ranks"]
+            self.assertEqual(len(ranks), n)
+            if n == 50:
+                self.assertEqual(Counter(ranks), {8: 23, 16: 12, 32: 5, 64: 10})
+            for rank, repos in ((8, 147), (16, 81), (32, 32), (64, 63)):
+                group = [p for r, p in zip(ranks, profile["adapter_probabilities"]) if r == rank]
+                self.assertAlmostEqual(sum(group), repos / 323)
+                for j, p in enumerate(group, 1):
+                    self.assertAlmostEqual(j * p, group[0])
+        with self.assertRaises(ValueError):
+            hf_profile(3)
+
+    def test_hf_server_replay_and_fixed_rank64_use_same_adapter_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.json"
+            data = fixture()
+            data["schema"] = PROFILE_SCHEMAS[HF_PROFILE]
+            data["config"]["num_adapters"] = 50
+            data[HF_PROFILE] = hf_profile(50)
+            data["requests"][1]["adapter_index"] = 49
+            path.write_text(json.dumps(data))
+            output = subprocess.check_output(
+                ["bash", "benchmarks/run_lmsys_preemption.sh", tmp, "--dry-run", "--prefix-sources",
+                 "--fixed-rank64", "--adapter-profile", HF_PROFILE, "--prefix-len", "10", "--duration", "10"],
+                text=True)
+            self.assertIn("total rank: 1176", output)
+            commands = [shlex.split(line)[2:] for line in output.splitlines()
+                        if " -u benchmarks/lowra_saturation_exp.py " in line]
+            self.assertEqual(len(commands), 5)
+            for command in commands:
+                with patch("sys.argv", command):
+                    args = parse_args()
+                bound, _, _ = trace_for(args, 3, 42)
+                server = server_command(args, Path(tmp) / "stats")
+                dirs = [server[i + 1] for i, flag in enumerate(server) if flag == "--lora-dirs"]
+                self.assertEqual(len(set(dirs)), 50)
+                self.assertEqual([int(d.split("-")[-2]) for d in dirs], data[HF_PROFILE]["adapter_ranks"])
+                self.assertEqual([r["adapter_dir"] for r in bound], [dirs[0], dirs[49]])
+                if args.mode == "cpu-read-fixed1-r64":
+                    hot, = args.fixed_hot_indices
+                    self.assertEqual(dirs[hot], "dummy-lora-7b-rank-64-0")
+            data[HF_PROFILE]["adapter_probabilities"].reverse()
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "rank or popularity"):
+                load_trace(path)
+
     def test_chameleon_distribution(self):
         for n in (3, 50, 51, 52):
             profile = chameleon_profile(n)

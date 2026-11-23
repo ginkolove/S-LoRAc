@@ -1,0 +1,73 @@
+--- a/slora/common/prefix_modes.py
++++ b/slora/common/prefix_modes.py
+@@ -13,7 +13,8 @@
+ LAYER_PREFETCH = "layer_prefetch"
+ LAYER_ADAPTIVE = "minikv-adaptive"
+ LAYER_ADAPTIVE_V2 = "minikv-adaptive-v2"
+-ADAPTIVE_MODES = (LAYER_ADAPTIVE, LAYER_ADAPTIVE_V2)
++LAYER_ADAPTIVE_V3 = "minikv-adaptive-v3"
++ADAPTIVE_MODES = (LAYER_ADAPTIVE, LAYER_ADAPTIVE_V2, LAYER_ADAPTIVE_V3)
+ 
+ PREFILL_BUILD_MODES = (FULL_REPREFILL, ACTIVE_REPREFILL)
+ # Full-size GPU entries produced without a static MiniKV region.
+--- a/slora/server/router/manager.py
++++ b/slora/server/router/manager.py
+@@ -34,17 +34,18 @@
+ from slora.server.router.online_req_queue import OnlineReqQueue
+ from slora.server.router.adaptive_req_queue import AdaptiveReqQueue
+ from slora.server.router.h20_adaptive_v2 import AdaptiveV2ReqQueue
++from slora.server.router.h20_adaptive_v3 import AdaptiveV3ReqQueue
+ from slora.common.space_plan_config import space_plan_options
+ from slora.common.full_reprefill import FULL_REPREFILL_MODES, FULL_PREFIX_CACHE_MODES
+-from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_MODES, CPU_FIXED_R64, CPU_PIN_COUNTS, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, LAYER_ADAPTIVE_V2, ADAPTIVE_MODES, normalize_prefix_mode
++from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_MODES, CPU_FIXED_R64, CPU_PIN_COUNTS, FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, LAYER_ADAPTIVE_V2, LAYER_ADAPTIVE_V3, ADAPTIVE_MODES, normalize_prefix_mode
+ from slora.common.service_cycles import ServiceCycleRecorder
+ 
+ 
+ def get_scheduler(input_params, adapter_dirs):
+     if getattr(input_params, "scheduler", "slora") == "online":
+         adaptive = input_params.lowra_prefix_mode in ADAPTIVE_MODES
+-        queue_class = (AdaptiveV2ReqQueue if input_params.lowra_prefix_mode == LAYER_ADAPTIVE_V2
+-                       else AdaptiveReqQueue if adaptive else OnlineReqQueue)
++        queue_class = {LAYER_ADAPTIVE: AdaptiveReqQueue, LAYER_ADAPTIVE_V2: AdaptiveV2ReqQueue,
++                       LAYER_ADAPTIVE_V3: AdaptiveV3ReqQueue}.get(input_params.lowra_prefix_mode, OnlineReqQueue)
+         extra = dict(space_plan_config=input_params.space_plan_config) if adaptive else {}
+         return queue_class(
+             input_params.max_total_token_num, input_params.batch_max_tokens,
+--- a/slora/server/router/model_infer/model_rpc.py
++++ b/slora/server/router/model_infer/model_rpc.py
+@@ -31,7 +31,8 @@
+ from slora.common.full_reconstruct import FullReconstructPrefixKVCache, FullReconstructRuntime
+ from slora.common.lowra_retained import RetainedPrefixKVCache, RetainedLayerRuntime
+ from slora.common.lowra_adaptive import AdaptivePrefixKVCache, AdaptiveLayerRuntime
+-from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE, ADAPTIVE_MODES, normalize_prefix_mode
++from slora.common.h20_adaptive_v3_runtime import AdaptiveV3LayerRuntime, AdaptiveV3PrefixKVCache
++from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_RETAINED, LAYER_ADAPTIVE_V3, ADAPTIVE_MODES, normalize_prefix_mode
+ from slora.common.prefix_modes import ACTIVE_REPREFILL, CPU_PIN_COUNTS, CPU_MODES
+ from slora.common.prefix_source_cache import ActivePrefixCache, HostPrefixBank
+ from slora.utils.infer_utils import set_random_seed
+@@ -204,8 +205,11 @@
+                 self.lowra_runtime = FullReconstructRuntime(
+                     static_store, self.model.mem_manager, self.lowra_prefix_cache)
+             elif input_params.lowra_prefix_mode in ADAPTIVE_MODES:
+-                self.lowra_prefix_cache = AdaptivePrefixKVCache(static_store.prefix_len, self.model.mem_manager)
+-                self.lowra_runtime = AdaptiveLayerRuntime(
++                cache_cls, runtime_cls = AdaptivePrefixKVCache, AdaptiveLayerRuntime
++                if input_params.lowra_prefix_mode == LAYER_ADAPTIVE_V3:
++                    cache_cls, runtime_cls = AdaptiveV3PrefixKVCache, AdaptiveV3LayerRuntime
++                self.lowra_prefix_cache = cache_cls(static_store.prefix_len, self.model.mem_manager)
++                self.lowra_runtime = runtime_cls(
+                     static_store, self.model.mem_manager, self.lowra_prefix_cache,
+                     workspace_lora_limit=input_params.lowra_workspace_loras,
+                     reconstruction_kernel=input_params.lowra_reconstruction_kernel,
+--- a/benchmarks/lowra_saturation_exp.py
++++ b/benchmarks/lowra_saturation_exp.py
+@@ -625,6 +625,8 @@
+                                                     "slora/common/space_plan_config.py",
+                                                     "slora/server/router/adaptive_req_queue.py",
+                                                     "slora/server/router/h20_adaptive_v2.py",
++                                                    "slora/server/router/h20_adaptive_v3.py",
++                                                    "slora/common/h20_adaptive_v3_runtime.py",
+                                                     "slora/common/prefix_modes.py",
+                                                     "slora/server/api_server.py",
+                                                     "slora/server/input_params.py",

@@ -13,7 +13,7 @@ import numpy as np
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from benchmarks.lmsys_maf_trace import CHAMELEON_SCHEMA, SCHEMA, chameleon_profile, load_trace
+from benchmarks.lmsys_maf_trace import HF_PROFILE, PROFILE_SCHEMAS, chameleon_profile, hf_profile, load_trace
 
 
 def file_hash(path):
@@ -146,10 +146,21 @@ def build_trace(args):
     arrivals = poisson_arrivals(args.request_rate, args.duration, arrival_rng)
     if not arrivals:
         raise ValueError("Poisson draw produced no requests; increase duration")
-    mixed = args.adapter_profile == "chameleon"
-    profile = (chameleon_profile(args.num_adapters) if mixed else
-               aggregate_maf(args.maf_file, args.num_adapters, args.maf_skewness,
-                             args.maf_minute_start, args.maf_minute_end))
+    if args.adapter_profile == HF_PROFILE:
+        profile = hf_profile(args.num_adapters)
+        profile_name = "hf_llama7b_r8_16_32_64_zipf1_adapters%s.json" % args.num_adapters
+        distribution = dict(adapter_distribution="hf_repository_rank_mass_within_rank_zipf")
+    elif args.adapter_profile == "chameleon":
+        profile = chameleon_profile(args.num_adapters)
+        profile_name = "chameleon_r16_32_64_zipf1_adapters%s.json" % args.num_adapters
+        distribution = dict(adapter_distribution="uniform_rank_within_rank_zipf")
+    else:
+        profile = aggregate_maf(args.maf_file, args.num_adapters, args.maf_skewness,
+                                args.maf_minute_start, args.maf_minute_end)
+        profile_name = "maf_%s_minutes%s-%s_skew%s_adapters%s.json" % (args.maf_file.stem,
+                        args.maf_minute_start, args.maf_minute_end, args.maf_skewness, args.num_adapters)
+        distribution = dict(adapter_distribution="maf_block_round_robin", maf_skewness=args.maf_skewness,
+                            maf_minute_start=args.maf_minute_start, maf_minute_end=args.maf_minute_end)
     paths = sorted(args.dataset.glob("*.parquet")) if args.dataset.is_dir() else [args.dataset]
     if not paths:
         raise ValueError("no parquet files found")
@@ -167,9 +178,6 @@ def build_trace(args):
     prepared_dir = args.output.parent / "prepared"
     order_artifact = save_artifact(prepared_dir / ("lmsys_first_turn_order_seed%s.json" % args.data_seed),
                                    dataset_order)
-    profile_name = ("chameleon_r16_32_64_zipf1_adapters%s.json" % args.num_adapters if mixed else
-                    "maf_%s_minutes%s-%s_skew%s_adapters%s.json" % (args.maf_file.stem,
-                    args.maf_minute_start, args.maf_minute_end, args.maf_skewness, args.num_adapters))
     profile_artifact = save_artifact(prepared_dir / profile_name, profile)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
     samples, rejected = select_samples(candidates, len(arrivals), tokenizer, sample_rng,
@@ -184,16 +192,13 @@ def build_trace(args):
                 for i, (sample, arrival, adapter) in enumerate(zip(samples, arrivals, adapters))]
     query_lens = [len(request["input_ids"]) for request in requests]
     output_lens = [request["output_len"] for request in requests]
-    distribution = (dict(adapter_distribution="uniform_rank_within_rank_zipf") if mixed else
-                    dict(adapter_distribution="maf_block_round_robin", maf_skewness=args.maf_skewness,
-                         maf_minute_start=args.maf_minute_start, maf_minute_end=args.maf_minute_end))
     config = dict(
         tokenizer=args.tokenizer, vocab_size=len(tokenizer), num_adapters=args.num_adapters,
         prefix_len=args.prefix_len, max_context_len=context_len,
         context_limit_source="explicit" if args.max_context_len is not None else "sample_maximum",
         request_rate=args.request_rate, duration=args.duration, seed=args.seed, data_seed=args.data_seed,
         arrival_distribution="homogeneous_poisson", **distribution)
-    trace = dict(schema=CHAMELEON_SCHEMA if mixed else SCHEMA, config=config)
+    trace = dict(schema=PROFILE_SCHEMAS[args.adapter_profile], config=config)
     trace[args.adapter_profile] = profile
     trace.update(
         prepared_artifacts={args.adapter_profile + "_profile": profile_artifact, "dataset_order": order_artifact},
@@ -210,7 +215,7 @@ def build_trace(args):
                      query_tokens=dict(min=min(query_lens), mean=float(np.mean(query_lens)), max=max(query_lens)),
                      output_tokens=dict(min=min(output_lens), mean=float(np.mean(output_lens)), max=max(output_lens))),
         requests=requests)
-    if mixed:
+    if "adapter_ranks" in profile:
         ranks = profile["adapter_ranks"]
         trace["summary"]["adapters_per_rank"] = dict(Counter(ranks))
         counts = Counter(ranks[i] for i in adapters)
@@ -221,8 +226,9 @@ def build_trace(args):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, default=Path("/data/hub/LMSYS-33k"))
-    parser.add_argument("--adapter-profile", choices=("maf", "chameleon"), default="maf",
-                        help="chameleon: fixed ranks 16/32/64, uniform rank mass, within-rank Zipf(1).")
+    parser.add_argument("--adapter-profile", choices=PROFILE_SCHEMAS, default="maf",
+                        help="hf-llama7b uses public repo counts for ranks 8/16/32/64; "
+                             "chameleon uses equal rank mass for 16/32/64. Both use within-rank Zipf(1).")
     parser.add_argument("--maf-file", type=Path, default=Path(
         "/data/hub/MAF/azurefunctions2019/invocations_per_function_md.anon.d01.csv"))
     parser.add_argument("--maf-skewness", type=int, default=1)
@@ -245,6 +251,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.adapter_profile == "chameleon" and args.num_adapters < 3:
         parser.error("chameleon requires >=3 adapters")
+    if args.adapter_profile == HF_PROFILE and args.num_adapters < 4:
+        parser.error("hf-llama7b requires >=4 adapters")
     if (args.seed < 0 or args.data_seed < 0 or args.num_adapters <= 0 or args.maf_skewness <= 0
             or args.prefix_len <= 0
             or (args.max_context_len is not None and args.prefix_len >= args.max_context_len)

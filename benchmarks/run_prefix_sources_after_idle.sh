@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  printf 'Usage: bash %s OUTPUT_DIR [--queue|--start-now] [--model-size SIZE] [--prefix-len N] [--duration SEC] [--adapter-profile chameleon|maf] [--fixed-rank64] [--reprefill-num-token N] [--replay-timeout SEC] [--dry-run]\n' "$0" >&2
+  printf 'Usage: bash %s OUTPUT_DIR [--queue|--start-now] [--model-size SIZE] [--prefix-len N] [--duration SEC] [--adapter-profile chameleon|maf|hf-llama7b] [--fixed-rank64] [--reprefill-num-token N] [--replay-timeout SEC] [--dry-run]\n' "$0" >&2
   exit 2
 }
 [[ $# -ge 1 ]] || usage
@@ -37,7 +37,7 @@ while (( $# )); do
       esac
       shift 2 ;;
     --adapter-profile)
-      case "${2:-}" in chameleon|maf) profile="$2"; shift 2 ;; *) usage ;; esac ;;
+      case "${2:-}" in chameleon|maf|hf-llama7b) profile="$2"; shift 2 ;; *) usage ;; esac ;;
     --reprefill-num-token)
       [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || usage
       reprefill=("$1" "$2"); shift 2 ;;

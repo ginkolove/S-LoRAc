@@ -261,6 +261,10 @@ class RouterManager:
                 ))
 
         await asyncio.gather(*init_model_ret)
+        profile_spec = os.environ.get("SLORA_BENCHMARK_SLOT_PROFILE")
+        if profile_spec:
+            from slora.common.startup_memory_profile import run_startup_profile
+            run_startup_profile(self, profile_spec)
         return
     
     async def profile_prefill(self):
@@ -873,6 +877,7 @@ def start_router_process(args, router_port, detokenization_port, model_rpc_ports
                                lowra_pin_hot_adapters=args.lowra_pin_hot_adapters,
                                cpu_prefix_token_id=args.cpu_prefix_token_id,
                                cpu_prefix_pool_gb=args.cpu_prefix_pool_gb,
+                               impress_read_percent=getattr(args, "impress_read_percent", None),
                                reuse_next_reconstructed=args.reuse_next_reconstructed,
                                cpu_fixed_hot_indices=args.cpu_fixed_hot_indices,
                                nccl_port=args.nccl_port,

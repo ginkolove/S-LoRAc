@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [ "$#" -lt 1 ]; then
-  printf 'Prefix comparison: --prefix-sources or --prefix-source-group compute|cpu [--adapter-profile chameleon|maf] [--num-adapters N] [--cpu-prefix-pool-gb GB] [--reprefill-num-token N]. Use one fresh OUTPUT_DIR for both groups.\n' >&2
+  printf 'Prefix comparison: --prefix-sources or --prefix-source-group compute|cpu [--adapter-profile chameleon|maf|hf-llama7b] [--num-adapters N] [--cpu-prefix-pool-gb GB] [--reprefill-num-token N]. Use one fresh OUTPUT_DIR for both groups.\n' >&2
   printf 'Usage: bash %s OUTPUT_DIR [--model-size 7b|13b|30b] [--prefix-len TOKENS] [--gpu 0|1] [--request-rate REQ_PER_S] [--duration SECONDS] [--data-seed SEED] [--max-context-len TOKENS] [--batch-max-tokens TOKENS] [--running-max-req-size COUNT] [--schedule-interval STEPS] [--adaptive-only] [--space-plan-interval STEPS] [--space-plan-window STEPS] [--dry-run]\n' "$0" >&2
   exit 2
 fi
@@ -40,7 +40,7 @@ while [ "$#" -gt 0 ]; do
       [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid timeout\n' >&2; exit 2; }
       REPLAY_TIMEOUT="$2"; shift 2 ;;
     --adapter-profile)
-      case "${2:-}" in maf|chameleon) PROFILE="$2" ;; *) printf 'Expected maf or chameleon\n' >&2; exit 2 ;; esac
+      case "${2:-}" in maf|chameleon|hf-llama7b) PROFILE="$2" ;; *) printf 'Expected maf, chameleon or hf-llama7b\n' >&2; exit 2 ;; esac
       shift 2 ;;
     --data-seed)
       if [[ ! ${2:-} =~ ^(0|[1-9][0-9]*)$ ]]; then printf 'Expected a nonnegative data seed\n' >&2; exit 2; fi
@@ -123,14 +123,17 @@ esac
 if [[ -z "$PROFILE" ]]; then
   if (( SOURCES )); then PROFILE=chameleon; else PROFILE=maf; fi
 fi
-if [[ "$FIXED_MODE" == cpu-read-fixed1-r64 && ( "$PROFILE" != chameleon || $SOURCES != 1 ) ]]; then
-  printf 'Fixed rank-64 requires chameleon prefix-source comparison.\n' >&2; exit 2
+if [[ "$FIXED_MODE" == cpu-read-fixed1-r64 && ( "$PROFILE" == maf || $SOURCES != 1 ) ]]; then
+  printf 'Fixed rank-64 requires a rank-stratified prefix-source comparison.\n' >&2; exit 2
 fi
 RANKS=(16)
 TRACE_PROFILE_ARGS=(--adapter-profile "$PROFILE")
 if [[ $PROFILE == chameleon ]]; then
   if (( ADAPTERS < 3 )); then printf 'chameleon needs >=3 adapters\n' >&2; exit 2; fi
   RANKS=(16 32 64)
+elif [[ $PROFILE == hf-llama7b ]]; then
+  if (( ADAPTERS < 4 )); then printf 'hf-llama7b needs >=4 adapters\n' >&2; exit 2; fi
+  RANKS=(8 16 32 64)
 else
   TRACE_PROFILE_ARGS+=(--maf-file /data/hub/MAF/azurefunctions2019/invocations_per_function_md.anon.d01.csv
                        --maf-skewness 1 --maf-minute-start 1 --maf-minute-end 1440)
@@ -141,6 +144,13 @@ for i in "${!RANKS[@]}"; do
   ADAPTER_ARGS+=(--adapter-base "dummy-lora-${SIZE}-rank-${RANKS[i]}")
   RANK_SUM=$((RANK_SUM + RANKS[i] * ((ADAPTERS + ${#RANKS[@]} - 1 - i) / ${#RANKS[@]})))
 done
+if [[ $PROFILE == hf-llama7b ]]; then
+  RANK_SUM=$(cd "$ROOT" && python3 -c '
+import sys
+from benchmarks.lmsys_maf_trace import hf_rank_counts
+print(sum(r * n for r, n in hf_rank_counts(int(sys.argv[1])).items()))
+' "$ADAPTERS")
+fi
 MAX_RANK=${RANKS[-1]}
 STATIC_TOKENS=$(((PREFIX_LEN * (LLAMA_HIDDEN + RANK_SUM) + LLAMA_HIDDEN - 1) / LLAMA_HIDDEN))
 MINIMUM_TOKENS=$((STATIC_TOKENS + PREFIX_LEN + 4 * MAX_RANK + 2))
@@ -215,7 +225,7 @@ printf 'CUDA_VISIBLE_DEVICES=%s; Llama-%s, prefix=%s tokens, default pool=%s tok
 printf 'Memory profile: weights + configured pool=%s bytes, weights=%s bytes, slot=%s bytes; model buffers and activation peaks are additional.\n' \
   "$((LLAMA_MODEL_WEIGHT_BYTES + TOKENS * LLAMA_SLOT_BYTES))" "$LLAMA_MODEL_WEIGHT_BYTES" "$LLAMA_SLOT_BYTES"
 printf 'Selected modes: %s\n' "${MODES[*]}"
-printf 'Adapter profile: %s; round-robin ranks: %s; total rank: %s\n' "$PROFILE" "${RANKS[*]}" "$RANK_SUM"
+printf 'Adapter profile: %s; ranks: %s; total rank: %s\n' "$PROFILE" "${RANKS[*]}" "$RANK_SUM"
 if [ "$SOURCES" -eq 1 ] && [ "$SOURCE_GROUP" != compute ]; then
   ENTRY_BYTES=$((PREFIX_LEN * LLAMA_SLOT_BYTES))
   ENTRIES="$ADAPTERS"

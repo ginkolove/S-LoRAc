@@ -9,6 +9,47 @@ from pathlib import Path
 SCHEMA = "lmsys-maf-poisson-v1"
 CHAMELEON_SCHEMA = "lmsys-chameleon-poisson-v1"
 CHAMELEON_RANKS = (16, 32, 64)
+HF_PROFILE = "hf-llama7b"
+PROFILE_SCHEMAS = {"maf": SCHEMA, "chameleon": CHAMELEON_SCHEMA, HF_PROFILE: "lmsys-hf-llama7b-poisson-v1"}
+# Exact configured base, one public LoRA repository per vote, conditional on these ranks.
+HF_REPO_COUNTS = {8: 147, 16: 81, 32: 32, 64: 63}
+
+
+def trace_profile(trace):
+    for name, schema in PROFILE_SCHEMAS.items():
+        if trace.get("schema") == schema:
+            return name
+    raise ValueError("unsupported workload trace schema")
+
+
+def hf_rank_counts(num_adapters):
+    """Largest-remainder allocation, with at least one adapter per selected rank."""
+    if num_adapters < len(HF_REPO_COUNTS):
+        raise ValueError("hf-llama7b needs at least four adapters, one per rank")
+    total = sum(HF_REPO_COUNTS.values())
+    counts = {r: 1 for r in HF_REPO_COUNTS}
+    for _ in range(num_adapters - len(counts)):
+        rank = max(counts, key=lambda r: num_adapters * HF_REPO_COUNTS[r] - total * counts[r])
+        counts[rank] += 1
+    return counts
+
+
+def hf_adapter_layout(counts):
+    return [(rank, replica) for replica in range(max(counts.values()))
+            for rank, count in counts.items() if replica < count]
+
+
+def hf_profile(num_adapters):
+    counts = hf_rank_counts(num_adapters)
+    layout = hf_adapter_layout(counts)
+    total = sum(HF_REPO_COUNTS.values())
+    harmonic = {r: math.fsum(1 / j for j in range(1, n + 1)) for r, n in counts.items()}
+    return dict(adapter_ranks=[r for r, _ in layout],
+                adapter_probabilities=[(HF_REPO_COUNTS[r] / total) / (harmonic[r] * (i + 1))
+                                       for r, i in layout],
+                within_rank_zipf_alpha=1.0, source_base="huggyllama/llama-7b",
+                source_snapshot="2026-11-20",
+                source_repository_counts={str(r): n for r, n in HF_REPO_COUNTS.items()})
 
 
 def chameleon_profile(num_adapters):
@@ -29,8 +70,7 @@ def chameleon_profile(num_adapters):
 def load_trace(path):
     raw = Path(path).read_bytes()
     trace = json.loads(raw)
-    if trace.get("schema") not in (SCHEMA, CHAMELEON_SCHEMA):
-        raise ValueError("unsupported workload trace schema")
+    profile = trace_profile(trace)
     config = trace["config"]
     for key in ("num_adapters", "prefix_len", "max_context_len", "vocab_size"):
         if type(config[key]) is not int or config[key] <= 0:
@@ -38,8 +78,9 @@ def load_trace(path):
     for key in ("request_rate", "duration"):
         if not math.isfinite(config[key]) or config[key] <= 0:
             raise ValueError("invalid trace config: %s" % key)
-    if trace["schema"] == CHAMELEON_SCHEMA and trace.get("chameleon") != chameleon_profile(config["num_adapters"]):
-        raise ValueError("invalid chameleon rank or popularity map")
+    build_profile = {"chameleon": chameleon_profile, HF_PROFILE: hf_profile}.get(profile)
+    if build_profile and trace.get(profile) != build_profile(config["num_adapters"]):
+        raise ValueError("invalid %s rank or popularity map" % profile)
     if type(config["seed"]) is not int or config["seed"] < 0:
         raise ValueError("invalid trace seed")
     if not trace["requests"]:
@@ -70,7 +111,7 @@ def load_trace(path):
 
 def validate_run(trace, args):
     config = trace["config"]
-    profile = "chameleon" if trace["schema"] == CHAMELEON_SCHEMA else "maf"
+    profile = trace_profile(trace)
     if getattr(args, "adapter_profile", None) not in (None, profile):
         raise ValueError("frozen trace disagrees with --adapter-profile; use a fresh output directory")
     if getattr(args, "data_seed", None) is not None and config.get("data_seed") != args.data_seed:

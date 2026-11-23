@@ -38,7 +38,13 @@ from slora.common.prefix_modes import (
 )
 from slora.common.space_plan_config import add_space_plan_arguments, space_plan_command, space_plan_options
 from benchmarks.saturation_cycles import decode_cache_entries, summarize_cycles
-from benchmarks.lmsys_maf_trace import CHAMELEON_SCHEMA, load_trace, validate_run, bind_requests
+from slora.common.prefix_modes import IMPRESS, add_impress_read_argument
+from benchmarks.lmsys_maf_trace import (
+    HF_PROFILE, PROFILE_SCHEMAS, hf_rank_counts, hf_adapter_layout, trace_profile, load_trace,
+    validate_run, bind_requests,
+)
+
+OUTPUT_WINDOW_SECONDS = 10
 
 
 @dataclass
@@ -65,6 +71,16 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
+def adapter_dirs_for_run(args):
+    if getattr(args, "adapter_profile", None) == HF_PROFILE:
+        counts = hf_rank_counts(args.num_adapters)
+        if len(args.adapter_base) != len(counts):
+            raise ValueError("hf-llama7b requires four --adapter-base values in rank 8, 16, 32, 64 order")
+        bases = dict(zip(counts, args.adapter_base))
+        return [f"{bases[r]}-{replica}" for r, replica in hf_adapter_layout(counts)]
+    return expand_adapter_dirs(args.adapter_base, args.num_adapters)
+
+
 def trace_for(args, rate, seed):
     if getattr(args, "workload_trace", None):
         trace, digest = load_trace(args.workload_trace)
@@ -73,7 +89,7 @@ def trace_for(args, rate, seed):
             raise ValueError("workload trace changed after argument validation")
         if rate != trace["config"]["request_rate"] or seed != trace["config"]["seed"]:
             raise ValueError("workload rate or seed mismatch")
-        dirs = expand_adapter_dirs(args.adapter_base, args.num_adapters)
+        dirs = adapter_dirs_for_run(args)
         return bind_requests(trace, dirs), args.workload_trace, digest
     config = dict(adapter_bases=args.adapter_base, num_adapters=args.num_adapters,
                   prefix_len=args.prefix_len, query_len=args.query_len,
@@ -148,7 +164,7 @@ def request_payload(request, args):
                                      query_len=len(query_ids), decode_len=output_len))
 
 
-async def send_request(session, server, request, args, origin):
+async def send_request(session, server, request, args, origin, output_counts=None):
     start = time.monotonic()
     result = RequestResult(request["req_id"], request["adapter_dir"], request["req_time"],
                            start - origin, None, 0.0, 0, 0, False, False, None, None)
@@ -178,10 +194,14 @@ async def send_request(session, server, request, args, origin):
                     data.clear()
                     if result.finished or count <= result.output_tokens:
                         raise ValueError("nonmonotonic token count or events after completion")
+                    received = time.monotonic() - origin
+                    if output_counts is not None:
+                        window = int(received // OUTPUT_WINDOW_SECONDS)
+                        output_counts[window] += count - result.output_tokens
                     result.output_tokens = count
                     result.stream_events += 1
                     if result.first_token_time is None:
-                        result.first_token_time = time.monotonic() - origin
+                        result.first_token_time = received
                     result.finished = finished
             length_ok = (0 < result.output_tokens <= result.expected_output_tokens
                          if getattr(args, "generation_mode", "trace") == "eos"
@@ -198,17 +218,38 @@ async def send_request(session, server, request, args, origin):
     return result
 
 
-async def replay(session, server, requests, args, results_path, origin):
+async def replay(session, server, requests, args, results_path, origin, output_counts=None):
     results = []
     tasks = []
+    if output_counts is None:
+        output_counts = Counter()
+
+    async def report_windows():
+        index = 0
+        while True:
+            start = index * OUTPUT_WINDOW_SECONDS
+            end = start + OUTPUT_WINDOW_SECONDS
+            await asyncio.sleep(max(0.0, origin + end - time.monotonic()))
+            tokens = output_counts[index]
+            if len(results) == len(requests):
+                last_completion = max((r.end_time for r in results), default=0.0)
+                if last_completion < end:
+                    return
+                if last_completion == end:
+                    tokens += output_counts[index + 1]
+            print(f"{results_path.stem} {start}–{end} s: {tokens} output tokens, "
+                  f"{tokens / OUTPUT_WINDOW_SECONDS:.2f} tok/s", flush=True)
+            index += 1
+
     with results_path.open("w") as output, tqdm(total=len(requests), desc=results_path.stem,
                                                 unit="req", mininterval=5) as progress:
         async def worker(request):
-            result = await send_request(session, server, request, args, origin)
+            result = await send_request(session, server, request, args, origin, output_counts)
             results.append(result)
             output.write(json.dumps(asdict(result), allow_nan=False) + "\n")
             output.flush()
             progress.update(1)
+        reporter = asyncio.create_task(report_windows())
         try:
             for request in requests:
                 await asyncio.sleep(max(0.0, origin + request["req_time"] - time.monotonic()))
@@ -224,10 +265,11 @@ async def replay(session, server, requests, args, results_path, origin):
                     print("Drain timeout: point will be marked invalid", flush=True)
                 await asyncio.gather(*tasks)
         finally:
+            reporter.cancel()
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(reporter, *tasks, return_exceptions=True)
     return results
 
 
@@ -236,6 +278,24 @@ def distribution(values):
         return dict(mean=None, p50=None, p95=None, p99=None)
     return dict(mean=float(np.mean(values)),
                 **{"p%s" % q: float(np.percentile(values, q)) for q in (50, 95, 99)})
+
+
+def output_window_metrics(counts, elapsed, valid):
+    """Client-delivered output from replay start through the last request, including drain."""
+    windows = []
+    for index in range(math.ceil(elapsed / OUTPUT_WINDOW_SECONDS)):
+        start = index * OUTPUT_WINDOW_SECONDS
+        end = min(start + OUTPUT_WINDOW_SECONDS, elapsed)
+        complete = end == start + OUTPUT_WINDOW_SECONDS
+        tokens = counts.get(index, 0)
+        # Internal boundaries belong to the next window. Include the replay endpoint in the last.
+        if complete and end == elapsed:
+            tokens += counts.get(index + 1, 0)
+        windows.append(dict(start=start, end=end, complete=complete, output_tokens=tokens,
+                            output_tokens_per_s=tokens / (end - start)))
+    full_windows = (window for window in windows if window["complete"])
+    peak = max(full_windows, key=lambda window: window["output_tokens"], default=None) if valid else None
+    return dict(output_windows_10s=windows, peak_output_window_10s=peak)
 
 
 def summarize(results, args):
@@ -409,11 +469,13 @@ def server_command(args, stats_path):
         command.extend(["--cpu-prefix-token-id", str(args.prompt_token_id)])
         if getattr(args, "cpu_prefix_pool_gb", None) is not None:
             command.extend(["--cpu-prefix-pool-gb", str(args.cpu_prefix_pool_gb)])
+    if args.mode == IMPRESS and getattr(args, "impress_read_percent", None) is not None:
+        command.extend(["--impress-read-percent", str(args.impress_read_percent)])
     if args.mode in CPU_PIN_COUNTS:
         command.extend(["--cpu-fixed-hot-indices", *map(str, args.fixed_hot_indices)])
     if getattr(args, "reuse_next_reconstructed", False):
         command.append("--reuse-next-reconstructed")
-    for directory in expand_adapter_dirs(args.adapter_base, args.num_adapters):
+    for directory in adapter_dirs_for_run(args):
         command.extend(["--lora-dirs", directory])
     if args.dummy:
         command.append("--dummy")
@@ -549,11 +611,34 @@ def suite_summary(points, args):
                 and relative <= args.plateau_tolerance):
             platform_pairs.append([previous["request_rate"], current["request_rate"]])
     confirmed = any(a[1] == b[0] for a, b in zip(platform_pairs, platform_pairs[1:]))
+    peaks = (dict(point["result"]["peak_output_window_10s"], request_rate=point["request_rate"], seed=point["seed"])
+             for point in points if point["result"]["valid"] and point["result"].get("peak_output_window_10s"))
     return dict(mode=args.mode, rates=rates, plateau_pairs=platform_pairs,
+                peak_output_window_10s=max(peaks, key=lambda window: window["output_tokens"], default=None),
                 saturation_confirmed=confirmed,
                 saturation_rule="two_consecutive_plateau_pairs_and_backlogged_windows_all_seeds",
                 note=("Inspect batch/slot curves and measurement variance before claiming saturation."
                       if confirmed else "Saturation not confirmed; extend rates or measurement time."))
+
+
+def verify_reused_configuration(reference, current):
+    def server_options(manifest):
+        command = manifest["command"].copy()
+        for flag in ("--port", "--nccl_port", "--internal-port-start", "--lowra-runtime-stats-path"):
+            command[command.index(flag) + 1] = "<run-specific>"
+        return command
+
+    def inference_sources(manifest):
+        return {path: digest for path, digest in manifest["source_sha256"].items()
+                if path.startswith("slora/") and path not in (
+                    "slora/common/benchmark_gpu.py", "slora/common/startup_memory_profile.py")}
+
+    if server_options(reference) != server_options(current):
+        raise ValueError("Server configuration differs from the saved KV profile")
+    if inference_sources(reference) != inference_sources(current):
+        raise ValueError("Inference implementation differs from the saved KV profile")
+    if any(reference["packages"][key] != current["packages"][key] for key in ("torch", "triton")):
+        raise ValueError("CUDA runtime package versions differ from the saved KV profile")
 
 
 async def run_suite(args):
@@ -619,8 +704,13 @@ async def run_suite(args):
                                                     "benchmarks/lowra_saturation_exp.py",
                                                     "benchmarks/lmsys_maf_trace.py",
                                                     "benchmarks/prepare_lmsys_maf_trace.py",
+                                                    "slora/common/startup_memory_profile.py",
+                                                    "slora/common/benchmark_gpu.py",
                                                     "benchmarks/saturation_cycles.py")},
                                    gpu_before=gpu.stdout, gpu_query_error=gpu.stderr))
+    reuse_manifest = os.environ.get("SLORA_BENCHMARK_REUSE_MANIFEST")
+    if reuse_manifest:
+        verify_reused_configuration(json.loads(Path(reuse_manifest).read_text()), json.loads(manifest_path.read_text()))
     points = []
     server = "http://127.0.0.1:%s" % args.port
     with (output / "server.log").open("w") as log:
@@ -631,8 +721,11 @@ async def run_suite(args):
             async with aiohttp.ClientSession(connector=connector, trust_env=False) as session:
                 await wait_ready(session, server, process, args.startup_timeout)
                 print("Ready: mode=%s server=%s" % (args.mode, server), flush=True)
+                if os.environ.get("SLORA_BENCHMARK_SLOT_PROFILE"):
+                    # The router completes the memory probes before signalling readiness.
+                    return
                 if args.preflight_requests:
-                    dirs = expand_adapter_dirs(args.adapter_base, args.num_adapters)
+                    dirs = adapter_dirs_for_run(args)
                     origin = time.monotonic()
                     requests = [dict(req_id="preflight-%s" % i, adapter_dir=dirs[i % min(2, len(dirs))],
                                      req_time=0.0) for i in range(args.preflight_requests)]
@@ -659,9 +752,10 @@ async def run_suite(args):
                         write_json(output / (label + "_trace.json"), dict(
                             trace_path=str(trace_path), trace_sha256=trace_hash, requests=requests))
                         print("Starting %s: %s requests, trace=%s" % (label, len(requests), trace_hash), flush=True)
+                        output_counts = Counter()
                         origin = time.monotonic()
                         results = await replay(session, server, requests, args,
-                                               output / (label + "_requests.jsonl"), origin)
+                                               output / (label + "_requests.jsonl"), origin, output_counts)
                         result = summarize(results, args)
                         if len(results) != len(requests):
                             result["valid"] = False
@@ -685,6 +779,7 @@ async def run_suite(args):
                         if runtime["samples"] == 0:
                             result["valid"] = False
                             result["invalid_reason"] = "no runtime snapshots in measurement window"
+                        result.update(output_window_metrics(output_counts, result["benchmark_time"], result["valid"]))
                         point = dict(mode=args.mode, retain_layers=args.retain_layers,
                                      retain_top_k=args.retain_top_k,
                                      pin_hot_adapters=args.pin_hot_adapters,
@@ -699,6 +794,12 @@ async def run_suite(args):
                         print("%s: steady=%.6f req/s total=%.6f req/s valid=%s backlog=%s" %
                               (label, result["completed_req_per_s_steady"], result["completed_req_per_s_total"],
                                result["valid"], runtime.get("backlogged_window")), flush=True)
+                        peak = result["peak_output_window_10s"]
+                        if peak is not None:
+                            print(f"{label} peak 10 s output throughput {peak['output_tokens_per_s']:.2f} tok/s "
+                                  f"from {peak['start']:g} to {peak['end']:g} s", flush=True)
+                        else:
+                            print(f"{label} has no eligible 10 s output window", flush=True)
                         print("Preemption diagnostics: %s" % json.dumps(preemption), flush=True)
                         if args.measure_saturation:
                             print("Saturation cycles: %s" % json.dumps(result["saturation"]), flush=True)
@@ -718,6 +819,7 @@ def parse_args():
     parser.add_argument("--reuse-next-reconstructed", action="store_true")
     parser.add_argument("--cpu-prefix-pool-gb", type=int,
                         help="Dummy fixed-output replay only: cap host KV payload in decimal GB.")
+    add_impress_read_argument(parser)
     parser.add_argument("--retain-layers", type=int, default=0,
                         help="First K prefix layers retained per active adapter in minikv-layer_retained.")
     parser.add_argument("--reconstruction-kernel", choices=("auto", "bounded"), default="auto")
@@ -776,7 +878,7 @@ def parse_args():
     parser.add_argument("--trace-dir", type=Path, default=ROOT / "benchmarks/results/lowra_saturation/traces")
     parser.add_argument("--workload-trace", type=Path,
                         help="Frozen LMSYS trace; per-request tokens and output lengths override fixed lengths.")
-    parser.add_argument("--adapter-profile", choices=("maf", "chameleon"),
+    parser.add_argument("--adapter-profile", choices=PROFILE_SCHEMAS,
                         help="Require that the frozen trace has this adapter profile.")
     parser.add_argument("--data-seed", type=int,
                         help="Require this LMSYS sampling seed in the frozen workload trace.")
@@ -784,6 +886,8 @@ def parse_args():
     parser.add_argument("--dummy", action="store_true")
     add_space_plan_arguments(parser)
     args = parser.parse_args()
+    if args.impress_read_percent is not None and args.mode != IMPRESS:
+        parser.error("--impress-read-percent requires --mode impress")
     if args.adapter_profile and not args.workload_trace:
         parser.error("--adapter-profile requires --workload-trace")
     if args.data_seed is not None and (args.data_seed < 0 or not args.workload_trace):
@@ -848,17 +952,14 @@ def parse_args():
             if args.max_context_len is None:
                 args.max_context_len = trace["config"]["max_context_len"]
             validate_run(trace, args)
-            if trace["schema"] == CHAMELEON_SCHEMA:
+            args.adapter_profile = trace_profile(trace)
+            if args.adapter_profile != "maf":
                 from slora.models.peft.lora_adapter import get_lora_config
-                dirs = expand_adapter_dirs(args.adapter_base, args.num_adapters)
+                dirs = adapter_dirs_for_run(args)
                 ranks = [get_lora_config(d, args.dummy)[0]["r"] for d in dirs]
-                if ranks != trace["chameleon"]["adapter_ranks"]:
-                    raise ValueError("server adapter ranks disagree with the frozen chameleon trace; "
-                                     "pass --adapter-base in rank 16, 32, 64 order")
-                args.workload_kind = "lmsys_chameleon_poisson"
-                args.adapter_profile = "chameleon"
-            else:
-                args.adapter_profile = "maf"
+                if ranks != trace[args.adapter_profile]["adapter_ranks"]:
+                    raise ValueError("server adapter ranks disagree with the frozen %s trace" % args.adapter_profile)
+                args.workload_kind = "lmsys_%s_poisson" % args.adapter_profile.replace("-", "_")
         except (ValueError, KeyError, TypeError, OSError) as exc:
             parser.error(str(exc))
         args.query_len = max(len(request["input_ids"]) for request in trace["requests"])
@@ -871,20 +972,20 @@ def parse_args():
         generation_cap = args.generation_max_new_tokens if args.generation_mode == "eos" else args.output_len
         args.max_context_len = args.prefix_len + args.query_len + generation_cap
     if args.mode in CPU_PIN_COUNTS:
-        if args.mode == CPU_FIXED_R64 and (not args.workload_trace or args.adapter_profile != "chameleon"):
-            parser.error("fixed1-r64 requires a rank-stratified chameleon workload trace")
+        if args.mode == CPU_FIXED_R64 and (not args.workload_trace or args.adapter_profile == "maf"):
+            parser.error("fixed1-r64 requires a rank-stratified workload trace")
         probs = (trace[args.adapter_profile]["adapter_probabilities"] if args.workload_trace
                  else zipf_probs(args.num_adapters, args.alpha))
         eligible = range(args.num_adapters)
         if args.mode == CPU_FIXED_R64:
-            eligible = [i for i in eligible if trace["chameleon"]["adapter_ranks"][i] == 64]
+            eligible = [i for i in eligible if trace[args.adapter_profile]["adapter_ranks"][i] == 64]
         args.fixed_hot_indices = sorted(eligible, key=lambda i: (-probs[i], i))[:CPU_PIN_COUNTS[args.mode]]
         # Permanently pinned idle prefixes must not make a cold request impossible
         # even in an otherwise empty pool. Only a benchmark validity check, not
         # output-length-based online admission.
         if args.workload_trace:
             from slora.models.peft.lora_adapter import get_lora_config
-            dirs = expand_adapter_dirs(args.adapter_base, args.num_adapters)
+            dirs = adapter_dirs_for_run(args)
             ranks = [get_lora_config(d, args.dummy)[0]["r"] for d in dirs]
             for req in trace["requests"]:
                 idx = req["adapter_index"]

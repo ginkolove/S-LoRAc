@@ -152,7 +152,8 @@ class ModelRpcServer(rpyc.Service):
                         raise ValueError("invalid CPU bank prefix token")
                     cap = input_params.cpu_prefix_pool_gb
                     bank = HostPrefixBank(pool, [token] * length, adapter_dirs,
-                                          byte_cap=cap * 10**9 if cap is not None else None)
+                                          byte_cap=cap * 10**9 if cap is not None else None, mode=source,
+                                          impress_read_percent=getattr(input_params, "impress_read_percent", None))
                     bank.check_capacity()
                     print("CPU prefix bank: %d logical adapters, %d physical entries, %d bytes/entry"
                           % (len(adapter_dirs), len(bank.physical_dirs), bank.entry_bytes), flush=True)

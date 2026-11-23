@@ -10,6 +10,149 @@ This implements vLLM-style incremental admission and recompute preemption in
 the existing S-LoRA engine. It does not import vLLM or replace the attention,
 MiniKV reconstruction, or Unified Paging allocator.
 
+## H20 comparisons under an 80 GB device budget
+
+From the repository root, select one exclusive physical H20 and a fresh result directory.
+The default methods are full reconstruction, layer-serial reconstruction and adaptive V3.
+
+```bash
+/opt/conda/bin/python benchmarks/run_h20_memory_cap.py benchmarks/results/h20_cap80 \
+  --gpu 0 --point 13b:10000
+```
+
+Use `--profile-only` to measure the slot counts on the GPU and save them in
+`<model>_p<prefix>/profiles.json`. Use `--dry-run` to print the planned configuration.
+`--methods` also accepts CPU prefix reads, fixed-hot CPU reads, Impress, active
+reprefill, the two rank-split methods and adaptive V1/V2/V4. Select all with `--methods all`.
+For Impress, `--impress-read-percent 60` copies 6,000 positions of a 10,000-token
+prefix and zero-fills the remaining 4,000. The default is 50%. All adapters, layers
+and K/V tensors use the same prefix-position permutation with seed 42.
+The scheduling limits and frozen trace stay common across
+pool sizes.
+
+Each method boots its own staged TP=1 worker with the minimum capacity for one request.
+The worker records the model initialization peak and runs the actual adapter load,
+prefix acquisition, prefill, decode and sampling kernels. Synthetic token IDs have
+shapes bounded by the frozen trace's sorted prompt and private-history lengths.
+The worker probes cold distinct LoRAs and a wide batch sharing a high-rank LoRA. It
+also probes a wide mixed batch and partial retention when those shapes fit. Each probe
+uses the staged scheduler's admission limits. Wide prefills include the private history
+of requests being resumed after preemption. To exercise deep decode in one forward,
+the worker fills the extra private KV positions with zeros. It records the batch widths,
+prefix counts, lengths and PyTorch peaks for each phase in `forward_profile.json`.
+
+The launcher takes the smaller of whole-device and MPS client headroom. The client
+estimate combines the largest PyTorch reserved peak with the largest observed allocation
+outside that allocator. After reserving one decimal GB it divides the remaining bytes by
+the worker's FP16 KV bytes per slot to propose a larger pool. It verifies the proposal
+with new probes at that actual capacity, including any larger admissible batches.
+A CUDA OOM or insufficient margin triggers a smaller candidate. The counts in
+`startup_profile.json` distinguish the total `--num-token` budget (`pool_tokens`)
+from allocated dynamic slots (`dynamic_pool_slots`) and the MiniKV static region
+(`static_token_equivalents`).
+
+A timed experiment starts a clean worker with the verified capacity and replays the
+original arrivals and outputs. Startup probes are outside the timing window and their
+prefix state and adaptive timing samples stay in the profiling processes. A CUDA OOM
+during replay triggers a fresh profile and replay at a smaller capacity.
+
+For a repeated measurement on an exclusive H20, select one method and pass its previous
+`startup_profile.json` with `--reuse-profile`. The launcher verifies the method, trace
+hash, recorded successful 80 GB probe, pool geometry and remaining client budget. The
+benchmark checks the server options, inference source hashes and Torch/Triton versions
+before starting the server. The formal replay then uses those slots under the current
+GPU's MPS limit and whole-device monitor. A reused capacity that encounters a CUDA OOM
+is reported as a failed run. The new experiment's peak covers its own attempts, and the
+copied profile records the path to the original measurement.
+
+```bash
+/opt/conda/bin/python benchmarks/run_h20_memory_cap.py benchmarks/results/replay_v3 \
+  --gpu 5 --point 13b:10000 --methods minikv-adaptive-v3 \
+  --reuse-profile benchmarks/results/h20_startup_capacity_13b10k/13b_p10000/minikv-adaptive-v3/startup_profile.json
+```
+
+Use `--num-token SLOTS` to go straight to formal replay at an explicit total slot
+budget. The MPS quota and whole-device monitoring stay active. A CUDA OOM marks
+the fixed-capacity run as failed. For the six 13B, 10K-prefix experiments on
+GPUs 0–5, use the following command from the repository root. Both CPU-read
+methods default to 45,532 slots. Pass `--num-token SLOTS` to this script to set
+one common total slot count for all six GPUs. Each launch creates a fresh
+directory and prints the path, controller PIDs and log files. Add `--dry-run`
+to preview the settings.
+
+```bash
+bash benchmarks/run_h20_13b10k_formal.sh
+```
+
+During parallel launches NVML can list a router on several boards while CUDA initializes.
+Each guarded router publishes its PID and assigned GPU UUID in its private MPS directory
+and holds a lock for its lifetime. The guard excludes a router assigned to another board
+only when every NVML entry for that PID on this board reports exactly zero bytes.
+An unrecognized process or a peer with local device memory invalidates the attempt.
+An interrupted formal replay stops on the first ownership conflict and records its
+reason in the method's `failure.json` and the point's `incomplete.json`.
+Startup probes may retry up to twice if a transient registration has cleared after teardown.
+
+The launcher creates a private MPS daemon on the selected UUID. The TP=1 router is the
+only GPU client. Its driver-enforced quota leaves the idle device usage plus two decimal
+GB for overhead outside MPS accounting. Adjust the latter with `--outside-reserve-gb`.
+Before loading weights the runner checks that current board usage plus the client's
+remaining quota fits within 80,000,000,000 bytes. The whole-device bound depends on
+exclusive access and this reserve covering later allocations outside the client quota.
+
+Each attempt writes `memory.json` and `device_memory.csv`. NVML polls the physical GPU
+every 20 ms from before MPS starts through teardown. The CSV records changes and the
+report includes the longest polling gap. The device peak is sampled. A detected breach
+or loss of monitoring invalidates the run. The point's `comparison.json` contains only
+completed formal replays with verified request identities, output counts and runtime reset.
+`startup_sampled_peak_bytes` includes all profiling attempts, even candidates that hit
+the CUDA quota. `experiment_sampled_peak_bytes` also includes every formal attempt.
+If a method still runs out of memory at its single-request pool floor, the runner records
+that failure, finishes the other methods, and writes `incomplete.json`.
+
+## MiniKV adaptive V4
+
+The H20 launcher stages the V4 router and worker together. For a 13B model and a
+10,000-token prefix at a fixed total budget of 61,000 slots, run from the repository root
+
+```bash
+PYTHONPATH=. /opt/conda/envs/slora/bin/python benchmarks/run_h20_memory_cap.py \
+  benchmarks/results/h20_v4_13b10k --gpu 6 --point 13b:10000 \
+  --methods minikv-adaptive-v4 --num-token 61000 --device-capacity
+```
+
+V4 changes retention between forwards. It uses the **dynamic** pool after the
+static MiniKV allocation. A new rank starts with the full prefix if the pool
+can hold one full copy, the smallest configured adapter and two private slots
+for a minimal request. A smaller pool uses layer-serial reconstruction throughout.
+
+- At an admission boundary, V4 tries the existing layout for the FCFS queue and
+  reclaims idle prefixes in LRU order. If the first remaining request still needs
+  space, V4 reduces retention together for all distinct prefixes of the lowest
+  rank in the proposed batch.
+  It keeps the largest common layer count that admits that request, then admits
+  any additional requests that fit. It can move to the next rank once the lower
+  rank reaches zero. Each new prefix with an already active rank inherits its depth.
+- Before each forward, existing requests' observed private histories must fit.
+  Growth can force another grouped reduction even with an empty waiting queue.
+  If the serial layout also exhausts the pool, the router uses its preemption
+  and recovery path.
+- After a completion, cancellation or capacity increase, an empty waiting queue
+  and sufficient spare slots allow a promotion trial. V4 restores the highest-rank
+  group that can gain layers. Promotions leave headroom based on observed output
+  batch size and preemption deficits. Admissions can use the entire dynamic pool.
+- For an elective change, the reference is actual output tokens per elapsed
+  second in the previous layout. A runnable batch first supplies a reference
+  window. If the very first request needs a smaller layout to start, it can
+  start immediately. The defaults are a one-second window and a 5% tolerance.
+  Two consecutive windows below 95% of the reference trigger rollback. If the
+  old layout would displace admitted requests, V4 pauses new admissions and
+  retries restoration at subsequent boundaries. Set `--v4-feedback-seconds`
+  and `--v4-hysteresis` to change the window and tolerance.
+
+The formal run's `runtime.plans.jsonl` records the trigger, target layers per prefix,
+required and available slots, observed output rate, reference rate and rollback state.
+
 ## Admission and recovery
 
 - FCFS waiting order. `--max-active-loras N` optionally caps distinct running
@@ -46,6 +189,18 @@ length. Context-length checks still apply. The old HTTP check that required the
 entire input-plus-output cap to fit the KV pool is disabled for `online`.
 
 ## Benchmark generation semantics
+
+Each timed replay also measures delivered output throughput in consecutive 10-second
+windows, from replay start through the last request, including drain. The benchmark
+prints throughput as each full window closes. Each streaming
+response contributes the increase in its cumulative output token count at the time
+the benchmark client receives it. The point's `rate*_seed*.json` stores every window
+under `result.output_windows_10s`, including empty windows and the final partial
+window at its actual duration. `result.peak_output_window_10s` contains the highest
+complete window of a valid replay, with its start, end, token count and tokens per
+second. Ties select the earliest window. A replay shorter than 10 seconds has a
+null peak. `summary.json` identifies the best measured window across rates and
+seeds, and the H20 `comparison.json` reports each method's peak.
 
 The default `--generation-mode trace` keeps deterministic recorded/synthetic
 output lengths and ignores EOS for controlled performance replay. In online

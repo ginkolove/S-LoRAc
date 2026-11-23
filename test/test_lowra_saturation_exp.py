@@ -1,5 +1,7 @@
 """CPU-only checks for paired traces, SSE validation and completion statistics."""
 
+import asyncio
+from collections import Counter
 from dataclasses import replace
 import json
 import pickle
@@ -9,9 +11,10 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from benchmarks.lowra_saturation_exp import RequestResult, decode_sse, summarize, trace_for, request_payload
+from benchmarks.lowra_saturation_exp import output_window_metrics, send_request, suite_summary
 from slora.common.prefix_modes import FULL_REPREFILL, FULL_RECONSTRUCT, LAYER_SERIAL, normalize_prefix_mode
 
 
@@ -115,6 +118,7 @@ class SaturationTests(unittest.TestCase):
                 point = dict(trace_sha256="paired", result=dict(valid=True, completed_req_per_s_steady=throughput),
                              runtime=dict(running_batch_size=dict(mean=10), backlogged_window=True,
                                           peak_allocated_without_base_model_bytes=2 ** 30))
+                point["result"].update(output_window_metrics({0: 10 * throughput}, 10., True))
                 (directory / "rate8_seed42.json").write_text(json.dumps(point))
             original = compare(directories[0], directories[2])[0]
             self.assertEqual(original["full_req_per_s"], 4)
@@ -127,6 +131,7 @@ class SaturationTests(unittest.TestCase):
             for key, value in original.items():
                 self.assertEqual(combined[key], value)
             self.assertEqual(combined["reconstruct_req_per_s"], 8)
+            self.assertEqual(combined["reconstruct_peak_output_window_10s"]["output_tokens_per_s"], 8)
             self.assertEqual(combined["serial_over_reconstruct"], 0.75)
             manifest = json.loads((directories[2] / "manifest.json").read_text())
             manifest["config"]["scheduler"] = "online"
@@ -268,6 +273,51 @@ class SaturationTests(unittest.TestCase):
         event["finished"] = -1
         with self.assertRaises(ValueError):
             decode_sse([json.dumps(event)])
+
+    def test_output_windows_count_sse_deltas_at_receipt_across_boundaries(self):
+        session = MagicMock()
+        response = session.post.return_value.__aenter__.return_value
+        response.status = 200
+        frames = []
+        for count in (3, 5, 9):
+            event = dict(token=dict(id=1), count_output_tokens=count, finished=count == 9)
+            frames.extend([("data: " + json.dumps(event)).encode(), b"\n"])
+        response.content.readline = AsyncMock(side_effect=[*frames, b""])
+        args = SimpleNamespace(mode=LAYER_SERIAL, prompt_token_id=1, query_len=1, output_len=9,
+                               prefix_len=10, request_timeout=30)
+        req = dict(req_id="req", adapter_dir="adapter", req_time=0.)
+        counts = Counter()
+        with patch("benchmarks.lowra_saturation_exp.time") as clock:
+            clock.monotonic.side_effect = [100., 109.9, 110., 120.05, 120.1]
+            result = asyncio.run(send_request(session, "http://test", req, args, 100., counts))
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(counts, {0: 3, 1: 2, 2: 4})
+        report = output_window_metrics(counts, result.end_time, result.success)
+        windows = report["output_windows_10s"]
+        self.assertEqual(sum(w["output_tokens"] for w in windows), result.output_tokens)
+        self.assertAlmostEqual(windows[-1]["output_tokens_per_s"], 40.)
+        self.assertFalse(windows[-1]["complete"])
+        self.assertEqual(report["peak_output_window_10s"], windows[0])
+
+    def test_output_peak_handles_idle_windows_ties_short_runs_and_final_endpoint(self):
+        report = output_window_metrics({1: 8, 2: 8}, 30., True)
+        self.assertEqual([w["output_tokens"] for w in report["output_windows_10s"]], [0, 8, 8])
+        self.assertEqual(report["peak_output_window_10s"]["start"], 10)
+        self.assertEqual(output_window_metrics({1: 4, 2: 2}, 20., True)["peak_output_window_10s"]["output_tokens"], 6)
+        self.assertIsNone(output_window_metrics({0: 5}, 1., True)["peak_output_window_10s"])
+        self.assertIsNone(output_window_metrics({}, 0., True)["peak_output_window_10s"])
+        self.assertIsNone(output_window_metrics({0: 5}, 20., False)["peak_output_window_10s"])
+
+    def test_suite_peak_identifies_rate_and_seed_of_best_valid_point(self):
+        args = SimpleNamespace(mode=LAYER_SERIAL, request_rates=[3, 4], seeds=[41, 42], plateau_tolerance=.05)
+        points = []
+        for rate, seed, count, valid in [(3, 41, 48, True), (3, 42, 95, True), (4, 41, 110, False)]:
+            metrics = output_window_metrics({1: count}, 25., valid)
+            result = dict(metrics, valid=valid, completed_req_per_s_steady=1.)
+            points.append(dict(result=result, runtime={}, request_rate=rate, seed=seed))
+        peak = suite_summary(points, args)["peak_output_window_10s"]
+        self.assertEqual((peak["request_rate"], peak["seed"], peak["start"], peak["output_tokens_per_s"]),
+                         (3, 42, 10, 9.5))
 
     def test_missing_counter_and_nan_are_rejected(self):
         event = dict(token=dict(id=10, logprob=-0.1), finished=True)

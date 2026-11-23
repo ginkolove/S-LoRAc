@@ -1,0 +1,42 @@
+--- a/slora/common/lowra_reconstruct.py
++++ b/slora/common/lowra_reconstruct.py
+@@ -37,7 +37,7 @@
+     scaling = tl.load(SCALINGS + lora_pid)
+ 
+     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+-    for r_base in range(0, MAX_RANK, BLOCK_R):
++    for r_base in range(0, rank_len, BLOCK_R):
+         r = r_base + r_offsets
+         mini = tl.load(
+             MINI + p_offsets[:, None] * R_TOTAL + rank_start + r[None, :],
+@@ -99,7 +99,7 @@
+ 
+     block_m = 16
+     block_n = 32
+-    block_r = 32
++    block_r = @BLOCK_R@
+     grid = (
+         prefix_locs.shape[0],
+         triton.cdiv(P, block_m),
+--- a/slora/common/lowra_layer_runtime.py
++++ b/slora/common/lowra_layer_runtime.py
+@@ -326,7 +326,8 @@
+                         and getattr(self.runtime, "reconstruction_kernel", "auto") == "bounded")):
+                 reconstruct_prefix_layer_bounded(self.runtime.static_store, self.infer_adapter,
+                                                   self.metadata, layer_id, *self.buffers(layer_id),
+-                                                  workers=self.prefetch_workers)
++                                                  workers=self.prefetch_workers,
++                                                  rank_loop="actual", block_r=@BLOCK_R@)
+                 return
+             reconstruct = (reconstruct_prefix_layer_fused_kv
+                            if self.runtime.mode == "layer_prefetch" and self.prefetch_reconstruction == "fused"
+--- a/benchmarks/lowra_saturation_exp.py
++++ b/benchmarks/lowra_saturation_exp.py
+@@ -712,6 +712,7 @@
+ def parse_args():
+     parser = argparse.ArgumentParser(description=__doc__)
++    parser.set_defaults(rank_loop="actual", block_r=@BLOCK_R@)
+     parser.add_argument("--mode", type=normalize_prefix_mode,
+                         choices=PREFIX_MODES, required=True)
+     parser.add_argument("--send-full-prompt", action="store_true",
+                         help="Send identical prefix+query HTTP inputs even for MiniKV modes.")
